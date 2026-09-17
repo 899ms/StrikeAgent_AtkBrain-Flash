@@ -23,21 +23,13 @@ from .projects import (
     update_scope_and_config,
     update_status,
 )
-from .scope import _IP_RE
+from .scope import _IP_RE, registrable_domain
 
 # 导入表头/列名，不是主机
 _ASSET_HEADER_TOKENS = frozenset({
     "host", "hosts", "hostname", "ip", "ips", "url", "urls",
     "domain", "domains", "address", "addresses", "target", "targets",
     "资产", "目标",
-})
-# 不引入完整 PSL；仅覆盖常见两段后缀
-_MULTI_PART_TLDS = frozenset({
-    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
-    "co.uk", "org.uk", "ac.uk", "gov.uk",
-    "co.jp", "or.jp", "ne.jp", "ac.jp",
-    "com.au", "net.au", "org.au", "co.nz",
-    "com.tw", "com.hk", "co.kr",
 })
 
 COMMON_WEB_PORTS = [80, 443, 8080, 8000, 8443, 8888, 8787]
@@ -175,22 +167,6 @@ def is_asset_header_token(raw: str) -> bool:
     if "." in s or _IP_RE.match(s):
         return False
     return s in _ASSET_HEADER_TOKENS
-
-
-def registrable_domain(host: str) -> str:
-    """eTLD+1。IP 原样；example.com.cn → example.com.cn。"""
-    h = preferred_host(host)
-    if not h:
-        return ""
-    if _IP_RE.match(h):
-        return h
-    parts = [p for p in h.split(".") if p]
-    if len(parts) < 2:
-        return h
-    last2 = ".".join(parts[-2:])
-    if last2 in _MULTI_PART_TLDS and len(parts) >= 3:
-        return ".".join(parts[-3:])
-    return last2
 
 
 def product_zone(host: str) -> str:
@@ -747,7 +723,13 @@ async def _http_get(url: str) -> dict | None:
         ]
         try:
             from .proxy.pool import pool as _proxy_pool
-            if _proxy_pool.enabled:
+            from .proxy.yakit import prepare_egress
+            eg = await prepare_egress("redteam")
+            if eg.refuse:
+                return await _http_get_httpx_v4(url)
+            if eg.proxy:
+                curl_args[1:1] = ["-x", eg.proxy]
+            elif _proxy_pool.enabled:
                 px = _proxy_pool.pick()
                 if px:
                     curl_args[1:1] = ["-x", px]
@@ -756,7 +738,9 @@ async def _http_get(url: str) -> dict | None:
         except Exception:
             try:
                 from .proxy.pool import pool as _proxy_pool
-                if _proxy_pool.enabled:
+                from .proxy.yakit import prepare_egress
+                eg = await prepare_egress("redteam")
+                if eg.refuse or (_proxy_pool.enabled and not eg.proxy and not _proxy_pool.pick()):
                     return await _http_get_httpx_v4(url)
             except Exception:
                 return await _http_get_httpx_v4(url)
@@ -819,8 +803,14 @@ async def _http_get_httpx_v4(url: str) -> dict | None:
     must = False
     try:
         from .proxy.pool import pool as _proxy_pool
+        from .proxy.yakit import prepare_egress, should_use_yakit
         must = bool(_proxy_pool.enabled)
-        if must:
+        if should_use_yakit("redteam"):
+            eg = await prepare_egress("redteam")
+            if eg.refuse:
+                return None
+            proxy = eg.proxy
+        elif must:
             proxy = _proxy_pool.pick()
             if not proxy:
                 return None

@@ -1,6 +1,15 @@
 /** 列表/集群筛选：配置了图空转/轮次/时长上限并触顶时进「失败」，不进「未完成」。 */
 export const HUNT_FAILED_REASONS = new Set(["graph_idle", "runtime_cap", "turn_cap"]);
 
+/** CTF / 夺旗项目：始终直连靶场，不走出口代理池。 */
+export function isCtfProject(p: {
+  config?: { track?: string; objective?: string } | null;
+} | null | undefined): boolean {
+  const t = String(p?.config?.track || "").toLowerCase();
+  const o = String(p?.config?.objective || "").toLowerCase();
+  return t === "ctf" || o === "flag" || o === "ctf";
+}
+
 export function huntFailedReason(p: { config?: { completion_reason?: string } | null } | null | undefined): string | undefined {
   const r = p?.config?.completion_reason;
   if (r && HUNT_FAILED_REASONS.has(r)) return r;
@@ -46,7 +55,8 @@ export function listStatusOf(p: {
   status?: string;
   config?: { completion_reason?: string } | null;
 }): string {
-  if (p.queued || p.running || p.status === "running") return "running";
+  if (p.queued) return "queued";
+  if (p.running) return "running";
   if (huntFailedReason(p)) return "error";
   if (p.status === "goal_reached" || p.status === "completed") return "completed";
   if (p.status === "error") return "error";

@@ -28,8 +28,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ATKBRAIN_", env_file=".env", extra="ignore")
 
     host: str = "127.0.0.1"
-    port: int = 5003
-    frontend_port: int = 5001
+    port: int = 2333
+    frontend_port: int = 2334
 
     data_dir: Path = DATA_DIR
     db_path: Path = DATA_DIR / "atkbrain.db"
@@ -97,6 +97,8 @@ class Settings(BaseSettings):
     turn_max_seconds: int = 0          # 0=单轮不限时（整场墙钟仍生效）
     # 不中途打断从者。0=关闭中途让出（默认）。360s 只卡等御主令。
     turn_advisor_yield_sec: int = 0
+    # 单轮从者+工人必须在此时限内交回御主。CTF/SRC/红队共用。0=关闭。
+    turn_must_close_sec: int = 15 * 60
     # 回合内无思考/工具/命令才当会话卡死；不是顾问让出，也不卡长命令。
     turn_hang_sec: int = 8 * 60
     cmd_timeout: int = 0               # 0=单条命令不限时
@@ -121,6 +123,14 @@ class Settings(BaseSettings):
 
     default_objective: str = "getshell"
     api_token: str = ""
+    # Yakit：MCP 全能力桥 + MITM。开关默认关，存在 proxy-settings.json 的 yakit_enabled。
+    yakit_mcp_url: str = "http://127.0.0.1:11432/mcp"
+    yakit_mcp_host: str = "127.0.0.1"
+    yakit_mcp_port: int = 11432
+    yakit_mcp_full_port: int = 11433  # Flash 自拉 --enable-all，不抢 Cursor 的 11432
+    yakit_mitm_host: str = "127.0.0.1"
+    yakit_mitm_port: int = 8084
+    yakit_mitm_ctf: bool = False  # 缺省 CTF 不抓包；true 时仍要项目 config.yakit_mitm 才进 MITM
     github_repo: str = "Yean-Sec/StrikeAgent_AtkBrain-Flash"
     github_token: str = ""
 

@@ -197,6 +197,8 @@ code, pre, .mono { font-family: var(--font-mono); }
   background: var(--hairline); padding: 1px; cursor: pointer; display: inline-flex; align-items: center;
 }
 .proxy-switch.is-on { background: var(--success); border-color: var(--success); }
+.proxy-switch.is-locked,
+.proxy-switch:disabled { opacity: 0.55; cursor: not-allowed; }
 .proxy-switch-knob {
   width: 12px; height: 12px; border-radius: 50%; background: #fff;
   transform: translateX(0); transition: transform .16s ease;

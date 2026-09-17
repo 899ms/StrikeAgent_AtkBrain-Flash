@@ -248,6 +248,11 @@ class RunManager:
                 await h.agent.interrupt()  # type: ignore[attr-defined]
             except Exception:
                 pass
+        try:
+            from ..agents.pi_runtime import kill_live_for_project
+            kill_live_for_project(project_id)
+        except Exception:
+            pass
         if h.task and not h.task.done():
             h.task.cancel()
             try:
@@ -256,10 +261,56 @@ class RunManager:
                 # 取消后仍卡住（例如 SDK 忽略 cancel）→ 降级为 zombie，解除 is_running 占位
                 if not h.task.done():
                     h.status = "zombie"
+                    try:
+                        from ..agents.pi_runtime import kill_live_for_project
+                        kill_live_for_project(project_id)
+                    except Exception:
+                        pass
                     await self.release_handle_slots(h)
+                    try:
+                        from ..projects import update_status
+                        await update_status(project_id, "idle")
+                    except Exception:
+                        pass
                     return True
         await self.release_handle_slots(h)
         self._drop_handle(project_id, h)
+        return True
+
+    async def halt(self, project_id: str, *, reason: str = "user_stop") -> bool:
+        """真正停猎：杀 Pi/命令、清续跑清单、项目改 idle。没有句柄也照做，不留幽灵。"""
+        from ..events import emit
+        from ..projects import update_status
+        from .hunt_resume import forget_resume
+
+        try:
+            forget_resume(project_id)
+        except Exception:
+            pass
+        try:
+            from ..agents.pi_runtime import kill_live_for_project
+            kill_live_for_project(project_id)
+        except Exception:
+            pass
+        had = bool(self.handles.get(project_id))
+        if had:
+            await self.stop(project_id)
+            try:
+                from ..agents.pi_runtime import kill_live_for_project
+                kill_live_for_project(project_id)
+            except Exception:
+                pass
+        try:
+            await update_status(project_id, "idle")
+        except Exception:
+            pass
+        try:
+            await emit(
+                project_id, "status",
+                {"status": "stopped", "reason": reason},
+            )
+        except Exception:
+            pass
         return True
 
     def steer(self, project_id: str, message: str) -> bool:

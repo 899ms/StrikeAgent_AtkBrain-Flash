@@ -1,5 +1,5 @@
 [Unit]
-Description=StrikeAgent_AtkBrain-Flash API backend (uvicorn :5003)
+Description=StrikeAgent_AtkBrain-Flash API backend (uvicorn :2333)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60
@@ -11,8 +11,8 @@ WorkingDirectory=__REPO__/backend
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/root
 Environment=ATKBRAIN_HOST=0.0.0.0
-Environment=ATKBRAIN_PORT=5003
-Environment=ATKBRAIN_FRONTEND_PORT=5001
+Environment=ATKBRAIN_PORT=2333
+Environment=ATKBRAIN_FRONTEND_PORT=2334
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
 EnvironmentFile=-__REPO__/backend/data/atkbrain-claude.env
 ExecStartPre=/bin/mkdir -p __REPO__/backend/data/logs

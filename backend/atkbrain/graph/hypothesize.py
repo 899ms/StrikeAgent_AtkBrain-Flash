@@ -9,6 +9,7 @@ import hashlib
 import re
 from typing import Any
 
+from ..engine.intranet_reach import SSRF_NEIGHBOR_RULE
 from .model import SEVERITY_ORDER, IntentIn
 
 
@@ -102,6 +103,11 @@ _CHANNEL_NEGATION_RE = re.compile(
     r"恒定\s*4\d\d|统一\s*4\d\d",
     re.I,
 )
+_SSRF_PIVOT_NOTE = (
+    "只有从目标响应里看见、或经 SSRF 拿到登录页/横幅的具体内网主机才 "
+    "report_pivot_capability（ssrf_*）扩进 Scope。"
+    + SSRF_NEIGHBOR_RULE
+)
 _GADGET_TAGS = frozenset({
     "ssrf", "ssrf_internal", "ssrf_as_gateway", "proxy", "import", "upload",
     "open_proxy", "ssrf-echo", "ssrf_echo",
@@ -166,15 +172,15 @@ _IMPACT_LADDER = {
     "info_leak": "泄露片段 → 覆盖相关只读接口与样本，禁止拖全量",
     "config_leak": "配置泄露 → 本机只读鉴权差分，禁止改配",
     "key_leak": "密钥泄露 → 本机只读鉴权差分证明未授权数据",
-    "ssrf": "能打内网 → 本机云元数据/敏感口一次证明；禁止当跳板扩网",
-    "ssrf_internal": "能打内网 → 本机元数据一次证明；禁止扩网",
+    "ssrf": "能打内网 → 具体主机（登录页/横幅/目标响应里的地址）才 report_pivot_capability；探测地址和超时 oracle 不要扩网；经 SSRF 参数打内网敏感面；禁止 Kali 直连",
+    "ssrf_internal": "能打内网 → 具体主机才扩 Scope；链路本地/云元数据/超时 oracle 只当探测；经 SSRF 打从目标响应看见的内网口；禁止 Kali 直连",
     "sqli": "证库名/用户 → 只读 SELECT 一条敏感样本；禁止 DROP/DELETE/INSERT/UPDATE/拖全表",
     "db_access": "有库面 → 只读一条敏感样本，禁止拖全表",
     "idor": "单条越权 → 按对象类型覆盖敏感读，不要脚本扫穿全部 ID，禁止写",
     "unauth": "单接口未授权 → 同文档内只读/未授权面按 tag 覆盖，写接口不落库",
     "auth_bypass": "绕过登录 → 只读证明后台/敏感数据覆盖，禁止改配改价",
     "authz": "权限缺口 → 按对象类型覆盖敏感读，禁止写生产",
-    "admin_access": "进后台 → 只读证明敏感面，禁止改配/重置/落持久化",
+    "admin_access": "进后台 → 只读证明敏感面，禁止改配/重置/覆盖已有用户口令/落持久化",
     "lfi": "证路径 → 读配置/密钥/源码样本",
     "file_read": "任意读 → 凭证或少量敏感文件样本",
     "arbitrary_file_read": "任意读 → 凭证或少量敏感文件样本",
@@ -198,7 +204,10 @@ def _impact_escalate_intent(
     c = (cat or "").strip().lower()
     if o == SRC:
         ladder = "把已确认漏洞打到高危影响（大量数据/命令执行/改价），不要停在存在性 PoC"
-        extra = "不要横向、不要为拿 shell 放弃未测类型；继续挖厂商清单下一类。"
+        extra = (
+            "已验证 SSRF 必须 report_pivot_capability 扩网；"
+            "不要 socks/shell 横向、不要为拿 shell 放弃未测类型；继续挖厂商清单下一类。"
+        )
     else:
         ladder = _IMPACT_LADDER.get(c, _IMPACT_LADDER_DEFAULT_RT)
         extra = "提权/横向只在已有立足点之后，不要为换路丢掉这条已验证洞。"
@@ -229,6 +238,9 @@ def _node_looks_like_gadget(blob: str, tags: set[str], title: str = "") -> bool:
     hay = f"{title or ''} {blob or ''} {' '.join(sorted(tags))}"
     if tags & _GADGET_TAGS:
         return True
+    # 第三方 auto 节点（搜索页等）正文里出现 SSRF 字样不算跳板。
+    if re.search(r"auto from (?:https?://|http_request)", hay, re.I):
+        return False
     return bool(_GADGET_BLOB_RE.search(hay))
 
 
@@ -731,11 +743,11 @@ def _looks_like_data_plane_dsn(blob: str) -> bool:
 def _data_plane_via_app_intent(key: str, title: str, node: dict, obj: str, sev: str) -> IntentIn:
     desc = (
         f"把 {title} 里的库/缓存 DSN 当成「经应用碰数据面」："
-        f"经已验证 SSRF/gopher 碰 db_host，禁止 Kali 直连内网库，不要把 RDS IP 建成新子项目。"
+        f"经已验证 SSRF/gopher 或跳板隧道碰 db_host，禁止无跳板 Kali 直连内网库，不要把 RDS IP 建成新子项目。"
     )
     return _mk(
         key, "data_plane_via_app", desc,
-        rationale="红队数据面经应用/跳板，不是 Kali 直连",
+        rationale="红队数据面经应用/跳板隧道，不是无跳板 Kali 直连",
         est=0.74, severity=sev or "high", boost=0.14, node=node,
     )
 
@@ -826,8 +838,8 @@ _LIVE_SURFACE_INTENTS: tuple[tuple[str, str, str, str], ...] = (
     ),
     (
         "race_window", "race_window",
-        "对 {title} 在无条件锁的写接口上做短并发窗口验证",
-        "无锁写成功是并发窗口的证据",
+        "对 {title} 只证明写接口缺锁；最多对自己的测试对象做 2 路对照，禁止打爆真实库存/优惠券/名额",
+        "无锁写成功是并发窗口的证据，不要对生产对象加压",
     ),
 )
 
@@ -977,6 +989,7 @@ def _src_vendor_intents(
 def hypotheses_for_node(
     node: dict, allows_flag: bool = True, objective: str | None = None,
     brief: str = "",
+    graph: dict | None = None,
 ) -> list[IntentIn]:
     """按节点类型/标签生成有限候选假设（不去重，由 store 负责）。
 
@@ -992,7 +1005,7 @@ def hypotheses_for_node(
     sev = node.get("severity") or "info"
     tags = _tags(node)
     blob = _blob(node)
-    cred_sfx = _brief_cred_suffix(brief)
+    cred_sfx = _brief_cred_suffix("\n".join(x for x in (brief, title, blob) if x))
     binary = looks_like_served_binary(blob, title, brief)
     out: list[IntentIn] = []
 
@@ -1018,7 +1031,9 @@ def hypotheses_for_node(
         elif is_http:
             out.extend([
                 _mk(key, "auth_surface",
-                    f"枚举 {title} 的登录/鉴权/管理入口并测默认口令与弱鉴权{cred_sfx}",
+                    f"枚举 {title} 的登录/鉴权/管理入口并测默认口令与弱鉴权{cred_sfx}；"
+                    "先读表单 action；经代理转发时把方法与请求体送到内层认证处理接口，"
+                    "外壳 POST 或仍回登录页不算口令否证",
                     rationale="多数 Web 服务的高价值面在认证边界", est=0.58, severity=sev, node=node),
                 _mk(key, "access_control",
                     f"测试 {title} 的鉴权/越权/未授权访问",
@@ -1030,7 +1045,9 @@ def hypotheses_for_node(
             if _node_looks_like_gadget(blob, tags, title):
                 out.append(_mk(
                     key, "ssrf_as_gateway",
-                    f"把 {title} 当跳板：内网/回环走该 gadget，不要从攻击机直连那些地址",
+                    f"把 {title} 当跳板：内网/回环走该 gadget，不要从攻击机直连那些地址。"
+                    f"{_SSRF_PIVOT_NOTE}"
+                    "GET 与 POST 是两种能力；登录等写请求必须确认内层收到方法与 body",
                     rationale="跳板类服务的下一事件是当传输层，不是直连内网",
                     est=0.8, severity=sev, boost=0.16, node=node,
                 ))
@@ -1194,7 +1211,9 @@ def hypotheses_for_node(
                 ))
         if is_ssrf:
             out.append(_mk(key, "ssrf_as_gateway",
-                           f"把 {title} 当传输层：对回环/容器网的 HTTP 经该 SSRF 转发，禁止从攻击机直连那些 IP",
+                           f"把 {title} 当传输层：对回环/容器网的 HTTP 经该 SSRF 转发，禁止从攻击机直连那些 IP。"
+                           f"{_SSRF_PIVOT_NOTE}"
+                           "登录等写请求必须确认内层收到方法与 body，不要把外壳 POST 当已送达",
                            rationale="SSRF 入 Scope 不给攻击机路由；直连超时不是入口挂了",
                            est=0.8, severity=sev, boost=0.16, node=node))
             out.append(_mk(key, "ssrf_local_svc",
@@ -1249,23 +1268,38 @@ def hypotheses_for_node(
         )
     ):
         same_box = bool(tags & {"same-machine", "vhost"}) or "同一容器" in str(title or "")
+        from ..engine.intranet_reach import (
+            hop_auth_eligible, is_ssrf_canary_host, node_host, node_is_live_intranet,
+        )
+        host = node_host(node)
+        if host and is_ssrf_canary_host(host):
+            return out
         if not same_box:
-            # 新 hop = 新身份域。要身份 / 不要身份是逻辑对偶，不按栈、端口、路径分流。
-            # 具体监听（SSH/HTTP/其它）由 service 节点自己派生，这里不猜协议。
             out.append(_mk(
-                key, "access_control",
-                f"对 {title} 已暴露的面做未授权可达差分，与过门并行；"
-                "不要把身份验证写成使用这些面的前置条件。",
-                rationale="要身份与不要身份是并行假设",
-                est=0.74, severity="high", boost=0.13, node=node,
+                key, "fingerprint",
+                f"经已有 SSRF/shell 跳板摸清 {title} 的开放端口、HTTP 标题与服务类型，"
+                "立刻 add_node service/info 挂到该目标下；禁止 Kali 直连该 IP。",
+                rationale="新内网目标先定性活体并落图，才能打登录/未授权；直连超时是预期",
+                est=0.72, severity="high", boost=0.12, node=node,
             ))
-            out.append(_mk(
-                key, "hop_auth",
-                f"过 {title} 自己的身份边界；上一跳泄露只是候选。"
-                "同一身份面没有新秘密、只重复失败，这一跳的过门假设做完。",
-                rationale="新 hop 是新身份域；过门只是假设之一",
-                est=0.74, severity="high", boost=0.13, node=node,
-            ))
+            if node_is_live_intranet(node):
+                out.append(_mk(
+                    key, "access_control",
+                    f"对 {title} 已暴露的面做未授权可达差分，与过门并行；"
+                    "不要把身份验证写成使用这些面的前置条件。",
+                    rationale="要身份与不要身份是并行假设",
+                    est=0.74, severity="high", boost=0.13, node=node,
+                ))
+            if hop_auth_eligible(node, graph):
+                out.append(_mk(
+                    key, "hop_auth",
+                    f"过 {title} 自己的身份边界；上一跳泄露只是候选。"
+                    "经跳板 HTTP 时先确认认证接口收到请求体再判口令；"
+                    "外壳 POST、站点根路径、仍回登录页 HTML 不算失败。"
+                    "同一身份面在认证接口已送达后没有新秘密、只重复失败，这一跳的过门假设做完。",
+                    rationale="新 hop 是新身份域；过门只是假设之一",
+                    est=0.74, severity="high", boost=0.13, node=node,
+                ))
 
     elif ntype == "foothold":
         if obj == SRC:
@@ -1393,7 +1427,9 @@ def hypotheses_for_finding(finding: Any, node: dict, allows_flag: bool = True,
                        evidence_extra=cat, node=node))
     elif cat in ("ssrf", "ssrf_internal"):
         out.append(_mk(key, "ssrf_as_gateway",
-                       f"把 SSRF「{title}」当跳板：内网/回环 HTTP 走 gadget，不要从攻击机直连那些 IP",
+                       f"把 SSRF「{title}」当跳板：内网/回环 HTTP 走 gadget，不要从攻击机直连那些 IP。"
+                       f"{_SSRF_PIVOT_NOTE}"
+                       "登录等写请求必须确认内层收到方法与 body",
                        rationale="SSRF 扩容只授权打目标，不授予攻击机路由", est=0.82, severity=sev, boost=0.16,
                        evidence_extra=cat, node=node))
         out.append(_mk(key, "ssrf_local_svc",

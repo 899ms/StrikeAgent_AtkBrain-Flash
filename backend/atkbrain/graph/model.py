@@ -21,7 +21,7 @@ def scrub_candidate_rce_label(text: str | None) -> str:
 # ---- 领域常量 ---------------------------------------------------------------
 
 NodeType = Literal[
-    "target",      # 项目入口/目标本身；内网 IP 不是新 target，挂 info/service
+    "target",      # 入口（entry）或经漏洞发现的内网目标（pivot）；同机 vhost 仍是 info
     "info",        # 信息点（技术栈、路径、参数…）
     "service",     # 开放服务/端口
     "danger",      # 危险点（可疑功能、攻击面）

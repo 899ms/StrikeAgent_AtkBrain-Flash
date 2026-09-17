@@ -1,14 +1,14 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-const apiOrigin = process.env.ATKBRAIN_API_ORIGIN || "http://127.0.0.1:5003";
-const frontendPort = Number(process.env.ATKBRAIN_FRONTEND_PORT || 5001);
+const apiOrigin = process.env.ATKBRAIN_API_ORIGIN || "http://127.0.0.1:2333";
+const frontendPort = Number(process.env.ATKBRAIN_FRONTEND_PORT || 2334);
 
 // 开发期把 /api 与 /ws 代理到后端 FastAPI
 export default defineConfig({
   plugins: [react()],
   server: {
-    // 允许局域网访问（Windows 远程连 Kali 时用 192.168.x.x:5001）
+    // 允许局域网访问（Windows 远程连 Kali 时用 192.168.x.x:2334）
     host: "0.0.0.0",
     port: frontendPort,
     strictPort: true,

@@ -20,7 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ATKBRAIN_HOSTED=1 \
     ATKBRAIN_LLM_GATEWAY=1 \
     ATKBRAIN_HOST=0.0.0.0 \
-    ATKBRAIN_PORT=5003 \
+    ATKBRAIN_PORT=2333 \
     ATKBRAIN_PI_BIN=pi \
     ATKBRAIN_PI_PROVIDER=deepseek \
     ATKBRAIN_PI_MODEL=deepseek-flash \
@@ -106,9 +106,9 @@ COPY scripts/docker-entrypoint.sh /opt/atkbrain/docker-entrypoint.sh
 RUN chmod 0755 /opt/atkbrain/docker-entrypoint.sh \
     && find /opt/atkbrain/backend/atkbrain -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-EXPOSE 5003
+EXPOSE 2333
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:5003/api/health || exit 1
+    CMD curl -fsS http://127.0.0.1:2333/api/health || exit 1
 
 ENTRYPOINT ["/opt/atkbrain/docker-entrypoint.sh"]

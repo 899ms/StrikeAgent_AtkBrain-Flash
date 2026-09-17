@@ -79,7 +79,7 @@ async def project_ws(ws: WebSocket, pid: str):
                         continue
                     manager.start(pid, hard_restart=bool(msg.get("confirm_restart")))
             elif mtype == "stop":
-                await manager.stop(pid)
+                await manager.halt(pid)
             elif mtype == "ping":
                 await ws.send_json({"type": "pong"})
 

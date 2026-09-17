@@ -79,7 +79,7 @@ def main() -> None:
     # layer: console
     rr(d, (40 * S, 148 * S, 1360 * S, 268 * S), 10, CARD, HAIR, 1)
     tx(d, (60 * S, 164 * S), "01  控制台", f_h, INK)
-    tx(d, (180 * S, 168 * S), "Vite  :5001", f_en, MUTED)
+    tx(d, (180 * S, 168 * S), "Vite  :2334", f_en, MUTED)
     chips = [
         (70, "项目  单目标 / 集群 / 评测"),
         (330, "猎面  攻击图 · 时间线 · 漏洞 · 对话"),
@@ -96,7 +96,7 @@ def main() -> None:
     # layer: api
     rr(d, (40 * S, 292 * S, 1360 * S, 400 * S), 10, CARD, HAIR, 1)
     tx(d, (60 * S, 308 * S), "02  API 与调度", f_h, INK)
-    tx(d, (220 * S, 312 * S), "FastAPI  :5003", f_en, MUTED)
+    tx(d, (220 * S, 312 * S), "FastAPI  :2333", f_en, MUTED)
     api = [
         (70, 240, "REST  项目 / 图 / 发现 / 报告 / 记忆"),
         (340, 260, "WebSocket  轮次事件推到控制台"),

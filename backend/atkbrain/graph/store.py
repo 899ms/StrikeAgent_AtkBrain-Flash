@@ -40,6 +40,19 @@ from .model import (
 )
 
 
+_GRAPH_CACHE: dict[str, tuple[float, dict]] = {}
+_GRAPH_TTL_SEC = 2.0
+_INTENT_AT: dict[str, float] = {}
+_INTENT_TTL_SEC = 20.0
+
+
+def invalidate_graph_cache(project_id: str | None = None) -> None:
+    if project_id:
+        _GRAPH_CACHE.pop(project_id, None)
+        return
+    _GRAPH_CACHE.clear()
+
+
 # ---- 节点 -------------------------------------------------------------------
 
 async def upsert_node(project_id: str, node: NodeIn, run_id: str | None = None) -> dict:
@@ -85,7 +98,14 @@ async def upsert_node(project_id: str, node: NodeIn, run_id: str | None = None) 
             await _rewire_node_key(project_id, orig_key, node.key)
     await _autofinding_from_node(project_id, row, run_id)
     # 新建或更新非蜜罐节点时派生推理前沿（strategy_key 去重，不会无限膨胀）
-    if node.type not in ("target", "honeypot"):
+    # 入口 target 不派生假说；跳板发现的内网目标要派生侦察，否则不会去摸端口/标题。
+    tags_l = {str(t).lower() for t in (node.tags or [])}
+    pivot_target = (
+        node.type == "target"
+        and "entry" not in tags_l
+        and bool(tags_l & {"lateral", "pivot", "internal", "scope-expanded", "via-live"})
+    )
+    if node.type != "honeypot" and (node.type != "target" or pivot_target):
         await derive_intents_for_node(project_id, row, run_id=run_id)
     # 新主机上的任意发现落图后即补齐目标区域与横向链路，不必等 get_graph。
     # Redis 等服务常先于该主机的 shell 被发现，不能因此留下游离区域。
@@ -94,6 +114,7 @@ async def upsert_node(project_id: str, node: NodeIn, run_id: str | None = None) 
     # 智能体常 add_node 却忘了 add_edge：新建节点立刻补 CONTAINS，前端才能实时看到连线
     if created and node.type != "target":
         await ensure_target_attachments(project_id, run_id=run_id)
+    invalidate_graph_cache(project_id)
     return row
 
 
@@ -600,8 +621,14 @@ async def ensure_target_attachments(project_id: str, run_id: str | None = None) 
                 src, relation = preferred
                 weight, rationale = 0.7, f"系统自动补边：经 {src} 挂入攻击链"
             else:
-                src, relation = primary, "CONTAINS"
-                weight, rationale = 0.55, "系统自动补边：将游离发现挂回目标起点"
+                host = _host_of_node(root, _node_tags(root_node))
+                same_tgt = f"target:{host}" if host else ""
+                if same_tgt and same_tgt in by_key and same_tgt != primary:
+                    src, relation = same_tgt, "CONTAINS"
+                    weight, rationale = 0.8, f"系统自动补边：挂到内网目标 {host}"
+                else:
+                    src, relation = primary, "CONTAINS"
+                    weight, rationale = 0.55, "系统自动补边：将游离发现挂回目标起点"
             exists = await db.fetchone(
                 "SELECT id FROM edges WHERE project_id=? AND src=? AND dst=? AND relation=?",
                 (project_id, src, root, relation),
@@ -671,7 +698,7 @@ def _host_from_target_key(key: str) -> str:
 
 
 def _host_from_asset_key(key: str) -> str:
-    """入口 target:IP、内网 info:host:IP / info:scope-expanded:IP 上的主机。"""
+    """入口/内网 target:IP，以及旧 info:host:IP / info:scope-expanded:IP 上的主机。"""
     k = str(key or "")
     host = _host_from_target_key(k)
     if host:
@@ -732,101 +759,134 @@ async def _is_peer_entry_host(project_id: str, host: str) -> bool:
     return host in {str(p or "").split(":")[0].strip().lower().rstrip(".") for p in peers}
 
 
+def _should_promote_intranet_host(host: str, tags: list | None, primary: str) -> bool:
+    """跳板发现的内网地址升成 target；入口、邻题、同机 vhost、纯线索不升。"""
+    host = (host or "").strip().lower().split(":")[0].rstrip(".")
+    if not host:
+        return False
+    if primary and host == primary:
+        return False
+    tags_l = {str(t).lower() for t in (tags or [])}
+    if "entry" in tags_l:
+        return False
+    if tags_l & {"vhost", "same-machine"}:
+        return False
+    if "clue-only" in tags_l and "via-live" not in tags_l:
+        return False
+    if tags_l & {"lateral", "pivot", "internal", "scope-expanded"}:
+        return True
+    return _is_rfc1918(host)
+
+
 async def _coerce_intranet_target_node(project_id: str, node: NodeIn) -> NodeIn:
-    """内网 IP 不得另开黑色 target：改挂为本题入口下的 info:host 资产。"""
+    """入口保留 entry；跳板发现的内网 IP 落成 type=target。同机 vhost 仍是信息。"""
     tags = list(node.tags or [])
     host = _host_from_asset_key(node.key) or _host_of_node(node.key, tags)
-    if node.type != "target" and not str(node.key or "").startswith("target:"):
-        return node
     if not host:
+        return node
+    tags_l = {str(t).lower() for t in tags}
+    if tags_l & {"vhost", "same-machine"}:
         return node
     primary = await _project_entry_host(project_id)
     if primary and host == primary:
         return node
     if await _is_peer_entry_host(project_id, host):
         return node
-    if not _is_intranet_asset_host(host, tags):
+    key = str(node.key or "")
+    declared_target = node.type == "target" or key.startswith("target:")
+    old_info = key.startswith(("info:host:", "info:scope-expanded:"))
+    if not (declared_target or old_info):
+        return node
+    if not _should_promote_intranet_host(host, tags, primary or ""):
         return node
     for t in ("internal", "pivot", f"host:{host}"):
         if t not in tags:
             tags.append(t)
+    title = node.title or f"内网目标 {host}"
+    if title.startswith("内网主机 ") or title.startswith("内网资产 "):
+        title = f"内网目标 {host}"
     return node.model_copy(update={
-        "type": "info",
-        "key": f"info:host:{host}",
+        "type": "target",
+        "key": f"target:{host}",
         "tags": tags,
-        "title": node.title or f"内网主机 {host}",
+        "title": title,
     })
 
 
 _folding_projects: set[str] = set()
 
 
-async def fold_intranet_targets(project_id: str, run_id: str | None = None) -> int:
-    """把误建成 type=target 的内网 IP 并入本题唯一入口目标。"""
+async def _drop_entry_contains(project_id: str, primary: str, dst_key: str) -> None:
+    if not primary or not dst_key:
+        return
+    await db.execute(
+        "DELETE FROM edges WHERE project_id=? AND src=? AND dst=? AND relation='CONTAINS'",
+        (project_id, f"target:{primary}", dst_key),
+    )
+
+
+async def promote_intranet_hosts(project_id: str, run_id: str | None = None) -> int:
+    """把旧 info:host / info:scope-expanded 升成 target:IP。入口不折，vhost 不升。"""
     if not project_id or project_id in _folding_projects:
         return 0
     primary = await _project_entry_host(project_id)
-    if not primary:
-        return 0
-    primary_key = f"target:{primary}"
     _folding_projects.add(project_id)
-    folded = 0
+    promoted = 0
     try:
         rows = await db.fetchall(
-            "SELECT key, type, tags, title FROM nodes WHERE project_id=? AND key LIKE 'target:%'",
+            """SELECT key, type, tags, title FROM nodes WHERE project_id=?
+               AND (key LIKE 'info:host:%' OR key LIKE 'info:scope-expanded:%')""",
             (project_id,),
         )
         for r in rows:
             key = r["key"]
-            if key == primary_key:
-                continue
-            host = _host_from_target_key(key)
-            if not host or host == primary:
+            host = _host_from_asset_key(key)
+            tags = _loads(r["tags"]) if not isinstance(r["tags"], list) else r["tags"]
+            tags = list(tags or [])
+            if not host or not _should_promote_intranet_host(host, tags, primary or ""):
                 continue
             if await _is_peer_entry_host(project_id, host):
                 continue
-            tags = _loads(r["tags"]) if not isinstance(r["tags"], list) else r["tags"]
-            tags = tags or []
-            if not _is_intranet_asset_host(host, tags):
-                continue
-            ikey = f"info:host:{host}"
-            if key == ikey:
-                if r["type"] == "target":
-                    await db.execute(
-                        "UPDATE nodes SET type='info', updated_at=? WHERE project_id=? AND key=?",
-                        (now(), project_id, key),
-                    )
-                    folded += 1
-                continue
+            tkey = f"target:{host}"
+            for t in ("internal", "pivot", f"host:{host}"):
+                if t not in tags:
+                    tags.append(t)
             existing = await db.fetchone(
                 "SELECT key FROM nodes WHERE project_id=? AND key=?",
-                (project_id, ikey),
+                (project_id, tkey),
             )
             if not existing:
                 await upsert_node(
                     project_id,
                     NodeIn(
-                        key=ikey,
-                        type="info",
-                        title=(r["title"] or f"内网主机 {host}"),
-                        detail=f"本题内网资产 {host}",
+                        key=tkey,
+                        type="target",
+                        title=(r["title"] or f"内网目标 {host}"),
+                        detail=f"经跳板发现的内网目标 {host}",
                         severity="info",
-                        tags=["internal", "pivot", f"host:{host}"],
+                        tags=tags,
                     ),
                     run_id=run_id,
                 )
-            await _rewire_node_key(project_id, key, ikey)
-            if await _insert_edge_once(
-                project_id, primary_key, ikey, "CONTAINS",
-                weight=0.8,
-                rationale=f"内网资产 {host} 属于入口目标 {primary}",
-                run_id=run_id,
-            ):
-                pass
-            folded += 1
-        return folded
+            else:
+                await db.execute(
+                    "UPDATE nodes SET type='target', tags=?, updated_at=? WHERE project_id=? AND key=?",
+                    (_dumps(tags), now(), project_id, tkey),
+                )
+            if key != tkey:
+                await _rewire_node_key(project_id, key, tkey)
+            if primary:
+                await _drop_entry_contains(project_id, primary, tkey)
+                await _drop_entry_contains(project_id, primary, key)
+            promoted += 1
+        return promoted
     finally:
         _folding_projects.discard(project_id)
+
+
+async def fold_intranet_targets(project_id: str, run_id: str | None = None) -> int:
+    """旧名：现改为把内网信息点升成独立目标，不再折回入口。"""
+    return await promote_intranet_hosts(project_id, run_id=run_id)
 
 
 def _canon_host_fragment(host: str) -> str:
@@ -891,10 +951,38 @@ def _absent_canon_fragments(text: str, live_frags: set[str]) -> bool:
     return False
 
 
+async def _merge_node_tags(project_id: str, key: str, extra: list[str]) -> None:
+    if not key or not extra:
+        return
+    row = await db.fetchone(
+        "SELECT tags FROM nodes WHERE project_id=? AND key=?", (project_id, key),
+    )
+    if not row:
+        return
+    tags = _loads(row["tags"]) if not isinstance(row["tags"], list) else list(row["tags"] or [])
+    tags = [str(t) for t in (tags or [])]
+    changed = False
+    for t in extra:
+        s = str(t or "").strip()
+        if s and s not in tags:
+            tags.append(s)
+            changed = True
+    from ..engine.intranet_reach import TAG_CLUE, TAG_LIVE
+    if TAG_LIVE in tags and TAG_CLUE in tags:
+        tags = [t for t in tags if t != TAG_CLUE]
+        changed = True
+    if changed:
+        await db.execute(
+            "UPDATE nodes SET tags=?, updated_at=? WHERE project_id=? AND key=?",
+            (_dumps(tags), now(), project_id, key),
+        )
+
+
 async def ensure_host_target(
     project_id: str, host: str, *, title: str = "", run_id: str | None = None,
+    live: bool | None = None, extra_tags: list[str] | None = None,
 ) -> str:
-    """确保主机在图上有节点。入口仍是唯一黑色 target；内网 IP 挂成 info 资产。"""
+    """确保主机在图上有节点。入口是 entry target；跳板发现的内网地址也是 target。"""
     host = (host or "").strip().lower().rstrip(".")
     if not host:
         return ""
@@ -920,54 +1008,97 @@ async def ensure_host_target(
         return tkey
     if await _is_peer_entry_host(project_id, host):
         return ""
-    ikey = f"info:host:{host}"
-    for cand in (f"info:host:{host}", f"info:scope-expanded:{host}"):
+    from ..engine.intranet_reach import TAG_CLUE, TAG_LIVE
+    want = list(extra_tags or [])
+    clue_only = live is False
+    if live is True:
+        want.extend([TAG_LIVE, "scope-expanded", "pivot", "internal", f"host:{host}"])
+    elif clue_only:
+        want.extend([TAG_CLUE, "internal", f"host:{host}"])
+    else:
+        want.extend(["internal", "pivot", "lateral", f"host:{host}"])
+    seen_t: list[str] = []
+    for t in want:
+        s = str(t or "").strip()
+        if s and s not in seen_t:
+            seen_t.append(s)
+    if live is True:
+        seen_t = [t for t in seen_t if t != TAG_CLUE]
+    if clue_only:
+        ikey = f"info:host:{host}"
         existing = await db.fetchone(
-            "SELECT key FROM nodes WHERE project_id=? AND key=?", (project_id, cand)
+            "SELECT key FROM nodes WHERE project_id=? AND key=?", (project_id, ikey)
         )
         if existing:
-            ikey = cand
-            break
-    else:
-        await upsert_node(
-            project_id,
-            NodeIn(
-                key=ikey,
-                type="info",
-                title=title or f"内网主机 {host}",
-                detail=f"本题内网资产 {host}",
-                severity="info",
-                tags=["internal", "pivot", "lateral", f"host:{host}"],
-            ),
-            run_id=run_id,
-        )
-    if primary:
-        await _insert_edge_once(
-            project_id, f"target:{primary}", ikey, "CONTAINS",
-            weight=0.8,
-            rationale=f"内网资产 {host} 属于入口目标 {primary}",
-            run_id=run_id,
-        )
-    old = f"target:{host}"
-    leftover = await db.fetchone(
-        "SELECT id FROM nodes WHERE project_id=? AND key=?", (project_id, old)
-    )
-    if leftover and old != ikey:
-        await _rewire_node_key(project_id, old, ikey)
-        if primary:
-            await _insert_edge_once(
-                project_id, f"target:{primary}", ikey, "CONTAINS",
-                weight=0.8,
-                rationale=f"内网资产 {host} 属于入口目标 {primary}",
+            await _merge_node_tags(project_id, ikey, seen_t)
+        else:
+            await upsert_node(
+                project_id,
+                NodeIn(
+                    key=ikey,
+                    type="info",
+                    title=title or f"内网线索 {host}",
+                    detail=f"本题内网线索 {host}",
+                    severity="info",
+                    tags=seen_t,
+                ),
                 run_id=run_id,
             )
-    return ikey
+        return ikey
+    tkey = f"target:{host}"
+    for cand in (tkey, f"info:host:{host}", f"info:scope-expanded:{host}"):
+        existing = await db.fetchone(
+            "SELECT key, type FROM nodes WHERE project_id=? AND key=?", (project_id, cand)
+        )
+        if not existing:
+            continue
+        if cand != tkey:
+            t_exists = await db.fetchone(
+                "SELECT key FROM nodes WHERE project_id=? AND key=?", (project_id, tkey)
+            )
+            if not t_exists:
+                await upsert_node(
+                    project_id,
+                    NodeIn(
+                        key=tkey,
+                        type="target",
+                        title=title or f"内网目标 {host}",
+                        detail=f"经跳板发现的内网目标 {host}",
+                        severity="info",
+                        tags=seen_t,
+                    ),
+                    run_id=run_id,
+                )
+            await _rewire_node_key(project_id, cand, tkey)
+        await _merge_node_tags(project_id, tkey, seen_t)
+        await db.execute(
+            "UPDATE nodes SET type='target', updated_at=? WHERE project_id=? AND key=?",
+            (now(), project_id, tkey),
+        )
+        if primary:
+            await _drop_entry_contains(project_id, primary, tkey)
+        return tkey
+    await upsert_node(
+        project_id,
+        NodeIn(
+            key=tkey,
+            type="target",
+            title=title or f"内网目标 {host}",
+            detail=f"经跳板发现的内网目标 {host}",
+            severity="info",
+            tags=seen_t,
+        ),
+        run_id=run_id,
+    )
+    if primary:
+        await _drop_entry_contains(project_id, primary, tkey)
+    return tkey
 
 
 def _is_entry_target_row(row) -> bool:
     tags = _loads(row["tags"]) if not isinstance(row["tags"], list) else row["tags"]
     tags = tags or []
-    if any(t in tags for t in ("lateral", "pivot", "vhost", "same-machine")):
+    if any(t in tags for t in ("lateral", "pivot", "vhost", "same-machine", "internal", "scope-expanded")):
         return False
     return "entry" in tags or not tags
 
@@ -1005,6 +1136,39 @@ async def _rewire_node_key(project_id: str, old_key: str, new_key: str) -> int:
     return moved
 
 
+def entry_adopt_retire_hosts(
+    new_host: str,
+    extra_hosts: list[str],
+    *,
+    keep_hosts: set[str] | None = None,
+    peer_hosts: set[str] | None = None,
+) -> tuple[str, list[str]]:
+    """入口换址：邻题地址既不能当新入口，也不能被并进来。
+
+    返回 ('refuse', []) 或 ('ok', 要并入的旧入口主机列表)。
+    """
+    new_h = (new_host or "").strip().lower().split(":")[0].rstrip(".")
+    peers = {
+        (h or "").strip().lower().split(":")[0].rstrip(".")
+        for h in (peer_hosts or ()) if h
+    }
+    peers.discard("")
+    if new_h and new_h in peers:
+        return ("refuse", [])
+    keep = {
+        (h or "").strip().lower().split(":")[0].rstrip(".")
+        for h in (keep_hosts or ()) if h
+    }
+    keep.discard("")
+    retire: list[str] = []
+    for raw in extra_hosts or []:
+        h = (raw or "").strip().lower().split(":")[0].rstrip(".")
+        if not h or h == new_h or h in keep or h in peers:
+            continue
+        retire.append(h)
+    return ("ok", retire)
+
+
 async def adopt_entry_host(
     project_id: str, host: str, *, scope_detail: Any = None, run_id: str | None = None,
     keep_hosts: set[str] | None = None,
@@ -1012,6 +1176,7 @@ async def adopt_entry_host(
     """评测容器换 IP 后，旧入口不是第二台主机：把 entry target 并到当前地址。
 
     keep_hosts：本题当前仍活着的入口（全部 container_addr），不要并进 primary。
+    邻题入口既不能当新地址，也不能被并进来。
     """
     host = (host or "").strip().lower().split(":")[0].rstrip(".")
     if not host:
@@ -1021,25 +1186,48 @@ async def adopt_entry_host(
         for h in (keep_hosts or ()) if h
     }
     keep.discard("")
-    new_key = f"target:{host}"
-    existing = await db.fetchone(
-        "SELECT key FROM nodes WHERE project_id=? AND key=?", (project_id, new_key)
-    )
+    peers: set[str] = set()
+    try:
+        from ..scope_pivot import peer_challenge_entry_hosts
+        peers = await peer_challenge_entry_hosts(project_id) or set()
+        peers = {
+            (p or "").split(":")[0].strip().lower().rstrip(".")
+            for p in peers if p
+        }
+        peers.discard("")
+    except Exception:
+        peers = set()
     rows = await db.fetchall(
         "SELECT key, tags FROM nodes WHERE project_id=? AND type='target'",
         (project_id,),
     )
-    extras = []
+    extra_hosts = []
+    extra_rows = []
+    new_key = f"target:{host}"
     for n in rows:
         if n["key"] == new_key:
             continue
         if not _is_entry_target_row(n):
             continue
         other = _host_from_target_key(n["key"])
-        if other and other in keep:
-            continue
-        extras.append(n)
-    retired: list[str] = []
+        extra_rows.append(n)
+        if other:
+            extra_hosts.append(other)
+    decision, retire_hosts = entry_adopt_retire_hosts(
+        host, extra_hosts, keep_hosts=keep, peer_hosts=peers,
+    )
+    if decision == "refuse":
+        await emit(
+            project_id, "log",
+            {"level": "warn",
+             "message": f"入口换址拒绝：{host} 是邻题入口，保留本题原入口节点。"},
+            run_id=run_id,
+        )
+        return {"entry": "", "retired": [], "deferred": 0, "refused": "peer"}
+    retire_set = set(retire_hosts)
+    existing = await db.fetchone(
+        "SELECT key FROM nodes WHERE project_id=? AND key=?", (project_id, new_key)
+    )
     if not existing:
         await upsert_node(
             project_id,
@@ -1050,7 +1238,13 @@ async def adopt_entry_host(
             ),
             run_id=run_id,
         )
-    for n in extras:
+    retired: list[str] = []
+    for n in extra_rows:
+        other = _host_from_target_key(n["key"])
+        if other and other not in retire_set:
+            continue
+        if not other:
+            continue
         await _rewire_node_key(project_id, n["key"], new_key)
         retired.append(n["key"])
     if retired:
@@ -1284,6 +1478,34 @@ async def reopen_false_closed_oracle(
     return n
 
 
+async def reopen_false_disproved_hop_auth(
+    project_id: str, *, run_id: str | None = None,
+) -> int:
+    """外壳 POST / 登录页 / 超时等假否证不能关掉 hop_auth。"""
+    from ..engine.hop_auth_gate import false_hop_auth_disprove_reason, is_hop_auth_intent
+
+    rows = await db.fetchall(
+        """SELECT id, strategy_key, result_summary, failure_fingerprint FROM intents
+           WHERE project_id=? AND status='disproved'""",
+        (project_id,),
+    )
+    n = 0
+    reason = "假否证不能关闭过门：复开 hop_auth"
+    for r in rows:
+        if not is_hop_auth_intent(r):
+            continue
+        if not false_hop_auth_disprove_reason(
+            r.get("result_summary"), r.get("failure_fingerprint"),
+        ):
+            continue
+        await set_intent_status(
+            project_id, r["id"], "open",
+            result_summary=reason, run_id=run_id,
+        )
+        n += 1
+    return n
+
+
 async def defer_local_closeout_for_remaining_flags(
     project_id: str, run_id: str | None = None,
 ) -> int:
@@ -1333,10 +1555,96 @@ async def defer_local_closeout_for_remaining_flags(
         await emit(
             project_id, "log",
             {"level": "info",
-             "message": f"剩余 flag：已搁置 {n} 条本机收口 Intent，优先 hop_auth（入口 {entry}）"},
+             "message": (
+                 f"剩余 flag：已搁置 {n} 条本机收口 Intent，"
+                 f"优先邻机 hop_auth（入口 {entry} 已交过的不要再挖）"
+             )},
             run_id=run_id,
         )
     return n
+
+
+async def defer_ineligible_hop_auth(
+    project_id: str, run_id: str | None = None,
+) -> int:
+    """广播/空号 hop_auth 在已有活面时搁置。"""
+    from ..engine.intranet_reach import intent_private_hosts, junk_hop_auth_host
+    hops = await db.fetchall(
+        """SELECT * FROM intents WHERE project_id=? AND strategy_key LIKE '%::hop_auth'
+           AND status IN ('open','active')""",
+        (project_id,),
+    )
+    if not hops:
+        return 0
+    graph = await get_graph(project_id)
+    n = 0
+    reason = "空号/广播/SSRF 探测地址不是身份门：搁置 hop_auth"
+    for r in hops:
+        it = _serialize_intent(r)
+        hosts = intent_private_hosts(it)
+        if not hosts:
+            continue
+        if not all(junk_hop_auth_host(h, graph) for h in hosts):
+            continue
+        await set_intent_status(
+            project_id, r["id"], "deferred",
+            result_summary=reason, failure_fingerprint=reason, run_id=run_id,
+        )
+        n += 1
+    return n
+
+
+async def nudge_hop_auth_frontier(
+    project_id: str, run_id: str | None = None,
+) -> str:
+    """本轮中途看见活邻机时，把最佳 hop_auth 认领上；错误 active 退回 open。"""
+    from ..engine.advisor_bind import hop_auth_switch_plan, preferred_hop_auth_id
+    from ..engine.hop_auth_gate import HOP_AUTH_NUDGE_MSG
+
+    try:
+        await defer_ineligible_hop_auth(project_id, run_id=run_id)
+    except Exception:
+        pass
+    hops = await db.fetchall(
+        """SELECT * FROM intents WHERE project_id=? AND strategy_key LIKE '%::hop_auth'
+           AND status IN ('open','active')""",
+        (project_id,),
+    )
+    if not hops:
+        return ""
+    serialized = [_serialize_intent(r) for r in hops]
+    graph = await get_graph(project_id)
+    iid = preferred_hop_auth_id(serialized, graph=graph)
+    if not iid:
+        return ""
+    plan = hop_auth_switch_plan(serialized, iid)
+    for old in plan.get("reopen") or []:
+        await set_intent_status(
+            project_id, old, "open",
+            result_summary="过门认领换到活身份面",
+            run_id=run_id,
+        )
+    claimed = []
+    if plan.get("claim"):
+        claimed = await claim_intents(project_id, [plan["claim"]], run_id=run_id)
+        if claimed:
+            sk = str((claimed[0] or {}).get("strategy_key") or "")[-48:]
+            await emit(
+                project_id, "log",
+                {"level": "info",
+                 "message": (
+                     "过门认领换到活身份面: " + sk
+                     if plan.get("reopen") else f"中途把 hop_auth 推上前沿: {sk}"
+                 )},
+                run_id=run_id,
+            )
+    elif plan.get("reopen"):
+        await emit(
+            project_id, "log",
+            {"level": "info", "message": "过门认领换到活身份面"},
+            run_id=run_id,
+        )
+    return HOP_AUTH_NUDGE_MSG
 
 
 async def _insert_edge_once(
@@ -1369,18 +1677,18 @@ async def _insert_edge_once(
 
 
 async def ensure_lateral_pivots(project_id: str, run_id: str | None = None) -> int:
-    """多主机立足点挂在本题唯一入口 target 下，不另开黑色目标。
+    """内网横向 / 跳板可达：漏洞连到新内网 target；立足点挂在新目标下。
 
     拓扑：
-      target:入口 ──CONTAINS──►  info:host:内网IP / foothold:shell@内网IP
-      foothold:shell@入口  ──PIVOTS_TO──►  foothold:shell@内网IP
-    SSRF 可达、端口发现等未验证 shell 的边降级为 LEADS_TO。
+      vuln:ssrf|rce  ──LEADS_TO / PIVOTS_TO──►  target:内网IP
+      target:内网IP  ──CONTAINS──►  foothold:shell@内网IP
+    旧 foothold→foothold 紫线降级为 LEADS_TO。
     """
     if project_id in _pivoting_projects:
         return 0
     _pivoting_projects.add(project_id)
     try:
-        added = await fold_intranet_targets(project_id, run_id=run_id)
+        added = await promote_intranet_hosts(project_id, run_id=run_id)
         rows = await db.fetchall(
             """SELECT key, type, tags, is_rce, created_at, title FROM nodes
                WHERE project_id=?
@@ -1478,14 +1786,18 @@ async def ensure_lateral_pivots(project_id: str, run_id: str | None = None) -> i
                 or control_hosts.get(e["dst"], "")
                 or _host_from_asset_key(e["dst"])
             )
-            src_host = control_hosts.get(e["src"], "")
-            valid = bool(
-                dst_host
-                and src_host
-                and src_host != dst_host
-                and bool(controls.get(e["src"], {}).get("is_rce"))
-                and dst_host in verified_hosts
+            src_key = str(e["src"] or "")
+            dst_key = str(e["dst"] or "")
+            src_is_vuln = src_key.startswith("vuln:")
+            dst_is_new_target = (
+                dst_key.startswith("target:")
+                and bool(dst_host)
+                and dst_host != primary_host
             )
+            if src_is_vuln and dst_is_new_target:
+                continue
+            src_host = control_hosts.get(e["src"], "")
+            valid = False
             if not valid:
                 duplicate = await db.fetchone(
                     """SELECT id FROM edges WHERE project_id=? AND src=? AND dst=?
@@ -1493,13 +1805,12 @@ async def ensure_lateral_pivots(project_id: str, run_id: str | None = None) -> i
                     (project_id, e["src"], e["dst"]),
                 )
                 if duplicate:
-                    # 已有相同发现线时，删除错误紫线，避免违反边关系的唯一约束。
                     await db.execute("DELETE FROM edges WHERE id=?", (e["id"],))
                 else:
                     await db.execute(
                         """UPDATE edges SET relation='LEADS_TO', rationale=? WHERE id=?""",
                         (
-                            f"{e['rationale'] or '发现链路'} [未验证新主机 shell/RCE，非内网横向]",
+                            f"{e['rationale'] or '发现链路'} [横向主边改为漏洞→新目标]",
                             e["id"],
                         ),
                     )
@@ -1562,48 +1873,37 @@ async def ensure_lateral_pivots(project_id: str, run_id: str | None = None) -> i
             (h for h in by_host if h != pivot_src_host),
             key=lambda h: min(n["created_at"] for n in by_host[h]),
         )
-        prev_shell = pivot_src
         for host in other_hosts:
             shell = _best_foothold(by_host[host])
             shell_key = shell["key"]
             asset_key = await ensure_host_target(
                 project_id, host,
-                title=f"内网主机 {host}",
+                title=f"内网目标 {host}",
                 run_id=run_id,
             )
 
-            # 横向线：上一台已验证 shell → 本机已验证 shell（仍属同一入口目标）
-            if host not in pivoted_hosts:
-                src_rce = bool(controls.get(prev_shell, {}).get("is_rce"))
-                if src_rce and host in verified_hosts:
+            if host not in pivoted_hosts and host in verified_hosts:
+                vuln = await find_pivot_vuln(
+                    project_id, pivot_src_host, mechanism="shell_reachable",
+                )
+                if vuln and asset_key and vuln != asset_key:
                     if await _insert_edge_once(
-                        project_id, prev_shell, shell_key, "PIVOTS_TO",
+                        project_id, vuln, asset_key, "PIVOTS_TO",
                         weight=0.95,
-                        rationale=f"内网横向：{prev_shell} → {host}",
+                        rationale=f"pivot_capability shell_reachable: {vuln} → {host}",
                         run_id=run_id,
                     ):
                         added += 1
                         pivoted_hosts.add(host)
 
-            if primary_target:
-                if await _insert_edge_once(
-                    project_id, primary_target, shell_key, "CONTAINS",
-                    weight=0.85,
-                    rationale=f"内网立足点 {host} 属于入口目标",
-                    run_id=run_id,
-                ):
-                    added += 1
             if asset_key and asset_key not in (primary_target, shell_key):
                 if await _insert_edge_once(
-                    project_id, asset_key, shell_key, "LEADS_TO",
-                    weight=0.8,
-                    rationale=f"内网主机 {host} 上的立足点",
+                    project_id, asset_key, shell_key, "CONTAINS",
+                    weight=0.85,
+                    rationale=f"内网目标 {host} 上的立足点",
                     run_id=run_id,
                 ):
                     added += 1
-
-            if bool(shell.get("is_rce")):
-                prev_shell = shell_key
 
         if added:
             await recompute_rce_path(project_id, run_id=run_id)
@@ -1646,6 +1946,92 @@ async def find_pivot_source(project_id: str, primary_host: str = "") -> str:
         (project_id,),
     )
     return t["key"] if t else ""
+
+
+_SSRF_VULN_CATS = frozenset({"ssrf", "ssrf_internal"})
+_RCE_VULN_CATS = frozenset({
+    "rce", "command_injection", "deserialization", "ssti", "file_upload",
+    "code_exec",
+})
+
+
+def _vuln_matches_host(key: str, tags: list | None, host: str) -> bool:
+    if not host:
+        return True
+    tags = tags or []
+    if _host_of_node(key, tags) == host:
+        return True
+    blob = f"{key} {' '.join(str(t) for t in tags)}"
+    return host in blob
+
+
+async def find_pivot_vuln(
+    project_id: str, from_host: str = "", mechanism: str = "",
+) -> str:
+    """跳板紫线起点：该主机上的 SSRF 或 RCE 漏洞。找不到则空串，不画入口虚线。"""
+    ph = (from_host or "").strip().lower().rstrip(".")
+    mech = (mechanism or "").strip().lower()
+    want_ssrf = mech.startswith("ssrf")
+    want_rce = mech in ("shell_reachable", "port_forward", "socks_tunnel") or (
+        mech and not want_ssrf
+    )
+    nodes = await db.fetchall(
+        """SELECT key, tags, created_at FROM nodes
+           WHERE project_id=? AND type='vuln' ORDER BY created_at DESC""",
+        (project_id,),
+    )
+    findings = await db.fetchall(
+        """SELECT node_key, category, verification_status, created_at FROM findings
+           WHERE project_id=? ORDER BY created_at DESC""",
+        (project_id,),
+    )
+    finding_cat = {
+        str(f["node_key"]): str(f["category"] or "").lower()
+        for f in findings
+        if f.get("node_key")
+        and str(f.get("verification_status") or "verified").lower()
+        not in ("rejected", "disproved", "false")
+    }
+
+    ranked: list[tuple[int, str, int]] = []
+    for r in nodes:
+        key = str(r["key"] or "")
+        tags = _loads(r["tags"]) or []
+        tagset = {str(t).lower() for t in tags}
+        blob = f"{key} {' '.join(tagset)}"
+        cat = finding_cat.get(key, "")
+        is_ssrf = cat in _SSRF_VULN_CATS or "ssrf" in blob
+        is_rce = cat in _RCE_VULN_CATS or any(
+            x in blob for x in ("rce", "command_injection", "getshell")
+        )
+        if want_ssrf and not is_ssrf:
+            continue
+        if want_rce and not want_ssrf and not is_rce:
+            if not _vuln_matches_host(key, tags, ph):
+                continue
+        host_score = 0 if _vuln_matches_host(key, tags, ph) else 1
+        if ph and host_score and want_ssrf:
+            host_score = 1
+        kind_score = 0 if (want_ssrf and is_ssrf) or (want_rce and is_rce) else 2
+        ranked.append((host_score + kind_score, key, int(r["created_at"] or 0)))
+
+    if not ranked and want_ssrf:
+        for r in nodes:
+            tags = _loads(r["tags"]) or []
+            blob = f"{r['key']} {' '.join(str(t).lower() for t in tags)}"
+            if "ssrf" in blob or finding_cat.get(str(r["key"]), "") in _SSRF_VULN_CATS:
+                ranked.append((3, str(r["key"]), int(r["created_at"] or 0)))
+
+    if not ranked and not want_ssrf:
+        for r in nodes:
+            if ph and not _vuln_matches_host(str(r["key"]), _loads(r["tags"]) or [], ph):
+                continue
+            ranked.append((9, str(r["key"]), int(r["created_at"] or 0)))
+
+    if not ranked:
+        return ""
+    ranked.sort(key=lambda x: (x[0], -x[2], x[1]))
+    return ranked[0][1]
 
 
 async def has_verified_internal_vantage(project_id: str) -> bool:
@@ -1723,7 +2109,7 @@ async def find_host_source(project_id: str, host: str) -> str:
             ),
         )
         return best["key"]
-    for cand in (f"info:host:{host}", f"info:scope-expanded:{host}", f"target:{host}"):
+    for cand in (f"target:{host}", f"info:host:{host}", f"info:scope-expanded:{host}"):
         row = await db.fetchone(
             "SELECT key FROM nodes WHERE project_id=? AND key=?",
             (project_id, cand),
@@ -1805,6 +2191,7 @@ async def add_edge(project_id: str, edge: EdgeIn, run_id: str | None = None) -> 
     await ensure_target_attachments(project_id, run_id=run_id)
     # 每次拓扑变化后重算 RCE 路径
     await recompute_rce_path(project_id, run_id=run_id)
+    invalidate_graph_cache(project_id)
     return row
 
 
@@ -1946,6 +2333,7 @@ async def add_finding(project_id: str, finding: FindingIn, run_id: str | None = 
                  now(), nrow["id"]),
             )
             await derive_intents_for_finding(project_id, finding, nrow, run_id=run_id)
+    invalidate_graph_cache(project_id)
     return data
 
 
@@ -2034,6 +2422,7 @@ async def add_intent(project_id: str, intent: IntentIn, run_id: str | None = Non
                      priority, ev, ts, existing["id"]),
                 )
                 row = await db.fetchone("SELECT * FROM intents WHERE id=?", (existing["id"],))
+                invalidate_graph_cache(project_id)
                 return _serialize_intent(row)
             # 证据变化或曾延期：复开
             await db.execute(
@@ -2045,6 +2434,7 @@ async def add_intent(project_id: str, intent: IntentIn, run_id: str | None = Non
             )
             row = await db.fetchone("SELECT * FROM intents WHERE id=?", (existing["id"],))
             await emit(project_id, "intent", _serialize_intent(row), run_id=run_id)
+            invalidate_graph_cache(project_id)
             return _serialize_intent(row)
 
     iid = new_id("i_")
@@ -2059,6 +2449,7 @@ async def add_intent(project_id: str, intent: IntentIn, run_id: str | None = Non
     )
     row = await db.fetchone("SELECT * FROM intents WHERE id=?", (iid,))
     await emit(project_id, "intent", _serialize_intent(row), run_id=run_id)
+    invalidate_graph_cache(project_id)
     return _serialize_intent(row)
 
 
@@ -2119,9 +2510,15 @@ async def derive_intents_for_node(project_id: str, node_row: dict, run_id: str |
     from .hypothesize import hypotheses_for_node
     allows_flag, obj = await _project_objective_meta(project_id)
     brief = await _project_brief_text(project_id)
+    graph = None
+    try:
+        siblings = await db.fetchall("SELECT * FROM nodes WHERE project_id=?", (project_id,))
+        graph = {"nodes": [_serialize_node(r) for r in siblings]}
+    except Exception:
+        graph = None
     created: list[dict] = []
     for hyp in hypotheses_for_node(
-        node_row, allows_flag=allows_flag, objective=obj, brief=brief,
+        node_row, allows_flag=allows_flag, objective=obj, brief=brief, graph=graph,
     ):
         row = await add_intent(project_id, hyp, run_id=run_id)
         if row:
@@ -2155,12 +2552,16 @@ async def _open_strategy_keys(project_id: str) -> set[str]:
     return {r["strategy_key"] for r in rows if r.get("strategy_key")}
 
 
-async def refresh_derived_intents(project_id: str, run_id: str | None = None) -> dict:
+async def refresh_derived_intents(project_id: str, run_id: str | None = None, *, force: bool = False) -> dict:
     """按当前 hypothesize 规则补派生，并搁置过时 tactic。
 
     规则升级后旧图不会自动长出 secret_mount，也不会自行丢掉 SSRF 上的 weaponize。
-    每个 run 开头跑一次即可。
+    每个 run 开头跑一次即可。短 TTL 避免热路径每轮全量刷新。
     """
+    now_m = time.monotonic()
+    if not force and (now_m - _INTENT_AT.get(project_id, 0.0)) < _INTENT_TTL_SEC:
+        return {"opened": 0, "stale_deferred": 0, "skipped": True}
+    _INTENT_AT[project_id] = now_m
     from .hypothesize import stale_tactics_for_node
     from .model import FindingIn
 
@@ -2193,6 +2594,10 @@ async def refresh_derived_intents(project_id: str, run_id: str | None = None) ->
         except Exception:
             continue
         await derive_intents_for_finding(project_id, finding, nrow, run_id=run_id)
+    try:
+        stale_deferred += await defer_ineligible_hop_auth(project_id, run_id=run_id)
+    except Exception:
+        pass
     after = await _open_strategy_keys(project_id)
     return {"opened": max(0, len(after - before)), "stale_deferred": stale_deferred}
 
@@ -2362,6 +2767,16 @@ async def claim_intents(project_id: str, intent_ids: list[str], run_id: str | No
         if row:
             claimed.append(row)
     return claimed
+
+
+async def get_intent(project_id: str, intent_id: str) -> dict | None:
+    iid = str(intent_id or "").strip()
+    if not iid:
+        return None
+    row = await db.fetchone(
+        "SELECT * FROM intents WHERE id=? AND project_id=?", (iid, project_id),
+    )
+    return _serialize_intent(row) if row else None
 
 
 async def resolve_intent(
@@ -3010,6 +3425,10 @@ async def get_graph(project_id: str, *, heal: bool = False) -> dict:
     heal=False（默认，UI/WS/列表）：只读已落库标记，避免每次打开页面都 networkx 重算把 SQLite 打满。
     写入节点/边时已调用 ensure_target_attachments + recompute_rce_path，日常展示不必再算。
     """
+    if not heal:
+        hit = _GRAPH_CACHE.get(project_id)
+        if hit and (time.monotonic() - hit[0]) < _GRAPH_TTL_SEC:
+            return hit[1]
     try:
         await repair_prefix_type_stubs(project_id)
     except Exception:
@@ -3096,4 +3515,8 @@ async def get_graph(project_id: str, *, heal: bool = False) -> dict:
             **lateral_state(nodes, edges),
         },
     }
+    if heal:
+        invalidate_graph_cache(project_id)
+    else:
+        _GRAPH_CACHE[project_id] = (time.monotonic(), out)
     return out

@@ -15,7 +15,7 @@ need_root() { [[ "$(id -u)" -eq 0 ]] || die "需要 root（sudo）"; }
 wait_health() {
   local i
   for i in $(seq 1 30); do
-    if curl -fsS -m 2 http://127.0.0.1:5003/api/health >/tmp/rt-health.json 2>/dev/null; then
+    if curl -fsS -m 2 http://127.0.0.1:2333/api/health >/tmp/rt-health.json 2>/dev/null; then
       return 0
     fi
     sleep 1
@@ -81,7 +81,7 @@ cmd_restart() {
 cmd_status() {
   systemctl --no-pager --full status atkbrain-flash-backend.service || true
   echo "---"
-  if curl -fsS -m 3 http://127.0.0.1:5003/api/health >/tmp/rt-health.json 2>/dev/null; then
+  if curl -fsS -m 3 http://127.0.0.1:2333/api/health >/tmp/rt-health.json 2>/dev/null; then
     python3 - <<'PY' || echo "health: $(cat /tmp/rt-health.json)"
 import json
 d=json.load(open("/tmp/rt-health.json"))
@@ -89,7 +89,7 @@ sdk=d.get("claude_sdk") or {}
 print(f"health: ok={d.get('ok')} label={sdk.get('label')} running={len(d.get('running') or [])}")
 PY
   else
-    echo "health: DOWN (5003 无响应)"
+    echo "health: DOWN (2333 无响应)"
   fi
 }
 

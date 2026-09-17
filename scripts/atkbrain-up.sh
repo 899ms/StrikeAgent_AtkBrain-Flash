@@ -6,5 +6,5 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 "$REPO/scripts/atkbrain-backend.sh" install
 "$REPO/scripts/atkbrain-frontend.sh" install
 echo
-echo "[*] 浏览器打开: http://127.0.0.1:5001/"
+echo "[*] 浏览器打开: http://127.0.0.1:2334/"
 echo "[*] 之后不要在 Cursor shell 里再跑 python -m atkbrain.main / npm run dev"

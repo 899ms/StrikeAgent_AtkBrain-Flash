@@ -1,9 +1,10 @@
 """系统提示、每轮指令、角色工人：攻击图工作记忆 + Pi 自循环。"""
 from __future__ import annotations
 
+from ..engine.intranet_reach import SSRF_NEIGHBOR_RULE
 from ..graph.rating_rubric import RATING_RUBRIC
-from ..objective import SRC_POLICY_BRIEF, normalize_objective, objective_allows_flag, objective_is_src
-from ..scope import Scope
+from ..objective import normalize_objective, objective_allows_flag, objective_is_src
+from ..scope import Scope, authorized_registrable_domains
 from .kali_kit import KIT_SKILL_HINT
 from .tools import tool_names
 
@@ -55,7 +56,7 @@ def _src_recon_block() -> str:
     return (
         "- 开局：读 skill `src-hunt-playbook`。厂商 11 类是菜单：按入口形态选该测的洞，低/中/高危/严重都要 report_finding 进漏洞页；不是每轮全开，也不是 GETSHELL。"
         "资产铺开：nmap `--top-ports 1000`、中档目录、JSFinder、robots/swagger；"
-        "入口已确认时 `web-exploit` / `src-hunt` 与 recon 同一回合并行开（只派有对应面的类型）。"
+        "入口已确认时 `src-hunt` 与 recon 同一回合并行开（只派有对应面的类型；御主要 web-exploit 再加）。"
         "禁止从者代替工人打完所有洞。静态 SPA 不是无攻击面。"
         "不要螺旋升圈，不要先看题交旗，不要为 getshell 停工，不要委派 `lateral` / `privesc` / `flag-hunt`。"
         "每个工人只做一面或一类；禁止再开子进程。"
@@ -65,7 +66,8 @@ def _src_recon_block() -> str:
 def _src_enum_block() -> str:
     return (
         "- SRC 不走螺旋升圈、不夺旗。按入口形态从厂商菜单选类型，已验证洞提危害。"
-        "禁止开局 `-p-` 或超 10 万行词表。禁止内网横向。"
+        "禁止开局 `-p-` 或超 10 万行词表。禁止 Kali 直连 RFC1918 与 socks/shell 横向；"
+        "已验证 SSRF 必须 `report_pivot_capability` 扩网。"
     )
 
 
@@ -79,9 +81,13 @@ def _flag_fragments(obj: str) -> dict[str, str]:
             ),
             "final_stage": "SRC：按厂商清单挖高危/严重",
             "ssrf_block": (
-                "- 作业对象以项目填写的主机/IP 为准；同主机任意端口均可打。\n"
-                "  SSRF 打本机元数据/密钥一次（不当跳板）。禁止 `report_pivot_capability` 扩网。\n"
-                "  不要把本控制台 API/前端端口当目标。\n"
+                "- 作业对象以项目填写的主机/IP 为准；同主机任意端口均可打。"
+                "公网只打该主机的注册域；页面/JS/iframe 里其它注册域不能当第一跳，可作 SSRF 载荷参数。\n"
+                "  已验证 SSRF 后，只有从目标响应里看见、或经 SSRF 拿到登录页/横幅的具体内网主机"
+                "才 `report_pivot_capability`（mechanism 以 ssrf_ 开头）扩进 Scope；"
+                "经 SSRF 扩容的禁止 `http_request` 直连，把 URL 放进已验证 SSRF 参数。\n"
+                f"  {SSRF_NEIGHBOR_RULE}\n"
+                "  不要把本控制台 API/前端端口当目标。不要 Kali 直连内网。不要 socks/shell 横向。\n"
             ),
             "graph_land_block": (
                 "  活端口/指纹 → `service`；路径/接口/文件/参数/跳转 → `info`；401/403/500/登录报错/上传面 → `danger`；"
@@ -94,7 +100,9 @@ def _flag_fragments(obj: str) -> dict[str, str]:
                 "没有对应面不要硬派。禁止委派 `lateral` / `privesc` / `flag-hunt`。"
             ),
             "graph_postex_block": (
-                "- SRC 不扩网、不转后渗：不要 `report_pivot_capability` / `PIVOTS_TO`。\n"
+                "- SRC 不转后渗、不以 getshell 收工：不要 `PIVOTS_TO`、不要 `report_shell` 收工。\n"
+                "- 已验证 SSRF 看见具体内网主机（登录页/横幅/目标响应里的地址）时必须 `report_pivot_capability`（ssrf_*）。"
+                f"{SSRF_NEIGHBOR_RULE}\n"
                 "- 命令执行只当高危证据，独立 `report_finding` 后继续挖下一类。\n"
                 "- 本赛道不夺旗。\n"
             ),
@@ -103,8 +111,10 @@ def _flag_fragments(obj: str) -> dict[str, str]:
             "recon_block": _src_recon_block(),
             "enum_block": _src_enum_block(),
             "private_net_block": (
-                "- 本机网卡和物机网关是守卫，不是目标。从 Kali 扫办公网/入口 /24 邻居不算发现。"
-                "SSRF 载荷里的目标内网地址可以打（走已验证 SSRF 参数），不要 Kali 直连、不要 `report_pivot_capability` 扩网打穿。"
+                "- 本机网卡和物机网关是守卫，不是目标。单个入口地址不授权同网段邻居。"
+                "已验证 SSRF 后，跳板看见的具体内网主机才 `report_pivot_capability` 扩进 Scope；"
+                f"{SSRF_NEIGHBOR_RULE}"
+                "后续只走已验证 SSRF 参数，禁止 Kali 直连。socks/shell 横向仍禁止。"
                 "命令执行只当高危证据，不要当跳板。\n"
             ),
             "close_out_block": (
@@ -131,6 +141,11 @@ def _flag_fragments(obj: str) -> dict[str, str]:
                 "- SSRF/内网：单标签内网名、内网 TLD 与回环视为作业对象内可达时，可在 payload 里使用。\n"
                 "- 已验证 SSRF/GETSHELL 后，从跳板看见的容器网主机用 `report_pivot_capability` 扩进 Scope；"
                 "经 SSRF 扩容的禁止 `http_request` 直连，把 URL 放进已验证 SSRF 参数或从 webshell 访问。\n"
+                "- 经跳板打内层登录：先读表单 action，把方法与请求体转发到认证处理接口，不要停在外壳或站点根路径。"
+                "仍回登录页 HTML 不是口令否证；未确认内层收到 body 之前不要换用户或回头打入口注入。\n"
+                "- SSH：立足点上常无可用 ssh 客户端；把 22/SOCKS 转到 Kali，再用本机 `/usr/bin/ssh` `/usr/bin/sshpass`。"
+                "中转必须长连接；短超时脚本转发导致 banner 超时不是口令失败，禁止 hydra。"
+                "不要用 curl 的 sftp/libssh2 去讲 SSH，不要对攻击机 docker 网桥直连。\n"
                 "- 邻题入口是同评测其它 unique_code 的入口 IP/端口；跳板看见的 RFC1918 不是邻题。\n"
             ),
             "delegate_step3": (
@@ -148,7 +163,11 @@ def _flag_fragments(obj: str) -> dict[str, str]:
             ),
             "ctf_dict_block": (
                 "- 本题必有解：禁止 rockyou / 超过 10 万行的词表 / hashcat 全库 / 登录喷洒去撞哈希或口令。"
-                "题面账号或个位数默认口令可试一次；失败不要升级字典，回到已验证读/注入通道抽数据交旗。\n"
+                "题面账号或个位数默认口令可试一次；「失败」= 认证处理接口已收到请求体后的会话差分失败"
+                "（3xx / Set-Cookie / 离开登录页 / 明确错误文案）。"
+                "经开放代理/SSRF 时：外壳 POST、打站点根路径、只 GET 内层，都不算送达，不能当口令无效，"
+                "也不能因此换用户、扫目录、或回到已交过旗的入口读/注入链。"
+                "送达后失败不要升级字典；邻机过门未完成则留在该 hop。\n"
             ),
             "recon_block": (
                 "- 开局：读 skill `recon-fanout`。**先看本题入口活体**（源码/注释/robots/题面路径/账号），"
@@ -163,8 +182,12 @@ def _flag_fragments(obj: str) -> dict[str, str]:
             ),
             "private_net_block": (
                 "- 本机网卡和物机网关是守卫，不是目标。只有在授权入口上已有 shell 或已核实 SSRF 之后，"
-                "跳板看见的 RFC1918 才是目标内网；先 `report_pivot_capability`。"
-                "SSRF 走载荷、不要 Kali 直连。从 Kali 扫办公网/入口 /24 邻居不算发现。邻题入口仍是禁区。\n"
+                "跳板看见的具体内网主机才是目标内网；先 `report_pivot_capability`。"
+                f"{SSRF_NEIGHBOR_RULE}"
+                "禁止无跳板从 Kali 直连内网，禁止打攻击机 docker 网桥。"
+                "立足点上常无 ssh 客户端：不要用 curl 的 sftp/libssh2 去讲 SSH。"
+                "正路：立足点把 22/SOCKS 转到 Kali，再用本机 `/usr/bin/ssh` `/usr/bin/sshpass` 打已扩容主机。"
+                "SSRF 走载荷。单个入口地址不授权同网段邻居。邻题入口仍是禁区。\n"
             ),
             "close_out_block": (
                 "- 已验证的读文件/RCE/注入类发现：本轮消耗它推向收口（夺旗 / GETSHELL），不要回头扫目录。"
@@ -184,7 +207,8 @@ def _flag_fragments(obj: str) -> dict[str, str]:
             "- 标题禁止「候选 RCE」这种叫法。没拿到命令执行的就是漏洞；GETSHELL 只在 `report_shell` 之后。\n"
         ),
         "ssrf_block": (
-            "- 作业对象以项目填写的主机/IP 为准；同主机任意端口均可打。\n"
+            "- 作业对象以项目填写的主机/IP 为准；同主机任意端口均可打。"
+            "公网只打该主机的注册域；页面/JS/iframe 里其它注册域不能当第一跳，可作 SSRF 载荷参数。\n"
             "  不要把本控制台 API/前端端口当目标。\n"
         ),
         "delegate_step3": (
@@ -200,8 +224,11 @@ def _flag_fragments(obj: str) -> dict[str, str]:
         "enum_block": _spiral_enum_block(ctf=False),
         "private_net_block": (
             "- 本机网卡和物机网关是守卫，不是目标。只有在授权入口上已有 shell 或已核实 SSRF 之后，"
-            "跳板看见的 RFC1918 才是目标内网；先 `report_pivot_capability`。"
-            "SSRF 走载荷、不要 Kali 直连。从 Kali 扫办公网/入口 /24 邻居不算发现。\n"
+            "跳板看见的具体内网主机才是目标内网；先 `report_pivot_capability`。"
+            f"{SSRF_NEIGHBOR_RULE}"
+            "禁止无跳板从 Kali 直连内网，禁止打攻击机 docker 网桥。"
+            "靶机无 ssh 时用立足点隧道 + 本机 `/usr/bin/ssh` `/usr/bin/sshpass`。"
+            "SSRF 走载荷。单个入口地址不授权同网段邻居。\n"
         ),
         "close_out_block": (
             "- 已验证的读文件/RCE/注入类发现：本轮消耗它推向收口（夺旗 / GETSHELL），不要回头扫目录。"
@@ -239,6 +266,7 @@ SYSTEM_PROMPT_TMPL = """你是 StrikeAgent_AtkBrain-Flash 的主智能体（从�
 {private_net_block}
 - 过滤器拒绝的是这一次提交的形态：不要给同一形态加包装；同一绕过族已否证就换正交表示类。
 - 只打本题入口地址（本项目 target / ports / 全部 container 入口），直到跳板扩容。同题多个入口都在范围内。
+- 公网作业对象以填写主机的注册域为准；不要顺着页面/JS/iframe 去打同品牌其它注册域。
 - 邻题节点上的算法、密钥、flag 候选不是本题手法；必须从本题入口产物（本题二进制/本题服务）求解。
 - 连续错误 flag 否证的是该次提交的值，不是整条利用链已死。
 {close_out_block}
@@ -247,9 +275,10 @@ SYSTEM_PROMPT_TMPL = """你是 StrikeAgent_AtkBrain-Flash 的主智能体（从�
 
 # 执行纪律
 - 内置 bash / 读文件已禁用。命令用 `run_cmd`，HTTP 用 `http_request`。
+- 本轮小结/收尾写完即停，不要再打工具。系统会结束本轮去问御主。工人不得把回合拖住。CTF / SRC / 红队同一条。
 - CTF / 红队 / SRC 均可联网。已识别产品或版本时用 WebSearch 查 CVE/N-day/官方公告，再用 http_request 拉公告页（公网文档域名不越界）。没有版本不要对着目标喷 N-day 词表。
 - 工作区跨命令持久。遇蜜罐用 `mark_honeypot`。
-- 禁止破坏性写入：不要 DROP/DELETE 业务库、不要打满磁盘、不要改生产配置。SQLi 只用 SELECT/布尔/报错证明。
+- 禁止破坏性写入：不要 DROP/DELETE 业务库、不要打满磁盘、不要改生产配置。SQLi 只用 SELECT/布尔/报错证明。红队/SRC：改密/支付/竞争/轰炸只证明不落地（http 与 https 同一套）。
 {enum_block}
 - CTF / 红队 / SRC 一律禁止超过 10 万行的词表：端口全表、账号密码、子目录、子域名、host 碰撞、哈希碰撞都算。禁止 rockyou 与 dirbuster medium（220560）。
 {ctf_dict_block}- 同一输入面：状态码/跳转/Cookie/正文无差异，只否证了这些观测通道，不否证后端已处理参数。结案前换耗时、长度、响应头或其它端点副作用。换通道 = 同一 URL、同一参数换观测；另一个路由因为允许 POST/JSON 不是换通道。同一状态码再采样、换 Host/方法但仍以状态码判死，都不算换通道。不要用不同状态码、不同路由的耗时互相比较来结案。
@@ -273,7 +302,7 @@ SYSTEM_PROMPT_TMPL = """你是 StrikeAgent_AtkBrain-Flash 的主智能体（从�
 
 # 轮次
 先看图与意图 → 调度并发拉起角色工人 → 收齐回传 → 写图 → 一句话结束本轮。
-不要再开子进程。必要时自己 http_request / run_cmd，不要干等。
+不要再开子进程。不要自己 http_request 打目标，打洞交给工人。
 有信息量的响应未 add_node 不得结束本轮。
 
 # 输出
@@ -287,13 +316,13 @@ _GOAL_BLOCKS = {
         "红队最高指令是拿到服务器 shell（RCE / webshell / 反弹等）后 `report_shell`，即完成本项目。\n"
         "工作循环：测试 → 验证 → `report_finding`（高危/严重）→ 推向命令执行；尚未 GETSHELL 则对下一活体面再来一圈。\n"
         "高危/严重发现是推进手段，不单独收工；不要因为已有一条已验证洞就停测其它活体面。\n"
-        "满 12 小时墙钟硬停，记失败。拿到 shell 提前收工。不限轮次。"
+        "满 12 小时墙钟硬停，记失败。拿到 shell 提前收工。不限轮次。\n"
+        "越界与破坏性写入由平台硬拦：洞要报，状态不要改。"
     ),
     "src": (
         "SRC / 漏洞赏金：目的是发现尽可能多的独立高危/严重，不是打穿一条 GETSHELL 链。"
-        "厂商清单是**类型**不是穷尽洞单，同一类型下所有变体都要挖；低/中/高危/严重都要 `report_finding` 进漏洞页（按危害排序）。"
-        "不追求 getshell，不夺旗，不要停在第一条。\n"
-        + SRC_POLICY_BRIEF
+        "按入口形态选题，低/中/高危/严重都要 `report_finding`。不追求 getshell，不夺旗。\n"
+        "越界与破坏性写入由平台硬拦：洞要报，状态不要改。"
     ),
     "flag": (
         "唯一终极目标是夺齐正确 flag（正确数 ≥ flag_count）。\n"
@@ -354,7 +383,7 @@ def _project_ports(project: dict | None) -> list[int]:
     return out
 
 
-def build_brief(project: dict | None) -> str:
+def build_brief(project: dict | None, graph: dict | None = None) -> str:
     cfg = (project or {}).get("config") or {}
     desc = str(cfg.get("description") or "").strip()
     hint = str(cfg.get("hint") or cfg.get("tip") or "").strip()
@@ -373,7 +402,7 @@ def build_brief(project: dict | None) -> str:
     if cfg.get("total_score"):
         meta.append(f"总分={cfg.get('total_score')}")
     meta_line = "（" + "、".join(meta) + "）" if meta else ""
-    from .brief_creds import credential_candidates_from_brief
+    from .brief_creds import credential_candidates_from_brief, graph_cred_blob
     parts: list[str] = []
     if desc:
         parts.append(f"{desc}{meta_line}")
@@ -400,9 +429,21 @@ def build_brief(project: dict | None) -> str:
             f"同机资产：vhost={', '.join(vhosts)}；端口={port_txt}；{ip_txt}。"
             f"{scan_note}"
         )
-    cands = credential_candidates_from_brief("\n".join(x for x in (desc, hint) if x))
+    extra = graph_cred_blob(graph)
+    cands = credential_candidates_from_brief(
+        "\n".join(x for x in (desc, hint, extra) if x)
+    )
     if cands:
-        parts.append("凭据候选（个位数尝试，禁止扩字典）：" + "；".join(cands[:8]))
+        parts.append("题面已出现的账密（禁止合成、禁止扩字典）：" + "；".join(cands[:8]))
+    pending = [
+        f for f in ((graph or {}).get("findings") or [])
+        if isinstance(f, dict) and not f.get("secondary_verified")
+    ]
+    if pending:
+        titles = [str(f.get("title") or f.get("id") or "finding")[:40] for f in pending[:6]]
+        parts.append(
+            "未二次验证（pending_review，不能当已结案）：" + "；".join(titles)
+        )
     return "\n".join(parts)
 
 
@@ -453,9 +494,18 @@ def build_system_prompt(
                 "主入口是当前目标的 host:port。集群里其它子项目的资产不在本作业范围内，"
                 "不要把兄弟站点/兄弟 IP 当本题线索。"
             )
+        apexes = authorized_registrable_domains(scope)
+        if apexes:
+            apex_note = (
+                f"授权公网注册域：{'、'.join(apexes)}。"
+                "只打该注册域上的主机；页面/JS/iframe 里出现的其它注册域不能当第一跳（可作 SSRF 载荷参数）。"
+            )
+        else:
+            apex_note = "公网文档与 OOB 除外；不要改打未写入作业对象的公网主机。"
         scope_desc = (
             f"- 作业对象：{tdesc}{ip_hint}{sub}。"
             f"{entry_note}"
+            f"{apex_note}"
         )
     else:
         scope_desc = "- 作业对象：见本轮指令。"
@@ -495,14 +545,14 @@ def default_fanout_roles(objective: str = "getshell") -> list[str]:
     if objective_allows_flag(objective):
         return ["web-exploit", "recon"]
     if objective_is_src(objective):
-        return ["web-exploit", "src-hunt", "recon"]
+        return ["src-hunt", "recon"]
     return ["web-exploit", "recon"]
 
 
 FINDING_REVIEW_ROLE = "finding-review"
 
 _FINDING_REVIEW_SYSTEM = (
-    "你是本项目专职的漏洞二次验证、红队评级与漏洞页撰稿员，不是猎洞工人。"
+    "你是本项目专职的漏洞二次验证与红队评级员，不是猎洞工人，也不写漏洞页长文。"
     "不要扫目录、不要开新意图、不要 report_shell / report_flag、不要再开子进程。"
     "只处理清单里未二次验证或缺红队评级的已入库漏洞。"
     "禁止新建漏洞条目：report_finding 必须带清单里的 finding_id 和原来的 node_key；"
@@ -510,12 +560,9 @@ _FINDING_REVIEW_SYSTEM = (
     "对每一条先独立再打一遍（换观测通道 / 重放 PoC / 对照预期回显），不能只把首次 evidence 再贴一遍；"
     "打完同一轮 report_finding：必须带原来的 finding_id（有则必填）和 node_key，"
     "secondary_verified=true、redteam_rating（critical|high|medium|low|info）、"
-    "redteam_rating_rationale（至少 40 字，写清怎么打、看到什么、为何按四级表是这个级），"
-    "并同时写漏洞页五段（都要针对本条、本项目，禁止 Burp/CIA/类别模板套话）："
-    "report_summary 漏洞简介；report_impact 对本项目已证明的危害；"
-    "report_rating 红队评级正文；report_repro 你刚才实际走过的手动复现；"
-    "report_fix 针对本条根因的修复。"
-    "二次打不出同样危害也要收口：仍标 secondary_verified=true，评级降为 info 或 low，五段写清失败过程。"
+    "redteam_rating_rationale（至少 40 字，写清怎么打、看到什么、为何按四级表是这个级）。"
+    "不要写 report_summary/report_impact/report_rating/report_repro/report_fix，页面另有撰稿补。"
+    "二次打不出同样危害也要收口：仍标 secondary_verified=true，评级降为 info 或 low。"
     "版本命中或仅白名单文件写不是 RCE：未打成命令执行则不要评 high/critical，也不要报 rce。"
     "任意文件读写默认中危，不要压成低危；不要把一般 SQLi/存储 XSS/越权进后台抬成高危。"
     "四级表不是白名单：对不上条目的已入库洞也要复核并评级，就近中危或低危，不要标 info 丢掉。"
@@ -539,8 +586,7 @@ def build_finding_review_instruction(findings: list[dict]) -> str:
         "逐条动手后用 report_finding 回写同一条：必须带下面的 finding_id，不要新建标题或换 node_key。",
         "同一 CVE / 同一上传接口禁止再报一条。红队评级按四级表对号入座，禁止抬级或压级。",
         "未打成命令执行不要把 RCE 评严重/高危，也不要标 rce；任意文件操作默认中危。",
-        "回写时必须带齐二次验证、红队评级，以及漏洞页五段（简介/危害/评级/复现/修复），",
-        "内容来自你这一轮实际打到的结果，不要套模板。",
+        "回写时必须带齐二次验证与红队评级。不要写漏洞页五段，页面另补。",
         "",
     ]
     for i, f in enumerate(findings[:12], 1):
@@ -594,7 +640,7 @@ _SURFACE_TURN_HINTS = {
         "- 活体像表达式/编码求值报错：无害 canary 确认求值面。\n"
     ),
     "race_window": (
-        "- 同一写接口连续成功且无条件锁：短并发窗口验证。\n"
+        "- 同一写接口连续成功且无条件锁：只证明缺锁；最多对自己的测试对象做 2 路对照，禁止打爆真实库存/优惠券/名额。\n"
     ),
 }
 
@@ -649,8 +695,8 @@ def build_turn_instruction(
             "\n## 人工强制指令（必须立刻改向执行）\n"
             f"{blob}\n"
             "本轮第一动作必须按上述人工指令调用工具。"
-            "禁止以御主假说、已认领 Intent、局面禁令为由拒绝或推迟。"
-            "御主方案本轮仅供参考，已被人工覆盖。\n"
+            "御主方案本轮仅供参考，已被人工覆盖。"
+            "已认领的 hop_auth 不能因外壳 POST、登录页或短超时被关掉。\n"
         )
     elif blob:
         steer_block = (
@@ -668,15 +714,18 @@ def build_turn_instruction(
     if postex_phase == "active" and not objective_is_src(objective):
         if objective_allows_flag(objective):
             postex_hint = (
-                "\n- 【后渗透】已有立足点：剩余目标多半不在本容器。"
-                "立刻把图上出现的内网 IP `report_pivot_capability` 扩进 Scope，"
-                "经 shell 或已验证 SSRF/代理参数打，禁止 Kali 直连、禁止打本机 docker。"
+                "\n- 【后渗透】已有立足点：本机已交过的目标不要再挖。"
+                "只把经跳板打出登录页/横幅的邻机扩进 Scope，不要把扫段空号或 hosts 线索一律申报。"
+                "图上另有未过身份门的活面：本轮第一动作是已认领的 hop_auth，"
+                "用图上已有字面量，经 shell、已验证 SSRF/代理参数，或立足点隧道 + 本机 ssh/sshpass 把认证请求体或横幅送到那一跳。"
+                "禁止无跳板 Kali 直连、禁止打本机 docker、禁止喷字典、禁止再扫段扩容空号。"
                 "并行 `privesc` 与 `lateral`；禁止回头扫入口或把本轮耗在本机文件系统穷举。"
                 "本机已交过的旗不要再挖。"
             )
         else:
             postex_hint = (
                 "\n- 【后渗透】已有立足点：可并行委派 `privesc` 与 `lateral`；"
+                "内网 SSH 用立足点隧道 + 本机 `/usr/bin/ssh` `/usr/bin/sshpass`，禁止打本机 docker。"
                 "踏上新主机时 report_shell 填 host。"
             )
     kind = (entry_kind or "").strip().lower()
@@ -714,9 +763,10 @@ def build_turn_instruction(
             )
         elif objective_is_src(objective):
             early = (
-                "- 早期：已知 HTTP 入口先委派 `web-exploit` / `src-hunt` 打当前入口；并行 `recon`："
+                "- 早期：已知 HTTP 入口先委派 `src-hunt` 打当前入口；并行 `recon`："
                 "nmap --top-ports 1000，中档目录、JSFinder。按入口形态选类型，不要 11 路全开。"
-                "禁止螺旋升圈、禁止开局 -p-、禁止横向。\n"
+                "禁止螺旋升圈、禁止开局 -p-、禁止 Kali 直连与 socks/shell 横向。"
+                "已验证 SSRF 必须 report_pivot_capability。\n"
             )
         else:
             early = (
@@ -732,8 +782,8 @@ def build_turn_instruction(
             )
         elif objective_is_src(objective):
             early = (
-                "- 早期：并行 `recon` + `web-exploit` / `src-hunt`。"
-                "recon 用 top-1000 与中档目录；按入口形态选类型。禁止螺旋升圈、全端口或横向。\n"
+                "- 早期：并行 `recon` + `src-hunt`。"
+                "recon 用 top-1000 与中档目录；按入口形态选类型。禁止螺旋升圈、全端口、Kali 直连与 socks/shell 横向。\n"
             )
         else:
             early = (
@@ -746,7 +796,8 @@ def build_turn_instruction(
         task_hint = (
             early
             + "- 已有读取/RCE：立即委派 `flag-hunt`，拿到就 report_flag。\n"
-            "- 本题必有解：禁止超过 10 万行的词表撞库/撞哈希；个位数默认口令失败就回到已验证通道抽数据。\n"
+            "- 本题必有解：禁止超过 10 万行的词表撞库/撞哈希；"
+            "个位数默认口令须打在认证处理接口上，未送达不算失败；送达后失败不要升字典。\n"
             "- 未齐：继续夺剩余 flag。\n"
             "- flag 数齐立即收工换题（总分差不是漏旗）。" + postex_hint
         )
@@ -757,7 +808,8 @@ def build_turn_instruction(
             + "- 按入口形态从 XSS/注入/RCE/文件/越权/逻辑/泄露/后门/N-day 里选该测的，测→证→报高危。"
             "没有 HTML 不要硬打 XSS，没有版本不要喷 N-day。\n"
             "- 已验证洞提危害；不要停在第一条；命令执行只当高危证据。\n"
-            "- 禁止横向、禁止 report_flag、禁止破坏业务。"
+            "- 禁止 Kali 直连与 socks/shell 横向、禁止 report_flag、禁止破坏业务。"
+            "已验证 SSRF 看见具体内网主机必须 report_pivot_capability（探测地址/超时不要扩）。"
         )
     else:
         goal_line = f"推进红队直至 getshell（report_shell 即收工）。目标：{tgt}"
@@ -794,7 +846,7 @@ def build_turn_instruction(
                     )
                 elif objective_is_src(objective):
                     empty_intents = (
-                        "（无——请先委派 web-exploit / src-hunt 打入口，并行 recon："
+                        "（无——请先委派 src-hunt 打入口，并行 recon："
                         "top-1000 与中档目录；按入口形态选类型，不要预开 11 路）"
                     )
                 else:
@@ -806,7 +858,7 @@ def build_turn_instruction(
                 if objective_allows_flag(objective):
                     empty_intents = "（无——请先看入口活体并委派 web-exploit；没有旗再 recon；不要螺旋升圈）"
                 elif objective_is_src(objective):
-                    empty_intents = "（无——请先并行委派 recon + web-exploit / src-hunt；按入口形态选类型）"
+                    empty_intents = "（无——请先并行委派 recon + src-hunt；按入口形态选类型）"
                 else:
                     empty_intents = "（无——请先并行委派第 1 圈 recon + web-exploit；旁站关）"
     return TURN_TMPL.format(
@@ -826,7 +878,7 @@ def build_subagents(objective: str = "getshell") -> dict[str, dict]:
         lateral_tail = "推进直至 report_shell（getshell）即收工。"
     ctf_no_mega = (
         "本题必有解：禁止 rockyou / 超过 10 万行的词表 / hashcat 全库去撞哈希或登录；"
-        "个位数默认口令失败不要升级字典。"
+        "个位数默认口令须打在认证处理接口上，未送达不算失败；送达后失败不要升字典。"
         "评测 `request_hint` 会扣分：先打活体，实在做不出再用，开局禁止。"
         if allows_flag else
         "禁止超过 10 万行的词表（目录/子域/host/口令/哈希）；禁止 rockyou 与 dirbuster medium。"
@@ -836,8 +888,9 @@ def build_subagents(objective: str = "getshell") -> dict[str, dict]:
         "不要再开子进程。命令用 `run_cmd`，Web 用 `http_request`；"
         "已识别产品/版本时用 WebSearch 查 CVE/N-day，公告页用 http_request 拉取（公网文档不越界）。"
         "每条有信息量的响应当场 add_node（service/info/danger/vuln），不要攒到结束、不要只写在回报里。"
-        "严格遵守作业对象；遇蜜罐用 mark_honeypot。"
-        "禁止破坏性写入。动手前先读 workspace/shells.json 与 workspace/post-exploit/creds_*.json。"
+        "严格遵守作业对象注册域；不要改打同品牌其它 TLD。遇蜜罐用 mark_honeypot。"
+        "越界与破坏性写入由平台硬拦。动手前先读 workspace/shells.json 与 workspace/post-exploit/creds_*.json。"
+        "本轮结论写完即停，不要再打工具。CTF / SRC / 红队同一条。"
         + ctf_no_mega
     )
     if allows_flag:
@@ -861,16 +914,19 @@ def build_subagents(objective: str = "getshell") -> dict[str, dict]:
     elif is_src:
         recon_nmap = (
             "nmap --top-ports 1000 找服务，目录用中型字典（词表路径见 skill `kali-kit`）；"
-            "不要开局 -p- 或超 10 万行的表。不要螺旋升圈。不要打内网横向。"
+            "不要开局 -p- 或超 10 万行的表。不要螺旋升圈。"
+            "不要 Kali 直连内网、不要 socks/shell 横向；已验证 SSRF 必须 report_pivot_capability。"
         )
         recon_fallback = (
             "若委派未点名某一面：并行 nmap top-1000（run_cmd timeout=90）+ 入口 http_request + whatweb；"
             "已有 HTTP 面立刻中档 ffuf（timeout=120）+ JSFinder。"
-            "端口确认活体后再考虑全端口。禁止横向、禁止把 jdbc/rds 当新资产扫。"
+            "端口确认活体后再考虑全端口。禁止 Kali 直连与 socks/shell 横向，禁止把 jdbc/rds 当新资产扫。"
+            "已验证 SSRF 看见具体内网主机必须 report_pivot_capability（探测地址/超时不要扩）。"
         )
         web_ctf = (
             "SRC：低/中/高危/严重都要 report_finding 进漏洞页。不要 getshell 收工，不要 report_flag。"
-            "读 skill `src-hunt-playbook`。禁止破坏业务、禁止横向。"
+            "读 skill `src-hunt-playbook`。禁止破坏业务。"
+            "已验证 SSRF 必须 report_pivot_capability 扩网；禁止 Kali 直连与 socks/shell 横向。"
         )
     else:
         recon_nmap = (
@@ -900,7 +956,8 @@ def build_subagents(objective: str = "getshell") -> dict[str, dict]:
             "prompt": ("你是 Web 漏洞利用专家。针对给定攻击面做探测与实弹验证，优先通往 RCE/读文件/越权；"
                     "确认漏洞 report_finding 附真实 PoC。"
                     "静态 SPA、无表单、同源 XHR=0 不是无攻击面：打路由/查询参数、Cookie、Authorization、"
-                    "前端路由、JS 里落在作业对象内的接口；测→证，命中立刻 report_finding，不要只落 info 交差。"
+                    "前端路由、JS 里落在作业对象注册域内的接口；测→证，命中立刻 report_finding，不要只落 info 交差。"
+                    "其它注册域上的嵌入页/CDN 不是本题第一跳。"
                     "按活体响应选择手法族：GraphQL 先读契约再授权差分；SOAP/WSDL 先拉契约；"
                     "会话令牌本地解码 claims；上传面只做无害 canary；"
                     "对象存储 API 先列桶/键，再做对象级读写与键级授权差分；"
@@ -908,10 +965,12 @@ def build_subagents(objective: str = "getshell") -> dict[str, dict]:
                     "参数原样进 HTML 时短 canary 确认反射/DOM 汇；"
                     "正文或参数像 PHP 序列化则走受限反序列化族；"
                     "表达式/编码求值报错先无害 canary；"
-                    "同一写接口连续成功且无条件锁时做短并发窗口验证。"
+                    "同一写接口连续成功且无条件锁时只证明缺锁，最多对自己的测试对象做 2 路对照，禁止打爆库存/优惠券。"
                     "不要目录爆破代替契约。"
                     "状态码/Cookie/跳转无差异时换耗时、长度、响应头再结案，不要宣布输入面已关闭。"
                     "没有 Cookie 差分不能当会话可伪造的 oracle。"
+                    "经开放代理/SSRF 打内层登录：把方法与请求体转发到表单 action，不要停在外壳或站点根路径；"
+                    "仍回登录页不是口令无效。"
                     + (
                         "已验证后独立 report_finding，继续挖厂商清单下一类，不要 report_shell 收工。"
                         "命令执行只写无害 txt canary 取回即删。"
@@ -983,7 +1042,8 @@ def build_subagents(objective: str = "getshell") -> dict[str, dict]:
                 "你按 skill `src-hunt-playbook` 挖厂商类型（XSS/注入/RCE/文件/越权/逻辑/泄露/后门/N-day）。"
                 "按当前入口形态选类型，不要把 11 类全打一遍。"
                 "低/中/高危/严重都要 report_finding 进漏洞页，附最小 PoC。评级按四级表对号入座，禁止抬级或压级。业务报错不能评高危或严重，但仍要报。"
-                "不要 report_flag，不要转后渗/横向，不要停在第一条。"
+                "不要 report_flag，不要 getshell 收工。已验证 SSRF 必须 report_pivot_capability；"
+                "禁止 Kali 直连与 socks/shell 横向。不要停在第一条。"
                 + common_tail + kit_hint
             ),
         }

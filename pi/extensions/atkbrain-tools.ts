@@ -33,20 +33,29 @@ function toType(schema: Record<string, unknown> | undefined) {
     let field;
     if (t === "integer" || t === "number") field = Type.Number(desc);
     else if (t === "boolean") field = Type.Boolean(desc);
-    else if (t === "array") field = Type.Array(Type.String());
+    else if (t === "array") {
+      const items = (spec.items || {}) as Record<string, unknown>;
+      const it = String(items.type || "string");
+      if (it === "number" || it === "integer") field = Type.Array(Type.Number());
+      else if (it === "boolean") field = Type.Array(Type.Boolean());
+      else if (it === "object") field = Type.Array(Type.Object({}, { additionalProperties: true }));
+      else field = Type.Array(Type.String());
+    }
     else if (t === "object") field = Type.Object({}, { additionalProperties: true });
     else field = Type.String(desc);
     out[key] = required.has(key) ? field : Type.Optional(field);
   }
-  return Type.Object(out);
+  return Type.Object(out, { additionalProperties: true });
 }
 
 export default async function (pi: ExtensionAPI) {
-  const base = (process.env.ATKBRAIN_TOOLS_BASE || process.env.ATKBRAIN_API || "http://127.0.0.1:5003").replace(/\/$/, "");
+  const base = (process.env.ATKBRAIN_TOOLS_BASE || process.env.ATKBRAIN_API || "http://127.0.0.1:2333").replace(/\/$/, "");
   const pid = process.env.ATKBRAIN_PROJECT_ID || "";
   const token = (process.env.ATKBRAIN_API_TOKEN || "").trim();
+  const role = (process.env.ATKBRAIN_PI_ROLE || "").trim();
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (token) headers["x-api-token"] = token;
+  if (role) headers["x-atkbrain-role"] = role;
   let stopped = false;
 
   pi.on("tool_call", async (event, ctx) => {
@@ -93,7 +102,14 @@ export default async function (pi: ExtensionAPI) {
         });
         const out = await r.json().catch(() => ({ text: `HTTP ${r.status}`, is_error: true }));
         const text = String(out.text || "");
-        if (text.includes("本题已满分")) stopped = true;
+        // 只认工具接口正文开头的收工句。sqlite/日志里扫到历史「本题已满分」不能停本面。
+        if (
+          text.startsWith("本题已满分")
+          || text.startsWith("本题 flag 已齐")
+          || text.startsWith("本项目已达成终极目标")
+        ) {
+          stopped = true;
+        }
         return {
           content: [{ type: "text", text }],
           details: { is_error: Boolean(out.is_error) },

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 
 from ..config import settings
 from ..events import emit
@@ -59,6 +60,7 @@ class ProjectAgent:
 
         _objective = cfg.get("objective", settings.default_objective)
         self.guard = Guard(scope, "", objective=_objective)
+        self.guard.workspace_dir = self.workspace_dir
         self.objective = _objective
         _allows_flag = objective_allows_flag(self.objective)
         flags_needed = int(cfg.get("flag_count") or 1) if _allows_flag else 1
@@ -71,6 +73,12 @@ class ProjectAgent:
             benchmark=bm,
         )
         self._sessions: list[PiSession] = []
+        self._pi_pool: dict[str, PiSession] = {}
+        self._review_wake = asyncio.Event()
+        self._review_lock = asyncio.Lock()
+        self._review_task: asyncio.Task | None = None
+        self._page_task: asyncio.Task | None = None
+        self._stopped = False
         self._full_score_aborting = False
         self.ctx.abort_run = self._abort_on_full_score
         self.brief = build_brief(project)
@@ -93,6 +101,17 @@ class ProjectAgent:
         except OSError:
             pass
 
+    def refresh_brief(self, project: dict | None = None) -> str:
+        """入口重绑后按新 project 重写 BRIEF.md，避免从者继续打旧 vhost。"""
+        if isinstance(project, dict):
+            self.project = project
+            ctx = getattr(self, "ctx", None)
+            if ctx is not None:
+                ctx.project = project
+        self.brief = build_brief(self.project)
+        self._write_brief()
+        return self.brief
+
     def _write_skills(self) -> list[str]:
         try:
             from .project_skills import install_into_workspace
@@ -113,7 +132,7 @@ class ProjectAgent:
             f"{prompt}\n\n"
             f"工作目录：{self.workspace_dir}\n"
             f"可用工具：{tools}。禁止再开子进程或套娃。\n"
-            f"{('题目简报：\\n' + self.brief) if self.brief else ''}"
+            "越界与破坏性写入由平台硬拦，不要改业务状态。"
         )
 
     def _fanout_roles(self) -> list[str]:
@@ -133,6 +152,8 @@ class ProjectAgent:
                 if n in known and n not in seen:
                     out.append(n)
                     seen.add(n)
+        if objective_is_src(self.objective) and "src-hunt" in out and "web-exploit" in out:
+            out = [n for n in out if n != "web-exploit"]
         return out
 
     async def connect(self, *, jitter: bool = False) -> None:
@@ -140,7 +161,8 @@ class ProjectAgent:
         self._connected = True
 
     async def close(self) -> None:
-        await self._close_sessions()
+        await self._stop_background()
+        await self._close_sessions(keep_review=False)
         self._connected = False
         unregister_project_mcp(self.project_id)
         try:
@@ -148,27 +170,99 @@ class ProjectAgent:
         except Exception:
             pass
 
-    async def interrupt(self) -> None:
+    async def interrupt(self, *, halt: bool = True) -> None:
+        if halt:
+            await self._stop_background()
         sessions = list(self._sessions)
+        if not halt:
+            sessions = [
+                s for s in sessions
+                if str(getattr(s, "role", "") or "") != FINDING_REVIEW_ROLE
+            ]
         for s in sessions:
             try:
                 await s.abort()
             except Exception:
                 pass
-        await self._close_sessions()
+        if halt:
+            await self._close_sessions(keep_review=False)
+        else:
+            await self._abort_hunt_prompts()
 
-    async def _close_sessions(self) -> None:
-        sessions = list(self._sessions)
-        self._sessions = []
-        if not sessions:
+    async def _stop_background(self) -> None:
+        self._stopped = True
+        try:
+            self._review_wake.set()
+        except Exception:
+            pass
+        task = self._review_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+        self._review_task = None
+        page = self._page_task
+        if page is not None and not page.done():
+            page.cancel()
+        self._page_task = None
+
+    async def _abort_roles(self, roles: set[str]) -> list[str]:
+        """中止指定角色的 Pi（从者收工后收掉仍在跑的工人）。不碰二次验证会话。"""
+        want = {str(r) for r in roles if r and r not in ("lead", FINDING_REVIEW_ROLE)}
+        aborted: list[str] = []
+        for s in list(self._sessions):
+            role = str(getattr(s, "role", "") or "")
+            if role not in want:
+                continue
+            try:
+                await s.abort()
+            except Exception:
+                pass
+            aborted.append(role)
+        return aborted
+
+    async def _abort_hunt_prompts(self) -> None:
+        """结束本轮从者/工人的 prompt，进程保留给下一轮。不杀复核 Pi。"""
+        for s in list(self._sessions):
+            role = str(getattr(s, "role", "") or "")
+            if role == FINDING_REVIEW_ROLE:
+                continue
+            try:
+                await s.abort()
+            except Exception:
+                pass
+
+    async def _close_sessions(self, *, keep_review: bool = False) -> None:
+        if keep_review:
+            drop = [
+                s for s in self._sessions
+                if str(getattr(s, "role", "") or "") != FINDING_REVIEW_ROLE
+            ]
+            keep = [
+                s for s in self._sessions
+                if str(getattr(s, "role", "") or "") == FINDING_REVIEW_ROLE
+            ]
+            self._sessions = keep
+            for role, sess in list(self._pi_pool.items()):
+                if role != FINDING_REVIEW_ROLE:
+                    self._pi_pool.pop(role, None)
+                    if sess not in drop:
+                        drop.append(sess)
+        else:
+            drop = list(self._sessions)
+            self._sessions = []
+            self._pi_pool.clear()
+        if not drop:
             return
-        await asyncio.gather(*(s.close() for s in sessions), return_exceptions=True)
+        await asyncio.gather(*(s.close() for s in drop), return_exceptions=True)
 
     async def reset_session(self) -> None:
         await self.begin_fresh_session(connect=False)
 
     async def begin_fresh_session(self, *, connect: bool = True) -> None:
-        await self._close_sessions()
+        await self._abort_hunt_prompts()
         self.last_session_id = None
         self._connected = bool(connect)
 
@@ -177,7 +271,23 @@ class ProjectAgent:
         return False
 
     async def recover_dead_cli(self) -> None:
-        await self._close_sessions()
+        await self._abort_hunt_prompts()
+        dead: list[PiSession] = []
+        for role, sess in list(self._pi_pool.items()):
+            if role == FINDING_REVIEW_ROLE:
+                continue
+            if not sess.alive():
+                dead.append(sess)
+                self._pi_pool.pop(role, None)
+        for sess in dead:
+            try:
+                await sess.close()
+            except Exception:
+                pass
+            try:
+                self._sessions.remove(sess)
+            except ValueError:
+                pass
         try:
             await self.ctx.aclose()
         except Exception:
@@ -208,6 +318,57 @@ class ProjectAgent:
         except Exception:
             pass
 
+    def _kick_review(self) -> None:
+        try:
+            self._review_wake.set()
+        except Exception:
+            return
+        self._ensure_review_loop()
+
+    def _ensure_review_loop(self) -> None:
+        if self._stopped:
+            return
+        task = self._review_task
+        if task is not None and not task.done():
+            return
+        try:
+            self._review_task = asyncio.get_running_loop().create_task(self._review_loop())
+        except RuntimeError:
+            return
+
+    async def _review_loop(self) -> None:
+        while not self._stopped:
+            await self._review_wake.wait()
+            if self._stopped:
+                return
+            self._review_wake.clear()
+            try:
+                async with self._review_lock:
+                    await self._run_finding_review()
+            except Exception:
+                pass
+
+    def _schedule_pages(self) -> None:
+        if self._stopped:
+            return
+        page = self._page_task
+        if page is not None and not page.done():
+            return
+        try:
+            self._page_task = asyncio.get_running_loop().create_task(self._fill_pages_bg())
+        except RuntimeError:
+            return
+
+    async def _fill_pages_bg(self) -> None:
+        try:
+            from ..projects import get_project as _gp_rev
+            from ..report.pi_finding_page import fill_missing_pi_pages
+            await fill_missing_pi_pages(
+                self.project_id, project=await _gp_rev(self.project_id),
+            )
+        except Exception:
+            pass
+
     async def _run_finding_review(self) -> int:
         """对当前未二次验证的入库漏洞立刻开专职复核 Pi；没有待办则跳过。"""
         from ..graph.store import findings_pending_secondary
@@ -217,6 +378,7 @@ class ProjectAgent:
         except Exception:
             pending = []
         if not pending:
+            self._schedule_pages()
             return 0
         names = list(getattr(self.ctx, "task_subagents", None) or [])
         if FINDING_REVIEW_ROLE not in names:
@@ -229,7 +391,7 @@ class ProjectAgent:
             self.project_id, "log",
             {
                 "level": "info",
-                "message": f"专职二次验证 {len(pending)} 条（从者入库后立刻复核）",
+                "message": f"专职二次验证 {len(pending)} 条（后台复核，不挡御主）",
             },
             run_id=self.ctx.run_id,
         )
@@ -250,14 +412,7 @@ class ProjectAgent:
                 finding_review_system_prompt(self.workspace_dir, self.objective),
                 build_finding_review_instruction(pending),
             )
-            try:
-                from ..projects import get_project as _gp_rev
-                from ..report.pi_finding_page import fill_missing_pi_pages
-                await fill_missing_pi_pages(
-                    self.project_id, project=await _gp_rev(self.project_id),
-                )
-            except Exception:
-                pass
+            self._schedule_pages()
         finally:
             try:
                 await emit(
@@ -274,7 +429,23 @@ class ProjectAgent:
                 pass
         return len(pending)
 
-    async def _run_one(self, role: str, system_prompt: str, instruction: str) -> dict:
+    async def _acquire_pi(self, role: str, system_prompt: str) -> PiSession:
+        sess = self._pi_pool.get(role)
+        if sess is not None and sess.alive():
+            sess.run_id = self.ctx.run_id
+            sess.on_activity = self.ctx.mark_activity
+            sess._emit = emit
+            return sess
+        if sess is not None:
+            try:
+                await sess.close()
+            except Exception:
+                pass
+            self._pi_pool.pop(role, None)
+            try:
+                self._sessions.remove(sess)
+            except ValueError:
+                pass
         sess = PiSession(
             cwd=self.workspace_dir,
             system_prompt=system_prompt,
@@ -287,24 +458,30 @@ class ProjectAgent:
             model=self.model,
             skill_paths=skill_abs_paths(self.workspace_dir, self._project_skill_names),
         )
-        self._sessions.append(sess)
+        await sess.start()
+        self._pi_pool[role] = sess
+        if sess not in self._sessions:
+            self._sessions.append(sess)
+        return sess
+
+    async def _run_one(self, role: str, system_prompt: str, instruction: str) -> dict:
+        sess = await self._acquire_pi(role, system_prompt)
         try:
-            await sess.start()
             text = await sess.prompt(instruction, timeout=0)
             return {"text": text, "tool_uses": int(sess.tool_uses or 0), "role": role}
         except Exception as e:
             if is_dead_cli_error(e):
                 self._connected = False
-            raise
-        finally:
             try:
                 await sess.close()
             except Exception:
                 pass
+            self._pi_pool.pop(role, None)
             try:
                 self._sessions.remove(sess)
             except ValueError:
                 pass
+            raise
 
     async def run_turn(self, instruction: str) -> dict:
         try:
@@ -345,64 +522,131 @@ class ProjectAgent:
             extra_lead.append(
                 "本回合调度已并发拉起角色会话："
                 + "、".join(f"`{r}`" for r in roles)
-                + "。你负责计划、短验证、写图与汇总；不要再开子进程。"
+                + "。你负责计划、写图与汇总；不要自己 http_request，打洞交给工人；不要再开子进程。"
             )
         extra_lead.append(
-            f"从者或工人一 `report_finding`，专职 `{FINDING_REVIEW_ROLE}` 会立刻二次验证并红队评级；"
-            "你不要把二次验证当本回合主线。"
+            f"从者或工人一 `report_finding`，专职 `{FINDING_REVIEW_ROLE}` 在后台二次验证；"
+            "你不要等复核、不要把二次验证当本回合主线。未复核洞是 pending_review，不能当已结案。"
         )
+        extra_lead.append(
+            "本轮小结/收尾写完即停，不要再打工具；系统会结束本轮去问御主。"
+            "CTF / SRC / 红队同一条：工人不得把回合拖住。"
+        )
+        close_note = extra_lead[-1]
         lead_instr = instruction + "\n\n" + "\n".join(extra_lead)
-        jobs = [
-            self._run_one("lead", self._lead_system(), lead_instr),
-        ]
+        named = [("lead", self._run_one("lead", self._lead_system(), lead_instr))]
+        worker_instr = instruction + "\n\n" + close_note
         for role in roles:
-            jobs.append(self._run_one(role, self._role_system(role), instruction))
+            named.append((role, self._run_one(role, self._role_system(role), worker_instr)))
 
-        wake = asyncio.Event()
-        stop = False
-        lock = asyncio.Lock()
-
-        def _kick_review() -> None:
-            wake.set()
-
-        self.ctx.wake_finding_review = _kick_review
-
-        async def _review_pass() -> None:
-            async with lock:
-                await self._run_finding_review()
-
-        async def _review_loop() -> None:
-            while True:
-                await wake.wait()
-                if stop:
-                    return
-                wake.clear()
-                try:
-                    await _review_pass()
-                except Exception:
-                    pass
-
-        loop_task = asyncio.create_task(_review_loop())
+        self.ctx.wake_finding_review = self._kick_review
+        self._ensure_review_loop()
         if leftover:
-            _kick_review()
+            self._kick_review()
+        results: list = []
         try:
-            results = await asyncio.gather(*jobs, return_exceptions=True)
+            from ..engine.turn_close import WORKER_ABORT_GRACE_SEC, turn_must_close
+            task_roles = {asyncio.create_task(coro): name for name, coro in named}
+            by_role: dict[str, object] = {}
+            pending: set[asyncio.Task] = set(task_roles)
+            lead_closed = False
+            t0 = time.monotonic()
+            try:
+                cap = float(getattr(settings, "turn_must_close_sec", 0) or 0)
+            except (TypeError, ValueError):
+                cap = 0.0
+
+            def _take(done_set: set[asyncio.Task]) -> None:
+                for t in done_set:
+                    name = task_roles.get(t)
+                    if not name or name in by_role:
+                        try:
+                            t.result()
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        by_role[name] = t.result()
+                    except Exception as e:
+                        by_role[name] = e
+
+            while pending:
+                if turn_must_close(time.monotonic() - t0, cap):
+                    try:
+                        await emit(
+                            self.project_id, "log",
+                            {"level": "info",
+                             "message": (
+                                 f"本轮已满 {int(cap)}s，强制收口以让御主开口"
+                                 "（CTF / SRC / 红队同一规则）。"
+                             )},
+                            run_id=self.ctx.run_id,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await self.interrupt(halt=False)
+                    except Exception:
+                        pass
+                    for t in list(pending):
+                        t.cancel()
+                    leftover, pending = await asyncio.wait(pending, timeout=5)
+                    _take(leftover)
+                    break
+                slice_wait = 2.0
+                if cap > 0:
+                    slice_wait = max(0.05, min(2.0, cap - (time.monotonic() - t0)))
+                done, pending = await asyncio.wait(
+                    pending, timeout=slice_wait, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    continue
+                _take(done)
+                if (not lead_closed) and "lead" in by_role:
+                    lead_closed = True
+                    leftover_roles = [
+                        r for r in (task_roles.get(p) for p in pending) if r
+                    ]
+                    await self._abort_roles(set(leftover_roles))
+                    if leftover_roles:
+                        try:
+                            await emit(
+                                self.project_id, "log",
+                                {
+                                    "level": "info",
+                                    "message": (
+                                        "从者本轮已返回，中止仍在跑的工人（"
+                                        + "、".join(leftover_roles)
+                                        + "）以让御主开口。"
+                                    ),
+                                },
+                                run_id=self.ctx.run_id,
+                            )
+                        except Exception:
+                            pass
+                        more, pending = await asyncio.wait(
+                            pending, timeout=WORKER_ABORT_GRACE_SEC,
+                        )
+                        _take(more)
+                        if pending:
+                            await self._abort_roles(
+                                {r for r in (task_roles.get(p) for p in pending) if r}
+                            )
+                            for t in list(pending):
+                                t.cancel()
+                            extra, pending = await asyncio.wait(pending, timeout=5)
+                            _take(extra)
+                            pending = set()
+            results = [by_role.get("lead")] + [by_role.get(r) for r in roles]
         finally:
-            stop = True
-            _kick_review()
-            try:
-                await loop_task
-            except Exception:
-                loop_task.cancel()
-            try:
-                await _review_pass()
-            except Exception:
-                pass
-            self.ctx.wake_finding_review = None
+            self._kick_review()
+            self.ctx.wake_finding_review = self._kick_review
         texts: list[str] = []
         tool_uses = 0
         first_err: BaseException | None = None
         for item in results:
+            if item is None:
+                continue
             if isinstance(item, BaseException):
                 if first_err is None:
                     first_err = item

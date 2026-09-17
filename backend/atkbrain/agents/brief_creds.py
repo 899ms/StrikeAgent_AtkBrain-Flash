@@ -1,38 +1,19 @@
-"""题面个位数凭据候选。赛道无关、不写某题口令、不扩字典。"""
+"""题面已出现的账密字面量。只摘录，不合成、不按厂商名拼默认口令。"""
 from __future__ import annotations
 
 import re
 
-_YEAR_RE = re.compile(r"\b(20[1-3]\d)\b")
-_PAREN_LATIN_RE = re.compile(r"\(([A-Z][A-Za-z0-9]{2,24})\)")
-_CAP_TOKEN_RE = re.compile(r"\b([A-Z][A-Za-z]{2,20})\b")
-_CN_VENDOR_RE = re.compile(
-    r"(?<![\u4e00-\u9fff])([\u4e00-\u9fff]{2,4})(?:OA|CMS|ERP)(?:系统)?",
-)
-_CN_FILLER_RE = re.compile(
-    r"资产|管理|业务|系统|设备|嵌入|团队|报告|安全|评估|核心|内部|"
-    r"授权|保护|机制|流程|凭据|访问|校验|输出|分析|部署|一套|"
-    r"厂商|软件|产品|平台|公司|员工|漏洞|测试|渗透|攻击|企业|"
-    r"获取|目标|机密|数据|后台|服务|开放|大型|开展|逐步|突破|"
-    r"防线|最终|需要|找到|有效|登录|官网|报销|报表|部门|帮助|"
-    r"最近|收到|该|某|了|的|一"
-)
+# 进程健康检查用：旧进程没有这个字段。
+CREDS_MODE = "literal_only"
+
 _EXPLICIT_PAIR_RE = re.compile(
     r"\b([A-Za-z][A-Za-z0-9._-]{1,20})\s*(?:[:/=])\s*"
     r"([A-Za-z0-9@._!#$%^*+-]{3,32})\b"
 )
-_STOP = frozenset({
-    "http", "https", "html", "flag", "ctf", "linux", "windows", "ubuntu",
-    "apache", "nginx", "mysql", "redis", "python", "java", "php", "node",
-    "admin", "root", "user", "test", "guest", "login", "password", "token",
-    "get", "post", "put", "head", "options", "api", "url", "json", "xml",
-    "sql", "ssh", "ftp", "tcp", "udp", "icmp", "dns", "smtp", "imap",
-    "the", "and", "for", "with", "from", "this", "that", "system", "server",
-    "please", "help", "team", "security", "internal", "core", "web",
-    "application", "service", "device", "code", "access", "check", "please",
-    "task", "challenge", "target", "host", "port", "file", "path",
-    "getshell", "report", "flag",
-})
+_LEAKED_PASS_RE = re.compile(
+    r"(?i)(?:password|passwd|口令)\s*[=:]\s*['\"]?"
+    r"([A-Za-z0-9@._!#$%^*+-]{3,32})"
+)
 _USER_STOP = frozenset({
     "http", "https", "www", "ftp", "ssh", "tcp", "udp", "api", "url",
 })
@@ -41,31 +22,16 @@ _PASS_STOP = frozenset({
 })
 
 
-def _vendors_of(text: str) -> list[str]:
-    raw = text or ""
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def add(tok: str) -> None:
-        t = (tok or "").strip()
-        if not t or t.lower() in _STOP:
-            return
-        if not re.search(r"[A-Za-z]", t):
-            if len(t) > 4 or _CN_FILLER_RE.search(t):
-                return
-        key = t.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(t)
-
-    for m in _PAREN_LATIN_RE.finditer(raw):
-        add(m.group(1))
-    for m in _CN_VENDOR_RE.finditer(raw):
-        add(m.group(1))
-    for m in _CAP_TOKEN_RE.finditer(raw):
-        add(m.group(1))
-    return out[:6]
+def graph_cred_blob(graph: dict | None, limit: int = 3000) -> str:
+    """图节点正文，供摘录已经写在图上的账密字面量。"""
+    parts: list[str] = []
+    for n in (graph or {}).get("nodes") or []:
+        if not isinstance(n, dict):
+            continue
+        blob = f"{n.get('title') or ''} {n.get('detail') or ''}".strip()
+        if blob:
+            parts.append(blob)
+    return "\n".join(parts)[: max(0, int(limit or 0) or 3000)]
 
 
 def _explicit_pairs(text: str) -> list[str]:
@@ -85,8 +51,20 @@ def _explicit_pairs(text: str) -> list[str]:
     return out[:6]
 
 
+def _leaked_secrets(text: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _LEAKED_PASS_RE.finditer(text or ""):
+        pw = (m.group(1) or "").strip()
+        if not pw or pw.lower() in _PASS_STOP or pw.lower() in seen:
+            continue
+        seen.add(pw.lower())
+        out.append(pw)
+    return out[:6]
+
+
 def credential_candidates_from_brief(text: str, max_pairs: int = 10) -> list[str]:
-    """从题面抽取个位数候选（user/pass 或单口令）。禁止扩字典。"""
+    """只返回正文里已经出现的 user/pass 或 password= 字面量。禁止合成。"""
     blob = (text or "").strip()
     if not blob:
         return []
@@ -103,22 +81,8 @@ def credential_candidates_from_brief(text: str, max_pairs: int = 10) -> list[str
 
     for p in _explicit_pairs(blob):
         add(p)
-    vendors = _vendors_of(blob)
-    years = [m.group(1) for m in _YEAR_RE.finditer(blob)]
-    years = list(dict.fromkeys(years))[:3]
-    if vendors or years:
-        add("admin/admin")
-    for v in vendors:
-        add(f"{v}@123")
-        add(f"admin/{v}")
-        add(f"admin/{v}@123")
-        for y in years:
-            add(f"{v}@{y}")
-            add(f"admin/{v}@{y}")
-    if years and not vendors:
-        for y in years:
-            add(f"admin@{y}")
-            add(f"admin/admin@{y}")
+    for p in _leaked_secrets(blob):
+        add(p)
     return out[:limit]
 
 
@@ -126,4 +90,30 @@ def format_cred_hint(cands: list[str] | None) -> str:
     items = [str(x).strip() for x in (cands or []) if str(x).strip()]
     if not items:
         return ""
-    return "；题面凭据候选（个位数尝试，禁止扩字典）：" + "、".join(items[:8])
+    return "；题面已出现的账密（禁止合成、禁止扩字典）：" + "、".join(items[:8])
+
+
+def password_values(cands: list[str] | None) -> set[str]:
+    """user/pass 对里的口令，以及单独出现的 password= 字面量。"""
+    out: set[str] = set()
+    for raw in cands or []:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        out.add(s.lower())
+        if "/" in s:
+            out.add(s.split("/", 1)[-1].lower())
+    return out
+
+
+_SSHPASS_P_RE = re.compile(
+    r"\bsshpass\b(?:\s+-\w)*\s+-p\s*(?:'([^']*)'|\"([^\"]*)\"|(\S+))",
+    re.I,
+)
+
+
+def sshpass_password_from_cmd(command: str) -> str | None:
+    m = _SSHPASS_P_RE.search(command or "")
+    if not m:
+        return None
+    return (m.group(1) or m.group(2) or m.group(3) or "").strip() or None

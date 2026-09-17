@@ -84,6 +84,7 @@ _SKIP_TEXT = {
     "hold_course": "刚注入过指令，再给几轮把当前验证做完，御主强制 noop。",
     "infra": "入口传输层失败，御主整段跳过，不当方法失败去换路。",
     "let_commander": "从者尚未连着空转满暂停阈值，先让从者打。",
+    "no_graph_change": "攻击图无新进展，沿用当前方案，未再问御主。",
     "human_override": "本轮有人工强制指令，御主让路，不改方向。",
     "binding_ignored": "上一步未执行御主绑定，收紧约束后重注，不开新方案。",
     "binding_empty": "本轮无工具，御主绑定沿用，不开新方案。",
@@ -609,40 +610,48 @@ def intent_tactic(intent: dict | None) -> str:
 
 
 def _internal_graph_hosts(graph: dict | None) -> set[str]:
-    """图上已出现的内网/容器网主机（target: 与 scope-expanded），不含入口同 /24。"""
+    """图上已出现的内网/容器网主机（scope-expanded / 跳板 target），不含入口同 /24。
+
+    入口网段只认带 entry 的 target（或未打横向标签的入口点），不把内网目标的 /24 当入口。
+    """
     if not graph:
         return set()
     import ipaddress
     from ..scope import _IP_RE, _norm_host, is_loopback, is_private
 
+    def _host_from_key(key: str, *, prefixes: tuple[str, ...]) -> str:
+        kid = str(key or "")
+        for p in prefixes:
+            if kid.startswith(p):
+                raw = kid[len(p):].split(":")[0]
+                return _norm_host(raw)
+        return ""
+
     tagged: set[str] = set()
+    entry_nets: list = []
     for n in graph.get("nodes") or []:
         key = str(n.get("key") or "")
-        h = ""
-        if key.startswith("info:scope-expanded:"):
-            h = key.split(":", 2)[-1]
-        elif key.startswith("info:host:"):
-            h = key.split(":", 2)[-1]
-        elif key.startswith("target:"):
-            h = key.split(":", 1)[-1]
-        h = _norm_host(h)
+        h = _host_from_key(key, prefixes=("info:scope-expanded:", "info:host:", "target:"))
         if h and _IP_RE.match(h) and is_private(h) and not is_loopback(h):
             tagged.add(h)
+        if str(n.get("type") or "").lower() == "target" or key.startswith("target:"):
+            tags = n.get("tags") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            tagset = {str(t).lower() for t in tags}
+            if "entry" not in tagset and (tagset & {"lateral", "pivot", "scope-expanded", "internal"}):
+                continue
+            eh = _host_from_key(key, prefixes=("target:",))
+            if not eh:
+                continue
+            try:
+                ip = ipaddress.ip_address(eh)
+            except ValueError:
+                continue
+            if ip.version == 4:
+                entry_nets.append(ipaddress.ip_network(f"{ip}/24", strict=False))
     if not tagged:
         return set()
-    entry_nets: list = []
-    for h in tagged:
-        try:
-            ip = ipaddress.ip_address(h)
-        except ValueError:
-            continue
-        if ip.version != 4:
-            continue
-        # 入口候选：非 docker 172.16/12 的私网 IP（常见 10.x）
-        if ip in ipaddress.ip_network("172.16.0.0/12"):
-            continue
-        entry_nets.append(ipaddress.ip_network(f"{ip}/24", strict=False))
-        break
     out: set[str] = set()
     for h in tagged:
         try:
@@ -872,7 +881,10 @@ class LoopSupervisor:
         self, graph: dict | None, *, correct_flags: int = 0, flag_count: int = 0,
     ) -> dict:
         from ..objective import objective_allows_flag
-        from .supervisor_brief import needs_postex_pivot_guidance, pending_loot_internal_hosts
+        from .supervisor_brief import (
+            needs_postex_pivot_guidance, pending_loot_internal_hosts,
+            needs_proxy_auth_guidance,
+        )
         has_foot = graph_has_getshell(graph)
         pending = pending_loot_internal_hosts(graph)
         hops = bool(_internal_graph_hosts(graph) or pending)
@@ -882,23 +894,28 @@ class LoopSupervisor:
                 remaining = int(correct_flags or 0) < int(flag_count)
             else:
                 remaining = bool(has_foot and hops)
-        if remaining and pending and (
-            has_foot
-            or needs_postex_pivot_guidance(
-                graph=graph, correct_flags=correct_flags, flag_count=flag_count,
-            )
-        ):
+        postex_pivot = needs_postex_pivot_guidance(
+            graph=graph, correct_flags=correct_flags, flag_count=flag_count,
+        )
+        if remaining and pending and (has_foot or postex_pivot):
             has_foot = True
         cats = verified_finding_categories(graph)
+        live_g = bool(live_gadget_tactics(graph))
         return {
             "has_foothold": has_foot,
             "remaining_goals": remaining,
             "has_verified_asset": has_verified_asset(graph) and not self.entry_identity_mismatch,
             "has_internal_hops": hops,
             "verified_categories": sorted(cats),
-            "has_live_gadget": bool(live_gadget_tactics(graph)),
+            "has_live_gadget": live_g,
             "needs_channel_oracle": bool(needs_channel_oracle(graph)),
             "has_http_service": graph_has_http_service(graph),
+            "proxy_auth": needs_proxy_auth_guidance(
+                graph,
+                postex_pivot=bool(postex_pivot or (remaining and pending)),
+                has_live_gadget=live_g,
+                has_internal_hops=hops,
+            ),
         }
 
     def _protected_now(self, graph: dict | None, *, remaining_goals: bool | None = None) -> frozenset[str]:
@@ -997,6 +1014,7 @@ class LoopSupervisor:
         extra_parts: list[str] = []
         from ..objective import objective_is_src
         cycle = objective_is_src(self.objective)
+        flags = bind_flags or {}
         if invert_ops:
             from .supervisor_brief import INVERT_OPS_GUIDE, sanitize_invert_ops_plan
             sanitize_invert_ops_plan(plan, invert_ops=True)
@@ -1004,7 +1022,9 @@ class LoopSupervisor:
         if postex_pivot and not cycle:
             from .supervisor_brief import POSTEX_PIVOT_GUIDE
             extra_parts.append(POSTEX_PIVOT_GUIDE)
-        flags = bind_flags or {}
+        if bool(flags.get("proxy_auth")) and not cycle:
+            from .supervisor_brief import PROXY_AUTH_GUIDE
+            extra_parts.append(PROXY_AUTH_GUIDE)
         cats = flags.get("verified_categories")
         oracle_open = bool(flags.get("needs_channel_oracle"))
         skip_close_guide = oracle_blocks_closeout(
@@ -1686,15 +1706,42 @@ class LoopSupervisor:
             ):
                 review, review_why = False, "progress"
 
+        if (
+            review
+            and not forced
+            and not infra
+            and not void_plan
+            and (quality or "none") == "none"
+            and self.binding is not None
+        ):
+            bind_status = binding_compliance(
+                self.binding,
+                assigned=assigned,
+                open_intents=open_intents,
+                last_turn_text=last_turn_text,
+                last_tool_uses=last_tool_uses,
+                quality=quality,
+                task_subagents=task_subagents,
+            )
+            stalled = False
+            try:
+                need = int(getattr(settings, "supervisor_consult_stall_turns", 2) or 2)
+                stalled = int(self.no_progress or 0) >= need
+            except (TypeError, ValueError):
+                stalled = False
+            if bind_status in ("executed", "oracle") and not stalled:
+                review, review_why = False, "no_graph_change"
+
         if not review:
             _requeue_active()
             await self.emit_skip(turn, reason=review_why or "hold_course")
-            if review_why in ("hold_course", "in_flight", "let_commander", "progress"):
+            if review_why in ("hold_course", "in_flight", "let_commander", "progress", "no_graph_change"):
                 why_cn = {
                     "hold_course": "刚下过指令，等当前验证做完",
                     "in_flight": "本轮任务仍在验证，尚未证实或否证",
                     "let_commander": "先让从者打",
                     "progress": "从者仍在推进当前方案",
+                    "no_graph_change": "攻击图无新进展，沿用当前方案",
                 }.get(review_why, review_why)
                 await emit(
                     self.project_id, "log",
@@ -1879,7 +1926,10 @@ class LoopSupervisor:
         )
         if llm_hold_ok:
             try:
-                from .supervisor_brief import POSTEX_PIVOT_GUIDE, needs_postex_pivot_guidance
+                from .supervisor_brief import (
+                    POSTEX_PIVOT_GUIDE, PROXY_AUTH_GUIDE, needs_postex_pivot_guidance,
+                    needs_proxy_auth_guidance,
+                )
                 cfg = (project or {}).get("config") or {}
                 try:
                     flag_count = int(cfg.get("flag_count") or 0)
@@ -1889,6 +1939,15 @@ class LoopSupervisor:
                     graph=graph, correct_flags=correct_flags, flag_count=flag_count,
                 ) and POSTEX_PIVOT_GUIDE not in (self.active_steer or ""):
                     self.active_steer = self.active_steer + "\n" + POSTEX_PIVOT_GUIDE
+                if needs_proxy_auth_guidance(
+                    graph,
+                    postex_pivot=needs_postex_pivot_guidance(
+                        graph=graph, correct_flags=correct_flags, flag_count=flag_count,
+                    ),
+                    has_live_gadget=bool(live_gadget_tactics(graph)),
+                    has_internal_hops=bool(_internal_graph_hosts(graph)),
+                ) and PROXY_AUTH_GUIDE not in (self.active_steer or ""):
+                    self.active_steer = (self.active_steer or "") + "\n" + PROXY_AUTH_GUIDE
             except Exception:
                 pass
             _requeue_active()

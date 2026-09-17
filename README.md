@@ -20,7 +20,7 @@
 
 ## 架构
 
-控制台调度猎面；攻击图驱动自循环。从者整轮（含角色工人）打完再问御主，卡住或到周期才开口；对话框里的人工指令立刻打断本轮并强制改向。收工把可迁移手法蒸馏进记忆库，回灌下一局。猎面运行时是 Pi（`deepseek-flash`），不是 Claude Code。
+控制台调度猎面；攻击图驱动自循环。从者整轮（含角色工人）打完再问御主，卡住或到周期才开口；对话框里的人工指令立刻打断本轮并强制改向。收工把可迁移手法蒸馏进记忆库，回灌下一局。猎面运行时是 Pi（`deepseek-flash`），不是 Claude Code。红队 / SRC 的 HTTP 第一跳是本机 Yakit MITM，下游仍是出口代理池；图工具走本机 HTTP 扩展，Yakit 全套能力走本机 Yak MCP。
 
 ![StrikeAgent_AtkBrain-Flash 架构](docs/assets/architecture.png)
 
@@ -73,20 +73,22 @@ Cybench 官方认证榜单第 3 名（`deepseek-v4-flash`，84.13 / 100）。
 
 一、目录与进程纪律
 - 仓库根记为 REPO（含 backend/、frontend/、scripts/、skills/、tools/、pi/）。
-- 后端 :5003，前端 :5001。不要在临时 shell 里再起 python3 -m atkbrain.main 或 npm run dev，会和 systemd 抢端口。
+- 后端 :2333，前端 :2334。不要在临时 shell 里再起 python3 -m atkbrain.main 或 npm run dev，会和 systemd 抢端口。
 - 后端解释器必须是 /usr/bin/python3（3.12+），包装到系统 Python，不要只装进 venv 却让 unit 跑系统 python。
-- 数据、库、工作区、密钥只写 backend/data/（已 gitignore）。不要提交 .env、*.db、workspaces、loot、atkbrain-claude.env。
+- 数据、库、工作区、密钥、MITM CA 只写 backend/data/（已 gitignore）。不要提交 .env、*.db、workspaces、loot、atkbrain-claude.env、yakit-mitm-ca.pem。
 - 启动/重启只用：sudo scripts/atkbrain-up.sh（首次）、sudo scripts/atkbrain-backend.sh restart、sudo scripts/atkbrain-frontend.sh restart。unit 名是 atkbrain-flash-backend.service / atkbrain-flash-frontend.service。
+- 不要把 yaklang/yakit 源码拷进本仓库。本机已装 Yak 引擎即可；Flash 当 MCP 客户端，不 vendor Yakit。
 
 二、依赖
 - sudo apt 安装 python3 python3-pip python3-dev build-essential nodejs npm curl；导出 PDF 再装 libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 libffi-dev shared-mime-info。
 - pip：sudo /usr/bin/python3 -m pip install -r backend/requirements.txt --break-system-packages
 - 前端：cd frontend && npm install（atkbrain-up.sh 前必须有 frontend/node_modules）
 - 全局安装 Pi：sudo npm install -g @earendil-works/pi-coding-agent；本机 `pi --version` 能跑（DEEPSEEK_API_KEY，可选 ANTHROPIC_AUTH_TOKEN 别名）。
-- 把当前 shell 里的 DEEPSEEK_* / ANTHROPIC_* / ATKBRAIN_* / PI_* 准备好后再 sudo scripts/atkbrain-up.sh。脚本会把密钥快照到 backend/data/atkbrain-claude.env（权限 600）。systemd 的 PATH 里要有 pi。
+- 本机 `yak` 能跑（Yakit / Yaklang 引擎）。不要 git clone yaklang/yakit 进本仓库。PATH 里没有 yak 时，顶栏会一直「Yakit 未就绪」。
+- 把当前 shell 里的 DEEPSEEK_* / ANTHROPIC_* / ATKBRAIN_* / PI_* 准备好后再 sudo scripts/atkbrain-up.sh。脚本会把密钥快照到 backend/data/atkbrain-claude.env（权限 600）。systemd 的 PATH 里要有 pi 和 yak。
 
 三、Skill / 工具路径（最容易部署错）
-猎面 Pi 的 cwd 是 backend/data/workspaces/<项目id>/，不是仓库根。Skill 和本仓库绑定，不是用户全局环境。图工具走 REPO/pi/extensions/atkbrain-tools.ts（本机 HTTP），不要再装 Claude Agent SDK / MCP。
+猎面 Pi 的 cwd 是 backend/data/workspaces/<项目id>/，不是仓库根。Skill 和本仓库绑定，不是用户全局环境。图工具走 REPO/pi/extensions/atkbrain-tools.ts（本机 HTTP）。不要再装 Claude Agent SDK。Yakit 走本机 Yak MCP（Streamable HTTP），由后端发现或自拉，不要把 Cursor 的 mcp.json 抄进仓库。
 - 源文件：REPO/skills/kali-kit、recon-fanout、recon-spiral、src-hunt-playbook、waf-bypass-methodology。只进 git，不要复制到 ~/.claude 或 ~/.pi，不要改 Pi 用户级 settings 来装 skill。
 - 运行时：会话启动会把本赛道 skill 拷到该猎工作区 backend/data/workspaces/<pid>/.agents/skills/。Pi 用 --skill 精确加载。
 - 调度按御主方案并发拉起角色工人（Python 拉 Pi 进程），不要用 Claude Code 的 Task/Agent。工人禁止再开子进程。
@@ -98,11 +100,17 @@ Cybench 官方认证榜单第 3 名（`deepseek-v4-flash`，84.13 / 100）。
 - nmap / ffuf / nuclei 等用系统绝对路径（/usr/bin/...），清单在 kali-kit，禁止 which / ls /usr/share/wordlists。
 - 不要把 kali-kit 全文塞进系统提示；从者需要路径时调用 skill kali-kit。CTF 开局读 recon-fanout，红队开局读 recon-spiral，SRC 开局读 src-hunt-playbook。利用 payload 被 WAF/403/406 拦住时再读 waf-bypass-methodology；路径级 401/403 仍走 kali-kit 的 bypass-403。
 
-四、验收
-curl -sS http://127.0.0.1:5003/api/health   期望 ok: true，claude_sdk.label 为「Pi 就绪」（字段名仍是 claude_sdk，含义是 Pi）
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5001/   期望 200
-浏览器打开 http://127.0.0.1:5001/
-失败先看 backend/data/logs/backend.err.log 与 frontend.err.log：缺包、端口占用、pi 不在 unit 的 PATH、或没快照密钥。
+四、Yakit MCP 与 MITM 证书
+- 红队 / SRC：从者 HTTP 第一跳必须是本机 MITM（默认从 127.0.0.1:8084 起找空闲口，范围 8084–8107），DownstreamProxy 必须是出口代理池。禁止 proxychains 与 MITM 叠跳，禁止出口开着时漏本机 IP。CTF 默认不进 MITM。
+- Yak MCP：优先接本机已监听的全能力口 http://127.0.0.1:11433/mcp（`yak mcp --enable-all`）。Cursor 若占用 11432，不要去抢、不要拿 11432 的 CA 去验 11433 的 MITM。没有监听时后端会自拉 11433。
+- 证书：后端用 MCP 工具 download_mitm_cert 落到 backend/data/yakit-mitm-ca.pem。顶栏「证书就绪」= 文件可读未过期，且能用这张 CA 校验当前 MITM 的 HTTPS 叶子证。引擎换口后旧 CA 作废，设置页再点一次「下载 MITM 证书」。
+- 顶栏持续检测：Yakit 就绪 / 证书就绪 / 已验收的出口 IP（跟 MITM 打 icanhazip 的结果，必须等于池节点）。设置页有 Yakit 开关、备用下游、下载证书。
+
+五、验收
+curl -sS http://127.0.0.1:2333/api/health   期望 ok: true，claude_sdk.label 为「Pi 就绪」（字段名仍是 claude_sdk，含义是 Pi）；打开 Yakit 后 yakit.engine.label 为「Yakit 就绪」，yakit.cert.label 为「证书就绪」，yakit.mitm.verified 为 true
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:2334/   期望 200
+浏览器打开 http://127.0.0.1:2334/
+失败先看 backend/data/logs/backend.err.log、frontend.err.log、backend/data/yakit-mcp.log：缺包、端口占用、pi/yak 不在 unit 的 PATH、没快照密钥、或 CA 与当前 MCP 引擎不是一套。
 ```
 
 ### 环境
@@ -116,8 +124,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5001/   期望 200
 | Python        | `/usr/bin/python3`，**3.12+**。后端 unit 直接跑这个解释器，不要只用 venv 装包却不改 unit                         |
 | Node.js / npm | **18+**（Pi 建议较新 Node）                                                                   |
 | Pi            | 本机 `pi` 能用：`npm i -g @earendil-works/pi-coding-agent`，配好 `DEEPSEEK_API_KEY`           |
-| 端口            | **5001** 控制台，**5003** API，不要被其它进程占着                                                        |
-| 磁盘            | `backend/data/` 会写库、工作区、日志、报告                                                              |
+| Yak / Yakit   | 本机 `yak` 能用（Yakit 引擎）。Flash 接 Streamable HTTP MCP，不把 yakit 源码放进仓库                         |
+| 端口            | **2334** 控制台，**2333** API；Yak MCP 默认 **11433**（全能力，不抢 Cursor 的 11432）；MITM **8084–8107** |
+| 磁盘            | `backend/data/` 会写库、工作区、日志、报告、`yakit-mitm-ca.pem`                                              |
 
 
 系统包（Kali / Debian）：
@@ -138,6 +147,21 @@ sudo npm install -g @earendil-works/pi-coding-agent
 pi --version
 ```
 
+Yakit 引擎（本机 `yak`，不要把源码拷进本仓库）：
+
+```bash
+command -v yak
+yak version   # 或 yak --version
+```
+
+没有 `yak` 时先按 [Yakit](https://github.com/yaklang/yakit) 安装 Yak 引擎。后端需要时会自拉：
+
+```bash
+yak mcp --transport streamable_http --host 127.0.0.1 --port 11433 --enable-all
+```
+
+Cursor 若已经在 `127.0.0.1:11432/mcp` 跑了一份 Yak MCP，留给 Cursor；Flash 用 11433 全能力口，两套 CA 不能混用。
+
 模型密钥用环境变量即可，安装脚本会快照到 `backend/data/atkbrain-claude.env`（权限 `600`，不要提交进 git）：
 
 
@@ -148,6 +172,9 @@ pi --version
 | `ATKBRAIN_PI_BIN`                            | `pi` 可执行文件路径，默认 `pi`          |
 | `ATKBRAIN_PI_MODEL` / `ATKBRAIN_CLAUDE_MODEL` | 默认 `deepseek-flash`           |
 | `ATKBRAIN_API_TOKEN`                         | 非空则 API / WebSocket 要带令牌（可选）  |
+| `ATKBRAIN_YAKIT_MCP_URL` / `yakit_mcp_url`   | 覆盖 MCP 地址；默认先找 `127.0.0.1:11433/mcp` |
+| `ATKBRAIN_YAKIT_MCP_FULL_PORT`               | Flash 自拉 `--enable-all` 的端口，默认 `11433` |
+| `ATKBRAIN_YAKIT_MITM_PORT`                   | MITM 首选口，被占则向后找空闲口（到 8107）     |
 
 
 Debian 12+ 若 `pip` 报 `externally-managed-environment`，给系统 Python 装包时加 `--break-system-packages`（本仓库的 systemd unit 用的就是 `/usr/bin/python3`）。
@@ -181,30 +208,32 @@ cd ..
 sudo scripts/atkbrain-up.sh
 ```
 
-脚本会安装并 enable `atkbrain-flash-backend.service`、`atkbrain-flash-frontend.service`，把模型相关环境变量写入 `backend/data/atkbrain-claude.env`，拉起后端 `:5003`、前端 `:5001`（崩溃会自动重启）。
+脚本会安装并 enable `atkbrain-flash-backend.service`、`atkbrain-flash-frontend.service`，把模型相关环境变量写入 `backend/data/atkbrain-claude.env`，拉起后端 `:2333`、前端 `:2334`（崩溃会自动重启）。
 
-浏览器打开 **[http://127.0.0.1:5001/](http://127.0.0.1:5001/)**。局域网其它机器用 `http://<kali-ip>:5001/`。
+浏览器打开 **[http://127.0.0.1:2334/](http://127.0.0.1:2334/)**。局域网其它机器用 `http://<kali-ip>:2334/`。
 
 确认起来：
 
 ```bash
-curl -sS http://127.0.0.1:5003/api/health
+curl -sS http://127.0.0.1:2333/api/health
 # 期望含 "ok": true，以及 claude_sdk.label 为「Pi 就绪」
+# 打开 Yakit 后还期望 yakit.engine.label 为「Yakit 就绪」、yakit.cert.label 为「证书就绪」
+# yakit.mitm.verified 为 true；yakit.engine.url 应是 11433 全能力口，不要拿别人的 11432 CA 去验
 
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5001/
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:2334/
 # 期望 200
 ```
 
-日志：`backend/data/logs/backend.log`、`backend.err.log`、`frontend.log`、`frontend.err.log`。数据在 `backend/data/`，已进 `.gitignore`。
+日志：`backend/data/logs/backend.log`、`backend.err.log`、`frontend.log`、`frontend.err.log`、`backend/data/yakit-mcp.log`。数据在 `backend/data/`，已进 `.gitignore`。MITM CA 在 `backend/data/yakit-mitm-ca.pem`，不要提交。
 
-红队 / SRC 默认 5 个项目槽、CTF 默认 3 个，两道互不占槽，都可调到 20。项目内 Pi 工人不设上限。顶栏看槽位、Pi 就绪和出口代理；设置页只管自建代理池。
+红队 / SRC 默认 5 个项目槽、CTF 默认 3 个，两道互不占槽，都可调到 20。项目内 Pi 工人不设上限。顶栏看槽位、Pi 就绪、Yakit 就绪、证书就绪和出口 IP；设置页管自建代理池、Yakit 开关、备用下游和下载 MITM 证书。
 
-红队墙钟 12 小时硬停（拿到 shell 提前收工）；SRC 6 小时硬停、不限轮次、已验证高危/严重不停工；CTF 按遍次墙钟。红队 / SRC 打目标必须走顶栏出口代理，无存活节点则拒绝出网，不会回落真实 IP。CTF 始终直连。侧栏版本对照 GitHub Release 只提示，不自动升级。
+红队墙钟 12 小时硬停（拿到 shell 提前收工）；SRC 6 小时硬停、不限轮次、已验证高危/严重不停工；CTF 按遍次墙钟。红队 / SRC 打目标：HTTP 第一跳本机 MITM，Downstream 必须是顶栏出口代理池；无存活节点则拒绝出网，不会回落真实 IP。CTF 始终直连，默认不进 Yakit。侧栏版本对照 GitHub Release 只提示，不自动升级。
 
 ### 常见问题
 
 **`health: DOWN`**  
-刚 restart 时 uvicorn 还在加载，等几秒再 curl。一直挂就看 `backend.err.log`：缺包、端口占用、或 `pi` 不在 `PATH`。
+刚 restart 时 uvicorn 还在加载，等几秒再 curl。一直挂就看 `backend.err.log`：缺包、端口占用、或 `pi` / `yak` 不在 `PATH`。
 
 **前端 unit 起不来，提示先 `npm install`**  
 `scripts/atkbrain-frontend.sh` 要求 `frontend/node_modules` 已存在。
@@ -215,8 +244,20 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5001/
 **红队 / SRC 打目标报拒绝直连**  
 顶栏出口代理开着，但还没有存活节点。到设置页保存自建池，或等探活转圈出节点后再打。CTF 始终直连，不受影响。
 
-**5001 / 5003 被占**  
-`ss -tlnp | grep -E '5001|5003'`，停掉旧进程后再 `atkbrain-up.sh`。
+**顶栏「Yakit 未就绪」**  
+本机没有 `yak`，或 MCP 没起来。看 `backend/data/yakit-mcp.log`。确认 `ss -tlnp | grep 11433`。不要去抢 Cursor 占用的 11432。unit 的 PATH 里要有 `yak`，改完再 `sudo scripts/atkbrain-backend.sh restart`。
+
+**顶栏「证书异常」**  
+CA 还没下、已过期，或证书绑定的 MCP 口和当前引擎不是一套（例如用 11432 的 CA 去验 11433 的 MITM）。到设置页点「下载 MITM 证书」，落到 `backend/data/yakit-mitm-ca.pem`。换引擎后必须重下。
+
+**顶栏出口 IP 和池子不一致**  
+顶栏必须跟当前 MITM 打 icanhazip 的结果。Yakit 开着时下游应是池当前节点；池子切了会重绑 DownstreamProxy。不要把 Yakit 错误页里的 IP 当成出口。
+
+**2334 / 2333 被占**  
+`ss -tlnp | grep -E '2333|2334'`，停掉旧进程后再 `atkbrain-up.sh`。
+
+**11432 / 11433 / MITM 口被占**  
+11432 留给 Cursor 的 Yak MCP 也可以；Flash 用 11433。MITM 口被别人占用时后端会从 8084 向后找空闲口，不要把别人的 8084 当成自己的抓包口。
 
 ## 开源协议与免责声明
 
@@ -229,3 +270,13 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5001/
 交流群目前已满。关注公众号「夜安团队SEC」，联系我们拉进群。
 
 ![夜安团队SEC 公众号名片](docs/assets/wechat-oa.png)
+
+## 写在最后
+
+当前 AI+安全领域百花齐放，各种工具层出不穷。在 AI 的加持下，想法到落地可以以极快的方式进行，但很多工具缺乏大量测试，只有其形没有其神。我们在写项目的同时，也对 AI+安全方向的众多工具（包括商业化闭源工具）进行了测试。
+
+测试后发现，同质化问题相当严重；也拿到过一些竞赛排名靠前的项目，发现不少问题。比如竞赛通常有时间和并发限制，大概率没有 WAF，并且题目肯定有解；而红队则不限时间，是否会有 RCE 或者数据库权限等，都是未知数，并且大概率有 WAF。再比如大资产的测试时间分配、是否容易打偏、什么叫目标资产（比如 JS 中有很多资产，如何精准区分旁站和毫不相关的资产）、Agent 的调用、沙箱、上下文、召回率，skill 的数量、嵌套深度和最佳平衡点到底是多少，图工具走本机扩展还是 MCP，等等一系列问题，都需要大量测试和反复验证。Flash 版猎面已从 Claude Code 换成 Pi，角色工人由调度并发拉起，不再走 Task/Agent。图工具仍走本机 HTTP 扩展；Yakit 的 MITM / History / Fuzzer / 证书走本机 Yak MCP，出口仍只从代理池出去。
+
+现在这个 AI 盛行的时代，代码不是重点，重要的是思想、观点和想法，而不是千篇一律地二开个项目、加几句话，然后导入一大坨资产，发现能搞点东西——这种量变无法引起质变。当然，也看到社区里有非常优秀的产品和非常先进的理念。比如杭州那个前辈团队的 Cairn 理念就很有意思：它摒弃了 Skill、MCP、RAG，完全由底座模型和 Agent，再加上一些编排自行决定，这颠覆了以往传统的“Skill+RAG 引导调用 MCP 工具”的理念，这种思想的提出也极具参考意义。还有社区“教红队的 Des”的产品融合，感觉做得很有意义，在增效方面有巨大提升，等等。许多极其优秀的前辈/作品都值得学习。
+
+我 2024 年开始做进攻型红队方向，前期在训练模型上走了不少弯路。如今感受到这股浪潮的来临，也希望在这股潮流中实现自我价值。最后欢迎拷打，欢迎比较，共同进步！

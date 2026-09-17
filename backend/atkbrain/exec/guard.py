@@ -23,7 +23,10 @@ from ..scope import (
     scan_network_forbidden_reason,
     unauthorized_peer_endpoint,
     unauthorized_private_host,
+    unauthorized_public_host,
+    on_local_docker_bridge,
     private_out_of_scope_hint,
+    public_out_of_scope_hint,
 )
 
 # 一个 token 若以 scheme:// 开头 → 只取其“权威主机”(authority)，忽略 path/query/fragment。
@@ -58,6 +61,8 @@ _SKIP_VALUE_FLAGS = {
     "--form-string", "-F", "--form", "-H", "--header", "-b", "--cookie", "--cookie-jar",
     "-A", "--user-agent", "-e", "--referer", "--json", "--url-query",
     "--mail-from", "--mail-rcpt", "--aws-sigv4", "--oauth2-bearer",
+    "-x", "--proxy", "--socks5", "--socks5-hostname", "--proxy1.0",
+    "-o", "-D", "-L", "-R",
 }
 # 这些选项的“值”本身是一条子命令(如 sh -c '...')，需递归解析出其中真正的连接目标作为兜底。
 _SUBCMD_FLAGS = {"-c", "--command"}
@@ -67,7 +72,41 @@ _SHELL_PROGS = {"sh", "bash", "zsh", "dash", "ksh", "ash", "busybox"}
 _INTERP_PROGS = {"python", "python2", "python3", "ruby", "node", "nodejs", "perl", "php", "php7", "php8"}
 _INTERP_CODE_FLAGS = {"-c", "-e", "-r", "--eval", "--command"}
 # 命令前缀里的“包装器”：定位真正程序名时应跳过它们（及 timeout 的时长参数、VAR=val 赋值）。
-_WRAPPERS = {"env", "sudo", "nohup", "stdbuf", "nice", "setsid", "time", "proxychains", "proxychains4"}
+_WRAPPERS = {"env", "sudo", "nohup", "stdbuf", "nice", "setsid", "time", "proxychains", "proxychains4", "sshpass"}
+
+# 本地 SOCKS/端口转发：回环是代理入口，不是作业目标。
+_LOCAL_PROXY_PORTS = {1080, 1081, 1082, 9050, 9051, 4145, 10800, 8083}
+
+
+def _local_proxy_ports() -> set[int]:
+    ports = set(_LOCAL_PROXY_PORTS)
+    try:
+        base = int(getattr(settings, "yakit_mitm_port", 8084) or 8084)
+        ports.update(range(base, base + 24))
+    except Exception:
+        ports.update(range(8084, 8108))
+    return ports
+
+
+_LOCAL_PROXY_HINT_RE = re.compile(
+    r"(?:proxychains4?|\bsshpass\b|"
+    r"(?:-x|--proxy|--socks5(?:-hostname)?)\b|"
+    r"ProxyCommand=|"
+    r"\bnc\s+-x\b|"
+    r"socks5h?://127\.|"
+    r"TCP-LISTEN:|"
+    r"\s-(?:D|L|R)\s)",
+    re.I,
+)
+
+
+def _loopback_is_local_proxy(command: str, host: str, port: int | None) -> bool:
+    """127.0.0.1:1080 / ssh -D / proxychains 是跳板隧道，不是打本机控制台。"""
+    if not is_loopback(host):
+        return False
+    if port is not None and int(port) in _local_proxy_ports():
+        return True
+    return bool(_LOCAL_PROXY_HINT_RE.search(command or ""))
 
 
 def _leading_prog(tokens: list[str]) -> str:
@@ -92,6 +131,7 @@ _REAL_TLDS = {
     "info", "biz", "xyz", "top", "site", "online", "store", "tech", "me", "tv", "cc",
     "pro", "vip", "work", "live", "team", "group", "network", "systems", "host",
     "kr", "hk", "tw", "sg", "nl", "it", "es", "se", "no", "fi", "pl", "cz", "ch",
+    "studio", "blog", "page", "shop", "news", "media", "link", "space",
 }
 
 # 明显是文件/payload 的扩展名（这些 token 一律不当主机）
@@ -141,7 +181,76 @@ _TARGET_DESTRUCTIVE = [
         r"[?&](?:action|op|do|operate|method|cmd|act)=(?:delete|remove|unlink|destroy|drop)\b",
         re.I,
     ), "请求会触发删除动作"),
+    (re.compile(r"\bFLUSH(?:ALL|DB)\b", re.I), "FLUSHALL/FLUSHDB 会清空业务缓存"),
+    (re.compile(r"\bdropDatabase\b", re.I), "dropDatabase 会删库"),
 ]
+
+# 红队/SRC：证明漏洞，禁止把写操作落到真实用户、资金、库存。CTF 不套（题解常要改管理员）。
+_RESET_PATH_RE = re.compile(
+    r"(?:/|\b)(?:reset[-_]?pass(?:word)?|forgot[-_]?pass(?:word)?|change[-_]?pass(?:word)?|"
+    r"changepwd|password[-_]?reset|passwd[-_]?reset|update[-_]?pass(?:word)?|"
+    r"set[-_]?pass(?:word)?)\b",
+    re.I,
+)
+_NEW_PASS_FIELD_RE = re.compile(
+    r"\b(?:new[_-]?pass(?:word)?|password[_-]?confirm(?:ation)?|confirm[_-]?password|"
+    r"re[_-]?password)\s*=",
+    re.I,
+)
+_ADMIN_OR_VICTIM_RE = re.compile(
+    r"(?:user(?:name|_name)?|account|email|login)\s*=\s*['\"]?(?:admin|root|administrator)\b|"
+    r"[?&](?:uid|user_id|userId|account_id)=(?:1|admin|root)\b|"
+    r"\b(?:admin|root|administrator)@[a-z0-9.-]+",
+    re.I,
+)
+_BIND_PATH_RE = re.compile(
+    r"(?:/|\b)(?:bind[-_]?(?:mobile|phone|email)|change[-_]?(?:email|mobile|phone)|"
+    r"unbind[-_]?(?:mobile|phone|email)?)\b",
+    re.I,
+)
+_LOGIN_PATH_RE = re.compile(r"(?:/|\b)login(?:\b|/|\.php|\.do|\.action|\?)", re.I)
+_WRITE_HTTP_RE = re.compile(
+    r"(?:^|[\s;&|])(?:PUT|POST|PATCH|DELETE)\b|"
+    r"\s-(?:X|-request)\s+(?:PUT|POST|PATCH|DELETE)\b|"
+    r"\s(?:-d|--data(?:-raw|-binary|-ascii|-urlencode)?|--json|-F|--form)\s",
+    re.I,
+)
+_PAY_PATH_RE = re.compile(
+    r"(?:/|\b)(?:pay(?:ment|pal)?|refund|transfer|checkout|alipay|wxpay|"
+    r"wechat[-_]?pay|unionpay|create[-_]?order|place[-_]?order)\b",
+    re.I,
+)
+_MONEY_FIELD_RE = re.compile(
+    r"\b(?:amount|price|money|total|pay[_-]?amount|fee|cash|coupon|points|integral)\s*=",
+    re.I,
+)
+_NOTIFY_PATH_RE = re.compile(
+    r"(?:/|\b)(?:sms|send[-_]?code|verify[-_]?code|vcode|otp|"
+    r"send[-_]?(?:sms|email|voice|mail)|captcha[-_]?sms)\b",
+    re.I,
+)
+_LOOP_RE = re.compile(
+    r"\b(?:for|while)\b.{0,120}(?:sms|send[-_]?code|verify|curl|http)|"
+    r"\bseq\s+\d+\s+\d+\s*\||"
+    r"\bxargs\s+-P\b|"
+    r"\{1?\.\.(?:[2-9]\d|\d{3,})\}",
+    re.I,
+)
+_DOS_RE = re.compile(
+    r"(?:^|[;&|\s])(?:ab|hey|wrk|siege|bombardier|slowloris|hping3?)\s+-"
+    r"|\bxargs\s+-P\s*(?:[4-9]|\d{2,})\b"
+    r"|\bparallel\b.{0,80}\bcurl\b",
+    re.I,
+)
+_OTHER_MUTATE_RE = re.compile(
+    r"(?:/|\b)(?:cancel[-_]?order|close[-_]?account|destroy[-_]?user|"
+    r"delete[-_]?user|unregister|deactivate[-_]?account)\b",
+    re.I,
+)
+_BIZ_RM_RE = re.compile(
+    r"\brm\s+-rf\s+(?:/var/www|/usr/share/nginx|/opt/|/home/www)",
+    re.I,
+)
 
 # 超过 10 万行的词表：CTF 与红队一律拦截（目录/口令/子域/host/哈希）。
 _MEGA_WORDLIST_RE = re.compile(
@@ -184,7 +293,7 @@ def ctf_mega_dict_reason(text: str | None) -> str | None:
     if why:
         return (
             "CTF 必有解，禁止超级大字典撞库/撞哈希。"
-            "题面账号或个位数默认口令即可；失败则回到已验证通道抽数据。"
+            "题面账号或个位数默认口令即可；送达认证接口后失败不要升字典。"
         )
     blob = text or ""
     if not blob.strip():
@@ -192,18 +301,59 @@ def ctf_mega_dict_reason(text: str | None) -> str | None:
     if _CTF_MEGA_DICT_RE.search(blob):
         return (
             "CTF 必有解，禁止超级大字典撞库/撞哈希。"
-            "题面账号或个位数默认口令即可；失败则回到已验证通道抽数据。"
+            "题面账号或个位数默认口令即可；送达认证接口后失败不要升字典。"
         )
     return None
 
 
-def target_destructive_reason(text: str | None) -> str | None:
-    """业务环境禁止的破坏性 payload/命令。命中则返回原因。"""
+def _is_auth_login(blob: str) -> bool:
+    if _RESET_PATH_RE.search(blob) or _BIND_PATH_RE.search(blob):
+        return False
+    return bool(_LOGIN_PATH_RE.search(blob))
+
+
+def _looks_like_write_http(blob: str) -> bool:
+    return bool(_WRITE_HTTP_RE.search(blob))
+
+
+def _business_mutation_reason(blob: str) -> str | None:
+    """红队/SRC：身份落地、资金提交、通知轰炸、高并发写、他人资料删改。"""
+    if _DOS_RE.search(blob):
+        return "高并发写/压测工具会把业务打挂；最多对自己的测试对象做 2 路对照"
+    if _BIZ_RM_RE.search(blob):
+        return "禁止删除业务站点目录"
+    if _OTHER_MUTATE_RE.search(blob) and _looks_like_write_http(blob):
+        return "禁止对线上订单/账号做取消、销户、销毁"
+    if not _is_auth_login(blob):
+        if _RESET_PATH_RE.search(blob) and (
+            _NEW_PASS_FIELD_RE.search(blob) or _ADMIN_OR_VICTIM_RE.search(blob)
+        ):
+            return "禁止覆盖已有管理员/他人口令；只证明 token/IDOR，不提交落地"
+        if _BIND_PATH_RE.search(blob) and (
+            _ADMIN_OR_VICTIM_RE.search(blob) or re.search(r"[?&](?:uid|user_id|userId)=", blob)
+        ):
+            return "禁止给他人账号换绑手机/邮箱"
+    if _PAY_PATH_RE.search(blob) and _MONEY_FIELD_RE.search(blob) and _looks_like_write_http(blob):
+        return "禁止提交支付/退款/转账落地；看回包差分即可"
+    if _NOTIFY_PATH_RE.search(blob) and _LOOP_RE.search(blob):
+        return "禁止短信/邮件验证码循环轰炸"
+    return None
+
+
+def target_destructive_reason(text: str | None, *, objective: str | None = None) -> str | None:
+    """业务环境禁止的破坏性 payload/命令。命中则返回原因。
+
+    SQL 写三赛道都拦。改密/资金/轰炸/高并发写仅红队与 SRC。
+    """
     blob = text or ""
     if not blob.strip():
         return None
     for pat, why in _TARGET_DESTRUCTIVE:
         if pat.search(blob):
+            return why
+    if not objective_allows_flag(objective):
+        why = _business_mutation_reason(blob)
+        if why:
             return why
     return None
 
@@ -278,18 +428,21 @@ def _hosts_from_tokens(tokens: list[str], depth: int = 0) -> set[str]:
         if h:
             hosts.add(h)
             continue
-        # 2) 裸 IPv4(:port)
-        m = _IP_TOKEN_RE.match(tok)
+        raw = tok
+        if "@" in raw and "://" not in raw.split("@", 1)[0]:
+            raw = raw.rsplit("@", 1)[-1]
+        # 2) 裸 IPv4(:port) 或 user@IPv4
+        m = _IP_TOKEN_RE.match(raw)
         if m:
             hosts.add(m.group(1).lower())
             continue
         # 2.5) localhost 别名
-        m = _LOOPBACK_NAME_RE.match(tok)
+        m = _LOOPBACK_NAME_RE.match(raw)
         if m:
             hosts.add(m.group(1).lower())
             continue
         # 3) 裸域名(:port)：整 token 匹配 + 真实 TLD + 非文件扩展名
-        m = _DOMAIN_TOKEN_RE.match(tok)
+        m = _DOMAIN_TOKEN_RE.match(raw)
         if m:
             h = m.group(1).lower()
             tld = h.rsplit(".", 1)[-1]
@@ -485,6 +638,11 @@ def _port_of(s: str) -> int | None:
 
 def _token_hostport(tok: str) -> tuple[str | None, int | None]:
     """从单个 token 取 (host, port)。仅用于平台自我保护端口判定，复用 extract_hosts 的主机白/黑逻辑。"""
+    raw = (tok or "").strip().strip("'\"")
+    if "@" in raw and "://" not in raw.split("@", 1)[0]:
+        # ssh user@host[:port] / sshpass 目标
+        raw = raw.rsplit("@", 1)[-1]
+        tok = raw
     m = _SCHEME_AUTH_RE.match(tok)
     if m:
         auth = m.group(1).split("@")[-1]
@@ -575,6 +733,10 @@ class Guard:
         self.peer_addrs: set[str] = set()
         self.own_addrs: set[str] = set()
         self.primary_port: int | None = None
+        self.workspace_dir: str = ""
+        self.has_intranet_precondition: bool = False
+        self.via_capability_hosts: set[str] = set()
+        self.allowed_secrets: set[str] = set()
 
     def _authorized_hosts(self) -> set[str]:
         out: set[str] = set()
@@ -599,11 +761,16 @@ class Guard:
             if pat.search(cmd):
                 return GuardDecision(False, f"拦截破坏性命令：匹配 {pat.pattern}", "destructive")
 
-        why = target_destructive_reason(cmd)
+        why = target_destructive_reason(cmd, objective=self.objective)
         if why:
+            hint = (
+                "SQLi 只用 SELECT/布尔/报错证明。"
+                if "SQL" in why or "sqlmap" in why.lower() or "DUMPFILE" in why or "OUTFILE" in why
+                else "只证明、不落地。"
+            )
             return GuardDecision(
                 False,
-                f"拦截破坏性操作：{why}。SQLi 只用 SELECT/布尔/报错证明。",
+                f"拦截破坏性操作：{why}。{hint}",
                 "destructive",
             )
 
@@ -678,10 +845,11 @@ class Guard:
                     "self_protection", hosts=[ch],
                 )
             why = attacker_loopback_forbidden(ch, authorized=authorized)
-            if why:
+            if why and not _loopback_is_local_proxy(cmd, ch, port):
                 return GuardDecision(
                     False,
-                    f"拦截：{why}。SSRF 载荷请放进 -d/--data，不要让 Kali 直连 127.0.0.0/8。",
+                    f"拦截：{why}。SSRF 载荷请放进 -d/--data，不要让 Kali 直连 127.0.0.0/8。"
+                    "本地 SOCKS/ssh -D 转发端口除外。",
                     "self_protection", hosts=[ch],
                 )
             if is_attacker_identity(ch, extra=self_hosts):
@@ -695,6 +863,13 @@ class Guard:
                 return GuardDecision(
                     False,
                     f"拦截：{why}。本机网卡和物机网关是守卫，不是目标。",
+                    "self_protection", hosts=[ch],
+                )
+            why = on_local_docker_bridge(ch, allow=own_hosts | {primary})
+            if why:
+                return GuardDecision(
+                    False,
+                    f"拦截：{why}。经已有 SSRF/shell 中转；sshpass 只打题目入口上的监听端口。",
                     "self_protection", hosts=[ch],
                 )
             why = unauthorized_peer_endpoint(
@@ -711,6 +886,20 @@ class Guard:
                     f"拦截越界私网：{why}。只打当前入口；邻题 IP/端口不是横向。",
                     "out_of_scope", hosts=[ch],
                 )
+            try:
+                from ..engine.hop_auth_gate import apply_kali_direct_reason, ssh_auth_block_reason
+                via_why = apply_kali_direct_reason(ch, self)
+                if via_why:
+                    return GuardDecision(False, f"拦截：{via_why}", "out_of_scope", hosts=[ch])
+                ssh_why = ssh_auth_block_reason(
+                    cmd, host=ch, port=port,
+                    workspace_dir=str(getattr(self, "workspace_dir", "") or ""),
+                    allowed_secrets=set(getattr(self, "allowed_secrets", None) or ()),
+                )
+                if ssh_why:
+                    return GuardDecision(False, f"拦截：{ssh_why}", "policy", hosts=[ch])
+            except Exception:
+                pass
             why = unauthorized_private_host(
                 ch, self.scope, primary=primary,
                 peers=getattr(self, "peer_hosts", None),
@@ -720,6 +909,13 @@ class Guard:
                 return GuardDecision(
                     False,
                     f"拦截越界私网：{private_out_of_scope_hint(why)}",
+                    "out_of_scope", hosts=[ch],
+                )
+            why = unauthorized_public_host(ch, self.scope, primary=primary)
+            if why:
+                return GuardDecision(
+                    False,
+                    f"拦截越界公网：{public_out_of_scope_hint(why)}",
                     "out_of_scope", hosts=[ch],
                 )
 

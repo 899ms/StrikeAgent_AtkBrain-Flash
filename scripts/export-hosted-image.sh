@@ -78,7 +78,7 @@ if [ ! -f /opt/atkbrain/backend/atkbrain/memory/evolve.py ]; then
   exit 1
 fi
 if grep -R -E -n --include="*.py" \
-    "Weaver@|submit_fact|commit_step" \
+    "Weaver@|submit_fact|commit_step|[.]2 起|OpenSSH 8[.]9|172[.]16/18/19/20|MaxStartups" \
     /opt/atkbrain/backend/atkbrain >/tmp/atkbrain-pack-hits 2>/dev/null; then
   echo "[!] 镜像源码命中赛题/writeup 痕迹：" >&2
   cat /tmp/atkbrain-pack-hits >&2

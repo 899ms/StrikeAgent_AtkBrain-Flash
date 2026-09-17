@@ -10,6 +10,8 @@ backend/data/**
 atkbrain-claude.env
 **/*.env
 !**/.env.example
+yakit-mitm-ca.pem
+**/*.pem
 
 # python / node
 __pycache__/

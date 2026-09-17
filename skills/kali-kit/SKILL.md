@@ -2,10 +2,10 @@
 name: kali-kit
 description: >
   This machine's Kali pentest tools: absolute binary paths, pinned wordlists,
-  copy-paste commands (nmap, ffuf, hydra, sqlmap, JSFinder, bypass-403, nxc,
-  impacket, binutils). Call only after you already decided you need that
-  scanner or wordlist for an unknown surface. Do not call to start a CTF
-  puzzle — encoding, crypto, protocol, or a hinted path is local python3 /
+  copy-paste commands (nmap, ffuf, hydra, ssh, sshpass, socat, sqlmap, JSFinder,
+  bypass-403, nxc, impacket, binutils). Call only after you already decided you
+  need that scanner or wordlist for an unknown surface. Do not call to start a
+  CTF puzzle — encoding, crypto, protocol, or a hinted path is local python3 /
   openssl / http_request, not this skill. Never which / ls wordlists.
   Shared by CTF and red team. Not recon policy — that is recon-fanout /
   recon-spiral.
@@ -20,7 +20,7 @@ description: >
 - 开局策略（CTF 先看入口 vs 红队三圈）见 skill `recon-fanout` / `recon-spiral`。本 skill 只给路径和可复制命令。
 
 # Web 能力（默认工具 + 一条可复制命令）
-- 端口扫描：`timeout 60 /usr/bin/nmap -sV -T4 -Pn --top-ports 100 --open <host>`（`run_cmd` 填 `timeout=60`）。加宽 `--top-ports 1000`（timeout=90）；确认活体后再 `-p-`。备选 `/usr/bin/masscan` 不默认。
+- 端口扫描：CTF 可用 `timeout 60 /usr/bin/nmap -sV -T4 -Pn --top-ports 100 --open <host>`。红队/SRC **禁止 nmap/masscan**（原始套接字会漏真实 IP），改用 `curl` / `http_request` / `ffuf`。
 - Web 指纹：`/usr/bin/whatweb -a 3 <url>`。
 - WAF：`/usr/bin/wafw00f <url>`。
 - nuclei：`/usr/bin/nuclei -u <url> -silent -nc`（引擎已装；模板走 nuclei 自己的目录，禁止 which）。
@@ -46,9 +46,14 @@ description: >
 - 其它 Web 相关：`/usr/bin/dig`、`/usr/bin/amass`、`/usr/bin/theHarvester`、`/usr/bin/cewl`、`/usr/bin/searchsploit`、`/usr/bin/proxychains4`、`/usr/bin/msfconsole`。
 
 # 横向 / 服务（何时用 + 一条模板）
+- `/usr/bin/ssh`：已扩容内网的 SSH。本机有客户端。禁止 Kali 直连攻击机 docker 网桥——那不是题内网。
+  立足点上常常没有能用的 ssh 客户端：不要用 curl 的 sftp/libssh2 去讲 SSH。
+  正路：立足点上把 22 或 SOCKS 转到 Kali（webshell 反连 / `socat TCP-LISTEN` / `ssh -D`），再用本机 ssh 打已 `report_pivot_capability` 的主机。
+  `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand='nc -x 127.0.0.1:<socks> %h %p' user@<in-scope-host>`
+- `/usr/bin/sshpass`：题面个位数口令。`sshpass -p '<pass>' ssh ...`。CTF 失败不要升字典。
 - `/usr/bin/masscan`：大网段快速探活，不替代 nmap 服务识别。`masscan <cidr> -p 22,80,443,445 --rate 1000`
-- `/usr/bin/nc`：短连 banner / 管道。`nc -nv <host> <port>`
-- `/usr/bin/socat`：转发与持久管道。`socat TCP-LISTEN:<lport>,fork TCP:<host>:<port>`
+- `/usr/bin/nc`：短连 banner / 管道 / SOCKS 客户端。`nc -nv <host> <port>`；`nc -x 127.0.0.1:<socks> <host> 22`
+- `/usr/bin/socat`：本地监听与转发。Kali 侧收反连：`socat TCP-LISTEN:<lport>,reuseaddr,fork -`；已能路由时：`socat TCP-LISTEN:<lport>,reuseaddr,fork TCP:<in-scope-host>:22`
 - `/usr/bin/smbclient`：SMB 列共享。`smbclient -L //<host> -N`
 - `/usr/bin/enum4linux`：SMB/RPC 枚举。`enum4linux -a <host>`
 - `/usr/bin/smbmap`：SMB 权限图。`smbmap -H <host>`

@@ -2,13 +2,16 @@
 
 局面（situation）由图编译，从者必须守：未消费凭证、未关输入面、已验证洞、跳板/邻题禁令。
 御主 next_plan / must_intents 是参考假说：排到前沿最前，不独占认领，也不因未点名 Intent 判违约。
-违背局面（入口枚举、离开已验证洞/跳板）才收紧禁令。
+局面点名的那一条 hop_auth Intent 不是参考假说，本轮必须经已有能力去走。
+违背局面（入口枚举、离开已验证洞/跳板、不走过门局面）才收紧禁令。
 """
 from __future__ import annotations
 
 import inspect
 import re
 from dataclasses import dataclass, field, replace
+
+from .hop_auth_gate import SITUATION_HOP_AUTH
 
 
 # 入口枚举/定性。web_inject 是打洞，不进这里，否则收紧绑定会把测→证禁掉。
@@ -78,6 +81,12 @@ SITUATION_SECRET = (
     "必须在已验证跳板到达的同一服务上做有/无密钥差分（查询参数、请求头、Cookie、body）。"
     "浅层路径 404 只否证这一条路径，不关闭密钥、也不等于无挂载点。"
     "禁止因为猜测路径 404 就转去旁路网段或其它容器端口。"
+)
+SITUATION_PROXY_AUTH = (
+    "【局面·跳板转发认证】经已验证开放代理/SSRF 打内层登录时，"
+    "必须把方法与请求体送到内层认证处理接口（表单 action），不能停在外壳或站点根路径。"
+    "未确认内层收到请求体之前，禁止把「仍是登录页」写成口令无效，"
+    "禁止因此换用户、扫目录、或回到已交过旗的入口注入/读链。"
 )
 SITUATION_PLACEHOLDER = (
     "【局面·占位输出】校验通过但 stdout 固定占位（点号/denied/complete）不是答案，"
@@ -199,6 +208,11 @@ _LEAVE_VERIFIED_RE = re.compile(
     r"再枚举入口|目录枚举|content_enum",
     re.I,
 )
+_PROXY_AUTH_ABANDON_RE = re.compile(
+    r"(?:口令|密码|登录).{0,16}(?:无效|失败|错误).{0,48}"
+    r"(?:换用户|扫目录|目录枚举|注入|sqli|outfile)",
+    re.I,
+)
 _WRAP_SAME_FORM_RE = re.compile(
     r"给同一形态加包装|同族变体|同形态再试|编码变体",
     re.I,
@@ -224,7 +238,8 @@ POSTEX_TACTICS: tuple[str, ...] = (
 )
 # 图上若已有这些 Intent，must 至少留一格（与 hop_auth 并行，不是备选叙事）。
 _POSTEX_RESERVE: tuple[str, ...] = (
-    "access_control", "file_read_chain", "ssrf_as_gateway", "svc_auth_bruteforce",
+    "ssrf_as_gateway", "hop_auth", "access_control", "file_read_chain",
+    "svc_auth_bruteforce",
 )
 _ORACLE_QUALITY = frozenset({"flag", "finding", "capability_edge"})
 _DENY_ALIASES: dict[str, tuple[str, ...]] = {
@@ -263,6 +278,10 @@ def situation_protected_intent_ids(
         tac = intent_tactic(by_id.get(str(iid) or "") or {})
         if tac in _SITUATION_PROTECT_TACTICS:
             out.append(str(iid))
+    for iid in binding.situation_intent_ids or []:
+        s = str(iid or "")
+        if s:
+            out.append(s)
     return frozenset(out)
 
 
@@ -270,7 +289,7 @@ def _hypo_is_canned_keep(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
-    for c in (ORACLE_KEEP, CLOSEOUT_OVERRIDE, GADGET_KEEP, SITUATION_PLACEHOLDER, SITUATION_EXEC):
+    for c in (ORACLE_KEEP, CLOSEOUT_OVERRIDE, GADGET_KEEP, SITUATION_PLACEHOLDER, SITUATION_EXEC, SITUATION_PROXY_AUTH, SITUATION_HOP_AUTH):
         if t == c or t.startswith(c):
             return True
     return False
@@ -328,6 +347,7 @@ class AdvisorBinding:
     misses: int = 0
     tightened: bool = False
     cycle_hunt: bool = False
+    situation_intent_ids: list[str] = field(default_factory=list)
 
     @property
     def fingerprint(self) -> str:
@@ -406,6 +426,153 @@ def _pick_must(
     return picked[:limit]
 
 
+def preferred_hop_auth_id(
+    open_intents: list[dict] | None,
+    graph: dict | None = None,
+    workspace_dir: str = "",
+) -> str:
+    """活身份面优先于线索/空号；已落地或已未授权收成的主机让位。"""
+    hops = [
+        it for it in (open_intents or [])
+        if it.get("id")
+        and intent_tactic(it) == "hop_auth"
+        and str(it.get("status") or "open") not in ("deferred", "disproved")
+    ]
+    if not hops:
+        return ""
+    from .hop_auth_gate import hop_delivered
+    from .intranet_reach import (
+        all_service_hosts,
+        clue_only_hosts,
+        cred_named_hosts,
+        foothold_hosts,
+        identity_service_hosts,
+        intent_private_hosts,
+        is_broadcast_or_net,
+        live_surface_hosts,
+        unauth_loot_hosts,
+        verified_hop_auth_hosts,
+    )
+
+    live = live_surface_hosts(graph)
+    ident = identity_service_hosts(graph)
+    svc = all_service_hosts(graph)
+    cred = cred_named_hosts(graph)
+    owned = foothold_hosts(graph)
+    loot = unauth_loot_hosts(graph)
+    clue = clue_only_hosts(graph)
+    done = verified_hop_auth_hosts(graph, open_intents)
+    other_ident = (live | ident | cred) - owned - done
+    has_live_ident = bool(live | ident)
+
+    def _score(it: dict) -> tuple[int, int, str]:
+        hosts = intent_private_hosts(it)
+        s = 0
+        if not hosts:
+            s = -20
+        for h in hosts:
+            if is_broadcast_or_net(h):
+                s -= 100
+                continue
+            if h in live:
+                s += 100
+            if h in ident:
+                s += 80
+            elif h in svc:
+                s += 40
+            if h in cred:
+                s += 30
+            if h in owned:
+                s -= 80
+            if h in done:
+                s -= 50
+            if (h in clue or h not in live) and has_live_ident and h not in ident and h not in cred:
+                s -= 40
+            if h in loot and (other_ident - {h}):
+                s -= 70
+        delivered = 1 if any(hop_delivered(workspace_dir, h) for h in hosts) else 0
+        return (s, -delivered, str(it.get("id") or ""))
+
+    hops.sort(key=_score, reverse=True)
+    return str(hops[0].get("id") or "")
+
+
+def hop_auth_switch_plan(
+    hops: list[dict] | None,
+    preferred_id: str,
+) -> dict:
+    """认领 preferred；把错误的 active 退回 open。"""
+    preferred_id = str(preferred_id or "")
+    active_ids = [
+        str(it.get("id") or "")
+        for it in (hops or [])
+        if str(it.get("status") or "") == "active" and it.get("id")
+    ]
+    if not preferred_id:
+        return {"claim": "", "reopen": []}
+    if preferred_id in active_ids:
+        return {"claim": "", "reopen": [i for i in active_ids if i != preferred_id]}
+    return {"claim": preferred_id, "reopen": active_ids}
+
+
+def hop_auth_situation_intent_id(
+    open_intents: list[dict] | None,
+    graph: dict | None = None,
+    *,
+    remaining_goals: bool = False,
+    has_foothold: bool = False,
+    has_live_gadget: bool = False,
+    workspace_dir: str = "",
+) -> str:
+    if not remaining_goals:
+        return ""
+    from .intranet_reach import has_verified_precondition
+    if not (has_foothold or has_live_gadget or has_verified_precondition(graph)):
+        return ""
+    return preferred_hop_auth_id(open_intents, graph=graph, workspace_dir=workspace_dir)
+
+
+def apply_preferred_hop_binding(
+    binding: AdvisorBinding | None,
+    open_intents: list[dict] | None,
+    graph: dict | None = None,
+    *,
+    remaining_goals: bool = False,
+    has_foothold: bool = False,
+    has_live_gadget: bool = False,
+    workspace_dir: str = "",
+) -> AdvisorBinding | None:
+    if binding is None:
+        return None
+    hop_id = hop_auth_situation_intent_id(
+        open_intents, graph,
+        remaining_goals=remaining_goals,
+        has_foothold=has_foothold,
+        has_live_gadget=has_live_gadget,
+        workspace_dir=workspace_dir,
+    )
+    if not hop_id:
+        return binding
+    sit = (binding.situation or "").strip()
+    if SITUATION_HOP_AUTH not in sit:
+        sit = (sit + "\n" + SITUATION_HOP_AUTH).strip() if sit else SITUATION_HOP_AUTH
+    by_id = {
+        str(it.get("id") or ""): it
+        for it in (open_intents or [])
+        if it.get("id")
+    }
+    must = [i for i in list(binding.must_intents or []) if i != hop_id]
+    must = [i for i in must if intent_tactic(by_id.get(i) or {}) != "hop_auth"]
+    must = [hop_id] + must
+    must = must[:3]
+    return replace(
+        binding,
+        situation=sit,
+        must_intents=must,
+        situation_intent_ids=[hop_id],
+    )
+
+
 def _reserve_open_tactics(
     picked: list[str],
     open_intents: list[dict] | None,
@@ -414,6 +581,7 @@ def _reserve_open_tactics(
     deny: list[str],
     limit: int = 3,
     exclusive: bool = False,
+    graph: dict | None = None,
 ) -> list[str]:
     """must 已满时仍给正交面留一格。
 
@@ -461,6 +629,34 @@ def _reserve_open_tactics(
             seen_tac.add(tac)
         if len(out) >= limit:
             break
+    if "hop_auth" in set(reserve) and "hop_auth" not in deny_set:
+        preferred = preferred_hop_auth_id(list(by_id.values()), graph=graph)
+        current = ""
+        for iid in out:
+            if iid in by_id and intent_tactic(by_id[iid]) == "hop_auth":
+                current = iid
+                break
+        hop_id = preferred or current
+        if hop_id and hop_id != current:
+            rest_ids = [
+                i for i in out
+                if not (i in by_id and intent_tactic(by_id[i]) == "hop_auth")
+            ]
+            out = [hop_id] + rest_ids
+            trimmed: list[str] = []
+            seen_tac = set()
+            for iid in out:
+                if iid not in by_id or iid in trimmed:
+                    continue
+                tac = intent_tactic(by_id[iid])
+                if tac in deny_set or (tac and tac in seen_tac):
+                    continue
+                trimmed.append(iid)
+                if tac:
+                    seen_tac.add(tac)
+                if len(trimmed) >= limit:
+                    break
+            out = trimmed[:limit]
     return out[:limit]
 
 
@@ -903,12 +1099,12 @@ def binding_reserve_tactics(
                 "finding_rce_close", "weaponize", "impact_escalate",
             )
         if cats & _SSRF_CATS:
-            return ("ssrf_as_gateway", "secret_mount", "weaponize")
+            return ("ssrf_as_gateway", "hop_auth", "secret_mount")
         if cats & _AUTH_CATS:
             return ("weaponize", "finding_authz_expand")
         return _CHAIN_CLOSE_RESERVE
     if has_live_gadget and not has_foothold:
-        return ("ssrf_as_gateway", "upload_bypass")
+        return ("ssrf_as_gateway", "hop_auth", "upload_bypass")
     return ()
 
 
@@ -999,6 +1195,7 @@ def ensure_postex_orthogonal(
     has_verified_asset: bool = False,
     verified_categories=None,
     has_live_gadget: bool = False,
+    graph: dict | None = None,
 ) -> AdvisorBinding | None:
     """已钉住的绑定也按本局图补一格下一跳，不等顾问再开口、不抄历史图。"""
     reserve = binding_reserve_tactics(
@@ -1046,8 +1243,15 @@ def ensure_postex_orthogonal(
         and prefer == list(binding.prefer_tactics or [])
         and deny == list(binding.deny_tactics or [])
     ):
-        return binding
-    return replace(binding, must_intents=must, prefer_tactics=prefer, deny_tactics=deny[:12])
+        updated = binding
+    else:
+        updated = replace(binding, must_intents=must, prefer_tactics=prefer, deny_tactics=deny[:12])
+    return apply_preferred_hop_binding(
+        updated, open_intents, graph,
+        remaining_goals=remaining_goals,
+        has_foothold=has_foothold,
+        has_live_gadget=has_live_gadget,
+    )
 
 
 def _exploit_verified_cats(verified_categories) -> set[str]:
@@ -1089,6 +1293,7 @@ def compile_binding(
     extra_subagents: list[str] | tuple[str, ...] | None = None,
     has_http_service: bool = False,
     invert_ops: bool = False,
+    graph: dict | None = None,
 ) -> AdvisorBinding:
     """把监督 JSON + 图状态编成绑定。LLM 空字段由规则补全；图约束覆盖散文。"""
     block_oracle_close = oracle_blocks_closeout(
@@ -1323,6 +1528,10 @@ def compile_binding(
         situation_bits.append(SITUATION_PLACEHOLDER)
         if _DECOY_FALSE_CLOSE_RE.search(hypo) or _hypo_is_canned_keep(hypo):
             hypo = ""
+    if not cycle_hunt and (has_live_gadget or postex):
+        situation_bits.append(SITUATION_PROXY_AUTH)
+        if _PROXY_AUTH_ABANDON_RE.search(hypo):
+            hypo = ""
     if chain_close and (_norm_cats(verified_categories) & _EXEC_CATS):
         situation_bits.append(SITUATION_EXEC)
     if chain_close and secret_open:
@@ -1362,7 +1571,7 @@ def compile_binding(
     except Exception:
         pass
     nxt = hypo
-    return AdvisorBinding(
+    binding = AdvisorBinding(
         diagnosis=str(getattr(plan, "diagnosis", None) or "").strip(),
         next_plan=nxt,
         situation="\n".join(x for x in situation_bits if x),
@@ -1373,6 +1582,12 @@ def compile_binding(
         subagents=subs[:4],
         stall=stall,
         cycle_hunt=bool(cycle_hunt),
+    )
+    return apply_preferred_hop_binding(
+        binding, open_intents, graph,
+        remaining_goals=remaining_goals,
+        has_foothold=has_foothold,
+        has_live_gadget=has_live_gadget,
     )
 
 
@@ -1478,6 +1693,8 @@ def binding_compliance(
     )
     if closeout_locked and left_closeout:
         return "ignored"
+    if SITUATION_PROXY_AUTH in sit and _PROXY_AUTH_ABANDON_RE.search(blob):
+        return "ignored"
     if assigned_all_denied or hit_ban or hit_deny or reflux:
         return "ignored"
     return "executed"
@@ -1535,6 +1752,7 @@ def pick_bound_assigned(
     reserve: tuple[str, ...] | None = None,
     exclusive: bool = False,
     limit: int = 3,
+    graph: dict | None = None,
 ) -> list[dict]:
     """want_ids（建议 Intent）排在最前；lock=False 时用前沿 extras 补满。
 
@@ -1581,6 +1799,7 @@ def pick_bound_assigned(
             deny=list(deny_set),
             limit=limit,
             exclusive=exclusive,
+            graph=graph,
         )
         assigned = []
         seen_tac = set()
@@ -1588,6 +1807,27 @@ def pick_bound_assigned(
         for iid in ids:
             _add(by_id.get(iid))
 
+    def _lead_hop() -> None:
+        nonlocal assigned, seen_tac, seen_id
+        pref = preferred_hop_auth_id(list(open_intents or []), graph=graph)
+        if not (pref and pref in by_id):
+            return
+        if str((by_id[pref] or {}).get("status") or "") == "deferred":
+            return
+        lead = by_id[pref]
+        rest = [it for it in assigned if str(it.get("id") or "") != pref]
+        assigned = []
+        seen_tac = set()
+        seen_id = set()
+        _add(lead)
+        for it in rest:
+            if intent_tactic(it) == "hop_auth":
+                continue
+            _add(it)
+            if len(assigned) >= limit:
+                break
+
+    _lead_hop()
     if lock and assigned:
         return assigned
 
@@ -1599,6 +1839,7 @@ def pick_bound_assigned(
         _add(it)
         if len(assigned) >= limit:
             break
+    _lead_hop()
     return assigned
 
 
@@ -1609,7 +1850,8 @@ def format_binding_block(binding: AdvisorBinding | None) -> str:
     lines = [
         "【局面·必须守住】",
         "循环按攻击图编译本段。必须消费已有凭证、不得离开未关输入面、不得回流目录枚举/邻题/本机内网。",
-        "同一身份域：过门与未授权可达并行，不是互为前置。",
+        "同一身份域：过门与未授权可达并行，不是互为前置。"
+        "经跳板打内层登录时，未确认认证接口收到请求体，不算口令否证。",
     ]
     if (binding.situation or "").strip():
         lines.append(binding.situation.strip())
@@ -1630,7 +1872,10 @@ def format_binding_block(binding: AdvisorBinding | None) -> str:
     if set(binding.prefer_tactics or ()) & set(_HUNT_LIVE_TACTICS) or "web-exploit" in set(binding.subagents or ()):
         lines.append(HUNT_TASK_NOTE)
     lines.append("【参考假说·可打可丢】")
-    lines.append("排到前沿最前，不是只许打这些；可另选正交假说，但不能违背局面。")
+    lines.append(
+        "排到前沿最前，不是只许打这些；可另选正交假说，但不能违背局面。"
+        "局面点名的那一条 hop_auth 不是参考假说。"
+    )
     if binding.must_intents:
         lines.append("建议 Intent：" + "、".join(f"`{x}`" for x in binding.must_intents))
     if binding.prefer_tactics:

@@ -689,6 +689,12 @@ async def _revive_ephemeral_entry(
     except Exception:
         own = set()
     _apply_bound_project(agent, project, scope, peers=peers, peer_addrs=addrs, own_addrs=own)
+    try:
+        refresh = getattr(agent, "refresh_brief", None)
+        if callable(refresh):
+            refresh(project)
+    except Exception:
+        pass
     new_host = str(target or "").split(":")[0]
     reused = bool((info or {}).get("reused"))
     if reused and new_host == host:
@@ -1263,7 +1269,7 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                 run_id=rid,
             )
         try:
-            refreshed = await gstore.refresh_derived_intents(project_id, run_id=rid)
+            refreshed = await gstore.refresh_derived_intents(project_id, run_id=rid, force=True)
             if refreshed.get("opened") or refreshed.get("stale_deferred"):
                 await emit(
                     project_id, "log",
@@ -1705,6 +1711,7 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                     project_id=project_id, rid=rid, is_benchmark=is_benchmark,
                 )
                 just_rebound = True
+                brief = str(getattr(agent, "brief", None) or brief)
                 entry_rebind_attempts += 1
                 nh = str(target or "").split(":")[0]
                 if nh and await _tcp_alive(nh, _entry_port(project)):
@@ -1768,6 +1775,18 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
             except Exception:
                 pass
             graph = await gstore.get_graph(project_id)
+            try:
+                from ..agents.prompts import build_brief as _rebuild_brief
+                brief = _rebuild_brief(project, graph=graph)
+                agent.brief = brief
+            except Exception:
+                pass
+            try:
+                from ..engine.intranet_reach import apply_gate_to_guard
+                apply_gate_to_guard(agent.guard, graph, brief=brief)
+                agent.guard.workspace_dir = getattr(agent, "workspace_dir", "") or agent.ctx.workspace_dir
+            except Exception:
+                pass
             try:
                 await _refresh_entry_identity(
                     project=project, graph=graph, brief=brief, supervisor=supervisor,
@@ -1862,11 +1881,18 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
             elif needs_channel_oracle(graph):
                 prefer = set(prefer or ()) | {"channel_oracle", "input_abuse"}
             gadget = live_gadget_tactics(graph)
-            if gadget and not src_cycle:
-                prefer = set(prefer or ()) | set(gadget)
+            _src_ssrf_tacs = {"ssrf_as_gateway", "ssrf_local_svc"}
+            if gadget:
+                if src_cycle:
+                    prefer = set(prefer or ()) | (set(gadget) & _src_ssrf_tacs)
+                else:
+                    prefer = set(prefer or ()) | set(gadget)
             wz = weaponize_prefer_tactics(graph)
-            if wz and not src_cycle:
-                prefer = set(prefer or ()) | set(wz)
+            if wz:
+                if src_cycle:
+                    prefer = set(prefer or ()) | (set(wz) & _src_ssrf_tacs)
+                else:
+                    prefer = set(prefer or ()) | set(wz)
             defer_tacs: set[str] = set()
             sidetrack_enum = enum_sidetrack_when_weaponizable(graph)
             if sidetrack_enum:
@@ -1945,7 +1971,7 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                     flag_submission_stats,
                     intent_claims_obtained_secret,
                 )
-                c_flags, w_flags = await flag_submission_stats(project_id)
+                c_flags, w_flags = await flag_submission_stats(project_id, project=project)
                 claim_unverified = claimed_secret_disproved(
                     plan=f"{supervisor.last_plan_text or ''} {supervisor.last_diagnosis or ''}",
                     graph=graph,
@@ -1973,15 +1999,25 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
             )
             from ..objective import objective_is_src as _obj_is_src
             src_cycle = _obj_is_src(objective)
-            reserve = () if src_cycle else binding_reserve_tactics(
-                has_foothold=bool(bind_flags.get("has_foothold")),
-                remaining_goals=bool(bind_flags.get("remaining_goals")),
-                has_verified_asset=bool(bind_flags.get("has_verified_asset")),
-                verified_categories=bind_flags.get("verified_categories"),
-                has_live_gadget=bool(bind_flags.get("has_live_gadget")),
-            )
+            if src_cycle:
+                reserve = tuple(sorted(
+                    (live_gadget_tactics(graph) | weaponize_prefer_tactics(graph))
+                    & {"ssrf_as_gateway", "ssrf_local_svc"}
+                ))
+            else:
+                reserve = binding_reserve_tactics(
+                    has_foothold=bool(bind_flags.get("has_foothold")),
+                    remaining_goals=bool(bind_flags.get("remaining_goals")),
+                    has_verified_asset=bool(bind_flags.get("has_verified_asset")),
+                    verified_categories=bind_flags.get("verified_categories"),
+                    has_live_gadget=bool(bind_flags.get("has_live_gadget")),
+                )
             try:
                 await gstore.reopen_live_hop_auth(project_id, run_id=rid)
+                try:
+                    await gstore.reopen_false_disproved_hop_auth(project_id, run_id=rid)
+                except Exception:
+                    pass
                 if reserve:
                     await gstore.reopen_advisor_deferred_tactics(
                         project_id, reserve, run_id=rid,
@@ -2010,6 +2046,7 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                     has_verified_asset=bool(bind_flags.get("has_verified_asset")),
                     verified_categories=bind_flags.get("verified_categories"),
                     has_live_gadget=bool(bind_flags.get("has_live_gadget")),
+                    graph=graph,
                 )
             if updated is not None and updated is not bind:
                 old_block = format_binding_block(bind)
@@ -2027,18 +2064,13 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                     b for b in (supervisor.banned_strategies or []) if b not in reserve
                 ]
                 exclude -= set(reserve)
-            if human_steers:
-                want_ids = []
-                try:
-                    agent.ctx.bound_must_intents = frozenset()
-                except Exception:
-                    pass
-            else:
-                want_ids = supervisor.drain_assigned_intents()
-                try:
-                    agent.ctx.bound_must_intents = situation_protected_intent_ids(bind, oi)
-                except Exception:
-                    agent.ctx.bound_must_intents = frozenset()
+            # 人工强制只覆盖指令文本，仍认领局面保底 Intent。
+            # 否则连续 steer 会让 hop_auth 永远不被 claimed，attempt_count 恒为 0。
+            want_ids = supervisor.drain_assigned_intents()
+            try:
+                agent.ctx.bound_must_intents = situation_protected_intent_ids(bind, oi)
+            except Exception:
+                agent.ctx.bound_must_intents = frozenset()
             bind_prefer = set((bind.prefer_tactics if bind else None) or ()) | set(lesson_do or ())
             bind_deny = set((bind.deny_tactics if bind else None) or ())
             bind_deny -= set(reserve)
@@ -2046,10 +2078,7 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                 bind_deny |= set(avoid_tacs or ())
                 exclude |= set(avoid_tacs or ())
             extra: list[dict] = []
-            if human_steers:
-                assigned = []
-                want_ids = []
-            elif not claim_unverified:
+            if not claim_unverified:
                 extra = await gstore.list_frontier_intents(
                     project_id, limit=8 if peer_entries else 3,
                     exclude_strategies=exclude,
@@ -2057,18 +2086,18 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                 )
                 if peer_entries:
                     extra = [i for i in extra if not _intent_cites_peer(i, peer_entries)]
-            if not human_steers:
-                assigned = pick_bound_assigned(
-                    open_intents=oi,
-                    want_ids=want_ids,
-                    extras=extra,
-                    prefer=set(),
-                    deny=bind_deny,
-                    lock=False,
-                    reserve=reserve,
-                    exclusive=bool(reserve) and not bind_flags.get("has_foothold")
-                    and not bind_flags.get("has_verified_asset"),
-                )
+            assigned = pick_bound_assigned(
+                open_intents=oi,
+                want_ids=want_ids,
+                extras=extra,
+                prefer=set(),
+                deny=bind_deny,
+                lock=False,
+                reserve=reserve,
+                exclusive=bool(reserve) and not bind_flags.get("has_foothold")
+                and not bind_flags.get("has_verified_asset"),
+                graph=graph,
+            )
             if assigned:
                 await gstore.claim_intents(project_id, [i["id"] for i in assigned if i.get("id")], run_id=rid)
                 await emit(
@@ -2079,6 +2108,27 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                      )},
                     run_id=rid,
                 )
+            try:
+                from .advisor_bind import intent_tactic as _itac
+                from .intranet_reach import intent_private_hosts
+                agent.ctx.hop_auth_situation = False
+                agent.ctx.hop_auth_host = ""
+                agent.ctx.hop_auth_intent_id = ""
+                sit_ids = set((getattr(bind, "situation_intent_ids", None) or ()) if bind else ())
+                for i in assigned or []:
+                    if _itac(i) != "hop_auth":
+                        continue
+                    hs = intent_private_hosts(i)
+                    agent.ctx.hop_auth_intent_id = str(i.get("id") or "")
+                    agent.ctx.hop_auth_host = hs[0] if hs else ""
+                    agent.ctx.hop_auth_situation = (
+                        bool(sit_ids) and str(i.get("id") or "") in sit_ids
+                    ) or bool(sit_ids)
+                    break
+                if sit_ids and not agent.ctx.hop_auth_situation:
+                    agent.ctx.hop_auth_situation = True
+            except Exception:
+                pass
             instruction = _build_instruction(
                 turn, target, graph, open_intents, steering, objective,
                 assigned=assigned, brief=brief, postex_phase=agent.ctx.postex_phase,
@@ -2099,7 +2149,8 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
             hang_sec = 0.0
             try:
                 # 单回合墙钟：0 表示不限；评测预算开启时仍用剩余预算卡住。
-                # 不中途打断从者；本轮先打完（含工人），打完再问御主。
+                # 不中途打断从者。从者返回即中止工人并问御主；工人不得拖死回合。
+                # CTF / SRC / 红队同一条（见 session.run_turn + engine.turn_close）。
                 turn_timeout = float(getattr(settings, "turn_max_seconds", 0) or 0)
                 from .advisor_bind import intent_tactic
                 from .advisor_schedule import should_yield_turn_to_advisor
@@ -2141,7 +2192,9 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                     agent, instruction, turn_timeout, hang_sec=hang_sec,
                     project_id=project_id,
                 )
-                cut_for_human = bool(result.get("human_interrupt")) or manager.take_human_interrupt(project_id)
+                # 必须先 take：or 短路会留下 human_interrupt，下一轮 2s 轮询再被切断，空转打断循环。
+                took_human = manager.take_human_interrupt(project_id)
+                cut_for_human = bool(result.get("human_interrupt")) or took_human
                 if cut_for_human:
                     empty_streak = 0
                     hang = 0
@@ -2725,8 +2778,8 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                 await _finish_run(rid, "stopped", goal, turn, summary or "后端重启，将自动续跑")
                 await update_status(project_id, "running")
                 await emit(
-                    project_id, "status",
-                    {"status": "stopped", "turns": turn, "reason": "backend_restart"},
+                    project_id, "log",
+                    {"level": "info", "message": "后端重启，本猎将自动续跑（不是人工停止）"},
                     run_id=rid,
                 )
             elif nxt == "idle":
@@ -2739,6 +2792,8 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                 await emit(project_id, "status", {"status": "stopped", "turns": turn}, run_id=rid)
             else:
                 await _finish_run(rid, "stopped", goal, turn, summary or "已被停止")
+                if not getattr(manager, "shutting_down", False):
+                    await update_status(project_id, "idle")
                 await emit(project_id, "status", {"status": "stopped", "turns": turn}, run_id=rid)
             await _record_memory(project, project_id, goal, turn, summary, rid, applied_lesson_ids)
     except Exception as e:
@@ -2789,7 +2844,20 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                 await agent.close()
             except Exception:
                 pass
+        try:
+            from ..agents.pi_runtime import kill_live_for_project
+            kill_live_for_project(project_id)
+        except Exception:
+            pass
         handle.status = "done"
+        if not getattr(manager, "shutting_down", False):
+            try:
+                live = manager.is_running(project_id) or manager.is_queued(project_id)
+                row = await get_project(project_id)
+                if (not live) and row and row.get("status") == "running":
+                    await update_status(project_id, "idle")
+            except Exception:
+                pass
         parent_id = (project or {}).get("parent_id") if is_benchmark else None
         if parent_id:
             asyncio.create_task(bmk.autopilot_tick(parent_id))

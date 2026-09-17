@@ -103,6 +103,11 @@ async def lifespan(app: FastAPI):
     if (settings.api_token or "").strip():
         print("[startup] API Token 鉴权已启用（ATKBRAIN_API_TOKEN 非空；不打印令牌）")
     try:
+        from .agents.brief_creds import CREDS_MODE
+        print(f"[startup] creds_mode={CREDS_MODE}（只摘录已出现账密，不合成厂商默认口令）")
+    except Exception as e:
+        print(f"[startup] creds_mode 打印失败：{e}")
+    try:
         from .hosted import ensure_hosted_benchmark
         await ensure_hosted_benchmark()
     except Exception as e:
@@ -130,6 +135,11 @@ async def lifespan(app: FastAPI):
         _proxy_pool.ensure_loop()
     except Exception as e:
         print(f"[startup] 代理池后台任务失败：{e}")
+    try:
+        from .proxy.yakit import yakit as _yakit
+        await _yakit.startup()
+    except Exception as e:
+        print(f"[startup] Yakit 桥启动失败：{e}")
     yield
     autopilot_task.cancel()
     try:

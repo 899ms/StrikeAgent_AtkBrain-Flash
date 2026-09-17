@@ -43,7 +43,7 @@ function loadEmbedded() {
 }
 
 export async function apply(ctx) {
-  const base = (process.env.ATKBRAIN_TOOLS_BASE || "http://127.0.0.1:5003").replace(/\/$/, "");
+  const base = (process.env.ATKBRAIN_TOOLS_BASE || "http://127.0.0.1:2333").replace(/\/$/, "");
   const pid = process.env.ATKBRAIN_PROJECT_ID;
   if (!pid) {
     throw new Error("ATKBRAIN_PROJECT_ID is required");
@@ -64,9 +64,12 @@ export async function apply(ctx) {
         render: (_args, value) => [{ type: "text", text: String(value ?? "") }],
       },
       async execute(args, exec) {
+        const headers = { "content-type": "application/json" };
+        const role = (process.env.ATKBRAIN_PI_ROLE || "").trim();
+        if (role) headers["x-atkbrain-role"] = role;
         const res = await fetch(`${base}/api/projects/${pid}/agent-tools/${encodeURIComponent(rawName)}`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers,
           body: JSON.stringify(args || {}),
           signal: exec && exec.signal,
         });

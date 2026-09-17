@@ -19,9 +19,12 @@ from ..scope import (
     local_self_hosts,
     unauthorized_peer_endpoint,
     unauthorized_private_host,
+    unauthorized_public_host,
+    on_local_docker_bridge,
 )
 
 NO_DIRECT_MSG = "红队/SRC 出口代理池暂无存活节点，拒绝直连以免暴露真实 IP"
+_HTTP_TIMEOUT = httpx.Timeout(12.0, connect=5.0)
 
 
 @dataclass
@@ -62,7 +65,11 @@ class AgentContext:
     _ssrf_gw_hosts: set = field(default_factory=set)
     _ssrf_gw_ts: float = 0.0
     bound_must_intents: frozenset = field(default_factory=frozenset)
+    hop_auth_situation: bool = False
+    hop_auth_host: str = ""
+    hop_auth_intent_id: str = ""
     wake_finding_review: object | None = None
+    _gate_mono: float = 0.0
 
     def host_of(self, url: str) -> str:
         try:
@@ -112,6 +119,17 @@ class AgentContext:
         why = attacker_lan_forbidden(host, self_hosts=self_hosts)
         if why:
             return f"越界：{why}。本机网卡和物机网关是守卫，不是目标。"
+        why = on_local_docker_bridge(
+            host,
+            allow={primary} | {
+                str(a).split(":")[0] for a in (getattr(self, "own_addrs", None) or set()) if a
+            },
+        )
+        if why:
+            return (
+                f"越界：{why}。经已有 SSRF/shell 中转；"
+                "sshpass 只打题目入口上的监听端口。"
+            )
         why = unauthorized_peer_endpoint(
             host, port,
             primary=primary,
@@ -122,6 +140,13 @@ class AgentContext:
         )
         if why:
             return f"越界：{why}。只打当前入口；邻题 IP/端口不是横向。"
+        try:
+            from ..engine.hop_auth_gate import apply_kali_direct_reason
+            via_why = apply_kali_direct_reason(host, self.guard)
+            if via_why:
+                return via_why
+        except Exception:
+            pass
         why = unauthorized_private_host(
             host, self.scope, primary=primary, peers=getattr(self, "peer_hosts", None),
             own_hosts={
@@ -130,6 +155,9 @@ class AgentContext:
         )
         if why:
             return f"越界：{why}。只打当前入口；邻题 IP 不是横向。"
+        why = unauthorized_public_host(host, self.scope, primary=primary)
+        if why:
+            return f"越界：{why}。只打作业对象注册域，不要改打同品牌其它域。"
         return None
 
     async def _host_is_ssrf_gateway(self, host: str) -> bool:
@@ -154,16 +182,49 @@ class AgentContext:
         import time as _t
         self.turn_activity_mono = _t.monotonic()
 
+    async def refresh_intranet_gate(self, graph: dict | None = None) -> None:
+        import time as _t
+        now = _t.monotonic()
+        if graph is None and (now - float(getattr(self, "_gate_mono", 0) or 0)) < 4.0:
+            return
+        try:
+            from ..engine.intranet_reach import apply_gate_to_guard
+            from ..graph import store as gstore
+            g = graph
+            if g is None:
+                g = await gstore.get_graph(self.project_id)
+            brief = ""
+            try:
+                from .prompts import build_brief
+                brief = build_brief(self.project or {}, graph=g)
+            except Exception:
+                brief = ""
+            apply_gate_to_guard(self.guard, g, brief=brief)
+            self.guard.workspace_dir = self.workspace_dir
+            self._gate_mono = now
+        except Exception:
+            pass
+
     async def run_command(self, command: str, timeout: int | None = None) -> CmdResult:
         self.cmd_inflight = int(getattr(self, "cmd_inflight", 0) or 0) + 1
         self.mark_activity()
         try:
+            await self.refresh_intranet_gate()
             extra_env = None
             must = False
             try:
                 from ..proxy.pool import pool as _proxy_pool
+                from ..proxy.yakit import prepare_egress, should_use_yakit
                 must = _proxy_pool.must_proxy(self.objective)
-                if must:
+                if should_use_yakit(self.objective, self.project):
+                    eg = await prepare_egress(self.objective, self.project)
+                    if eg.refuse:
+                        return CmdResult(
+                            exit_code=-1, stdout="", stderr=eg.reason or NO_DIRECT_MSG,
+                            blocked=True, reason=eg.reason or NO_DIRECT_MSG, category="proxy",
+                        )
+                    extra_env = eg.extra_env
+                elif must:
                     px = await _proxy_pool.wait_pick(8.0, prefer_http=True)
                     extra_env = _proxy_pool.proxy_env(px)  # runner 会再扩成多节点轮换
             except Exception:
@@ -175,7 +236,7 @@ class AgentContext:
                 )
             return await run_shell(
                 command, cwd=self.workspace_dir, guard=self.guard, timeout=timeout,
-                extra_env=extra_env,
+                extra_env=extra_env, project_id=self.project_id,
             )
         finally:
             self.cmd_inflight = max(0, int(getattr(self, "cmd_inflight", 0) or 0) - 1)
@@ -185,7 +246,7 @@ class AgentContext:
         if self._httpx_cli is None:
             self._httpx_cli = httpx.AsyncClient(
                 follow_redirects=True,
-                timeout=30.0,
+                timeout=_HTTP_TIMEOUT,
                 verify=False,
             )
         return self._httpx_cli  # type: ignore[return-value]
@@ -195,6 +256,10 @@ class AgentContext:
         if host in ("127.0.0.1", "localhost", "::1"):
             return None
         try:
+            from ..proxy.yakit import resolve_egress, should_use_yakit
+            if should_use_yakit(self.objective, self.project):
+                eg = resolve_egress(self.objective, self.project)
+                return None if eg.refuse else eg.proxy
             from ..proxy.pool import pool as _proxy_pool
             if not _proxy_pool.must_proxy(self.objective):
                 return None
@@ -212,6 +277,16 @@ class AgentContext:
                 must = _proxy_pool.must_proxy(self.objective)
             except Exception:
                 must = False
+        if not local:
+            from ..proxy.yakit import prepare_egress, should_use_yakit
+            if should_use_yakit(self.objective, self.project):
+                eg = await prepare_egress(self.objective, self.project)
+                if eg.refuse:
+                    raise RuntimeError(eg.reason or NO_DIRECT_MSG)
+                async with httpx.AsyncClient(
+                    follow_redirects=True, timeout=_HTTP_TIMEOUT, verify=False, proxy=eg.proxy,
+                ) as cli:
+                    return await cli.request(method, url, headers=headers, content=content)
         if not must:
             return await self._client().request(method, url, headers=headers, content=content)
 
@@ -227,7 +302,7 @@ class AgentContext:
             tried.add(px)
             try:
                 async with httpx.AsyncClient(
-                    follow_redirects=True, timeout=30.0, verify=False, proxy=px,
+                    follow_redirects=True, timeout=_HTTP_TIMEOUT, verify=False, proxy=px,
                 ) as cli:
                     return await cli.request(method, url, headers=headers, content=content)
             except (httpx.ConnectError, httpx.ProxyError, httpx.ConnectTimeout) as e:
@@ -247,6 +322,17 @@ class AgentContext:
         data: str | None = None,
         **_kw,
     ) -> dict:
+        from ..exec.guard import target_destructive_reason
+        why = target_destructive_reason(
+            f"{method} {url} {data or ''}", objective=self.objective,
+        )
+        if why:
+            return {
+                "blocked": True,
+                "error": f"越界：{why}。只证明、不落地。",
+                "status": 0,
+            }
+        await self.refresh_intranet_gate()
         blocked = self._http_blocked(url)
         if blocked:
             return {"blocked": True, "error": blocked, "status": 0}

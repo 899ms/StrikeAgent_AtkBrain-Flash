@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import REPO_ROOT, settings
+from ..engine.turn_close import role_wrote_turn_done
 
 _LIVE: dict[int, str] = {}
 
@@ -40,6 +41,68 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _kill_pid(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _proc_project_ids(pid: int) -> str:
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return ""
+    needle = b"ATKBRAIN_PROJECT_ID="
+    i = env.find(needle)
+    if i < 0:
+        return ""
+    rest = env[i + len(needle):]
+    end = rest.find(b"\0")
+    return rest[:end if end >= 0 else None].decode("utf-8", "replace").strip()
+
+
+def kill_live_for_project(project_id: str) -> int:
+    """停猎后扫掉仍活着的 Pi 进程组。interrupt/close 超时或被取消时会漏。"""
+    want = (project_id or "").strip()
+    if not want:
+        return 0
+    targets: set[int] = set()
+    for proc_pid, owner in list(_LIVE.items()):
+        if owner == want:
+            targets.add(proc_pid)
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            proc_pid = int(name)
+            if _proc_project_ids(proc_pid) != want:
+                continue
+            try:
+                cmd = Path(f"/proc/{proc_pid}/cmdline").read_bytes()
+            except OSError:
+                continue
+            if b"atkbrain.main" in cmd or b"atkbrain-backend" in cmd:
+                continue
+            targets.add(proc_pid)
+    except OSError:
+        pass
+    n = 0
+    for proc_pid in targets:
+        _kill_pid(proc_pid)
+        _LIVE.pop(proc_pid, None)
+        n += 1
+    try:
+        from ..exec.runner import kill_cmds_for_project
+        n += kill_cmds_for_project(want)
+    except Exception:
+        pass
+    return n
+
+
 def extension_path() -> Path:
     p = REPO_ROOT / "pi" / "extensions" / "atkbrain-tools.ts"
     if p.is_file():
@@ -48,7 +111,7 @@ def extension_path() -> Path:
 
 
 def tools_base_url() -> str:
-    port = int(getattr(settings, "port", 5003) or 5003)
+    port = int(getattr(settings, "port", 2333) or 2333)
     return f"http://127.0.0.1:{port}"
 
 
@@ -151,7 +214,7 @@ def ensure_pi_agent_dir(*, hosted: bool | None = None) -> Path:
     return agent
 
 
-def _child_env(*, project_id: str | None, tools: bool) -> dict[str, str]:
+def _child_env(*, project_id: str | None, tools: bool, role: str = "") -> dict[str, str]:
     env = dict(os.environ)
     key = (env.get("DEEPSEEK_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
     if key:
@@ -165,6 +228,8 @@ def _child_env(*, project_id: str | None, tools: bool) -> dict[str, str]:
         env["ATKBRAIN_PROJECT_ID"] = project_id
         env["ATKBRAIN_TOOLS_BASE"] = tools_base_url()
         env["ATKBRAIN_API"] = tools_base_url()
+    if role:
+        env["ATKBRAIN_PI_ROLE"] = str(role)
     token = (getattr(settings, "api_token", None) or "").strip()
     if token:
         env["ATKBRAIN_API_TOKEN"] = token
@@ -177,7 +242,7 @@ def _child_env(*, project_id: str | None, tools: bool) -> dict[str, str]:
 
 
 class PiSession:
-    """一条 Pi RPC 进程。每轮猎面新建，不续对话。"""
+    """一条 Pi RPC 进程。不续接旧对话；猎面角色可保活进程、每轮只换 instruction。"""
 
     def __init__(
         self,
@@ -268,7 +333,7 @@ class PiSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.cwd,
-            env=_child_env(project_id=self.project_id or None, tools=self.tools),
+            env=_child_env(project_id=self.project_id or None, tools=self.tools, role=self.role),
             start_new_session=True,
         )
         if self.proc.pid:
@@ -388,6 +453,18 @@ class PiSession:
         if text and text != self._last_text:
             self._last_text = text
             await self._emit_safe("text", {"text": text[:8000], "role": self.role})
+            if (
+                not getattr(self, "_turn_closed", False)
+                and role_wrote_turn_done(text, role=self.role)
+            ):
+                self._turn_closed = True
+                who = "从者" if self.role == "lead" else f"工人 {self.role}"
+                await self._emit_safe(
+                    "log",
+                    {"level": "info",
+                     "message": f"{who}已写本轮收尾，结束该会话以让御主开口。"},
+                )
+                await self.abort()
 
     async def _flush_thought(self, content: str = "") -> None:
         text = (content or "".join(self._thought_acc)).strip()
@@ -422,6 +499,11 @@ class PiSession:
         self.proc.stdin.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
         await self.proc.stdin.drain()
 
+    def alive(self) -> bool:
+        if self._closed or not self.proc:
+            return False
+        return self.proc.returncode is None
+
     async def prompt(self, message: str, *, timeout: float = 0) -> str:
         self.texts = []
         self._text_acc = []
@@ -429,6 +511,7 @@ class PiSession:
         self._last_text = ""
         self._last_thought = ""
         self._settled = asyncio.Event()
+        self._turn_closed = False
         loop = asyncio.get_running_loop()
         self._prompt_ok = loop.create_future()
         self._req += 1

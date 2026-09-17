@@ -1,6 +1,7 @@
 """后端重启后续跑：只接回当时占槽的项目，不把集群 start_all 排队整表拉起来。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from pathlib import Path
@@ -187,6 +188,9 @@ async def start_saved_hunts(manager, db_running: list[str]) -> list[str]:
             if (proj or {}).get("status") == "running":
                 idle_ids.append(pid)
             continue
+        if (proj or {}).get("status") != "running":
+            # 续跑清单可能残留已收口项目，不要把 idle 再拉起来。
+            continue
         parent_id = (proj or {}).get("parent_id")
         if parent_id:
             try:
@@ -229,5 +233,13 @@ async def start_saved_hunts(manager, db_running: list[str]) -> list[str]:
                 await update_status(pid, "idle")
             except Exception:
                 pass
+    await asyncio.sleep(0)
+    for pid in list(dict.fromkeys([*(picked or []), *(db_running or [])])):
+        if manager.is_running(pid) or manager.is_queued(pid):
+            continue
+        try:
+            await update_status(pid, "idle")
+        except Exception:
+            pass
     return picked
 

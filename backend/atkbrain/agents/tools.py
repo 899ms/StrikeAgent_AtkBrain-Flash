@@ -41,7 +41,16 @@ from ..objective import (
     src_impact_proven,
 )
 from .. import benchmark as bm
-from ..scope import unauthorized_peer_endpoint, unauthorized_private_host, private_out_of_scope_hint
+from ..scope import (
+    _IP_RE,
+    _norm_host,
+    public_hosts_in_text,
+    unauthorized_peer_endpoint,
+    unauthorized_private_host,
+    unauthorized_public_host,
+    private_out_of_scope_hint,
+    public_out_of_scope_hint,
+)
 from .context import AgentContext
 
 SERVER_NAME = "atkbrain"
@@ -346,8 +355,8 @@ async def _land_shell(
             evidence=(ctx.shell_evidence or "")[:400],
         )
         return _text(
-            "✅ 已验证命令执行（高危）。SRC 不转后渗、不打内网横向。"
-            "请独立 report_finding 后按厂商清单挖下一类。"
+            "✅ 已验证命令执行（高危）。SRC 不转后渗、不以 shell 横向。"
+            "已验证 SSRF 才 report_pivot_capability。请独立 report_finding 后按厂商清单挖下一类。"
         )
     ctx.postex_phase = "active"
     await emit(ctx.project_id, "shell",
@@ -413,6 +422,145 @@ async def maybe_autoland_shell(ctx: AgentContext, blob: str) -> str | None:
     except Exception:
         return None
     return user
+
+
+async def maybe_absorb_intranet(
+    ctx: AgentContext,
+    *,
+    command: str = "",
+    url: str = "",
+    data: str = "",
+    output: str = "",
+) -> str:
+    """经已验证跳板观测到的内网主机自动扩进 Scope。泄露正文不会在没有通道时扩容。"""
+    from urllib.parse import urlparse as _urlparse
+    from ..engine.intranet_reach import (
+        KIND_SSRF,
+        entry_hosts,
+        hosts_from_capability_observation,
+        infer_pivot_mechanism,
+        is_entry_identity,
+        is_ssrf_canary_host,
+        precondition_kinds,
+    )
+    from ..scope_pivot import persist_scope, try_expand_scope
+
+    graph = await gstore.get_graph(ctx.project_id)
+    kinds = precondition_kinds(graph)
+    if not kinds:
+        return ""
+    # SRC 只跟红队对齐 SSRF 跳板扩网；socks/shell 横向仍不自动入库。
+    if objective_is_src(ctx.objective) and KIND_SSRF not in kinds:
+        return ""
+    primary = _primary_host(ctx)
+    own = {str(a).split(":")[0] for a in (getattr(ctx, "own_addrs", None) or set()) if a}
+    scoped = ctx.scope
+    targeted_entry = False
+    if url:
+        h = (_urlparse(url).hostname or "").split(":")[0]
+        if is_entry_identity(h, primary=primary, own_hosts=own, scope=scoped):
+            targeted_entry = True
+    if command:
+        try:
+            from ..exec.guard import extract_hosts
+            cmd_hosts = extract_hosts(command) or []
+        except Exception:
+            cmd_hosts = []
+        if any(is_entry_identity(x, primary=primary, own_hosts=own, scope=scoped) for x in cmd_hosts):
+            targeted_entry = True
+        elif any(e and e in command for e in entry_hosts(scoped, primary=primary, own_hosts=own)):
+            targeted_entry = True
+    if not targeted_entry:
+        return ""
+    found = hosts_from_capability_observation(
+        url=url, data=data, command=command, output=output,
+    )
+    from ..engine.intranet_reach import clue_hosts_from_observation
+    clues = clue_hosts_from_observation(command=command, output=output)
+    if not found and not clues:
+        return ""
+    from_host = primary or next(iter(entry_hosts(scoped, primary=primary, own_hosts=own)), "")
+    if not from_host:
+        return ""
+    mech = infer_pivot_mechanism(kinds)
+    peers = set(getattr(ctx, "peer_hosts", None) or [])
+    grew = False
+    src = ""
+    try:
+        src = await gstore.find_pivot_vuln(ctx.project_id, from_host, mech)
+    except Exception:
+        src = ""
+    for h in found:
+        if is_ssrf_canary_host(h):
+            continue
+        if is_entry_identity(h, primary=primary, own_hosts=own, scope=scoped):
+            continue
+        if h in peers:
+            continue
+        try:
+            res = await try_expand_scope(
+                ctx.project_id, ctx.scope,
+                from_host=from_host, to_host=h,
+                mechanism=mech, evidence=output or data or "",
+                verified=True, run_id=ctx.run_id, gstore=gstore,
+            )
+        except Exception:
+            continue
+        if not (res.get("expanded") or res.get("reason") == "already_in_scope"):
+            continue
+        if res.get("expanded"):
+            grew = True
+        try:
+            asset_key = await gstore.ensure_host_target(
+                ctx.project_id, h, title=f"内网主机 {h}", run_id=ctx.run_id,
+                live=True,
+            )
+        except Exception:
+            asset_key = ""
+        if src and asset_key and src != asset_key:
+            rel = "PIVOTS_TO" if mech == "shell_reachable" else "LEADS_TO"
+            try:
+                await gstore.add_edge(
+                    ctx.project_id,
+                    EdgeIn(**{"from": src, "to": asset_key}, relation=rel,
+                           weight=0.9,
+                           rationale=f"pivot_capability {mech}: via verified capability"),
+                    run_id=ctx.run_id,
+                )
+            except Exception:
+                pass
+    for h in clues:
+        if h in found:
+            continue
+        if is_entry_identity(h, primary=primary, own_hosts=own, scope=scoped):
+            continue
+        if h in peers:
+            continue
+        try:
+            await gstore.ensure_host_target(
+                ctx.project_id, h, title=f"内网线索 {h}", run_id=ctx.run_id,
+                live=False,
+            )
+        except Exception:
+            pass
+    if grew or found or clues:
+        if grew:
+            await persist_scope(ctx.project_id, ctx.scope)
+            try:
+                await ctx.refresh_intranet_gate()
+            except Exception:
+                pass
+        try:
+            await gstore.refresh_derived_intents(ctx.project_id, run_id=ctx.run_id)
+        except Exception:
+            pass
+        try:
+            return await gstore.nudge_hop_auth_frontier(
+                ctx.project_id, run_id=ctx.run_id,
+            ) or ""
+        except Exception:
+            return ""
+    return ""
 
 
 def _append_shell_asset(ctx: AgentContext, *, host: str, access: str, evidence: str,
@@ -481,8 +629,16 @@ def _primary_port(ctx: AgentContext) -> int | None:
     return None
 
 
+def _oos_hint(hosts: list[str]) -> str:
+    for h in hosts:
+        name = _norm_host(str(h or "").split(":")[0])
+        if name and not _IP_RE.match(name):
+            return public_out_of_scope_hint()
+    return private_out_of_scope_hint()
+
+
 def _out_of_scope_hosts(ctx: AgentContext, *texts: str) -> list[str]:
-    """当前入口以外的私网 IP（含评测邻题）视为越界。公网域名不拦。
+    """当前入口以外的私网 IP，以及作业对象注册域以外的公网 FQDN，视为越界。
 
     网段标识（末段为 0）不当主机。节点检查应只传 key/host 标签，避免 init.sql 诱饵 IP 拦掉已扩容资产。
     """
@@ -498,7 +654,22 @@ def _out_of_scope_hosts(ctx: AgentContext, *texts: str) -> list[str]:
                                            str(a).split(":")[0]
                                            for a in (getattr(ctx, "own_addrs", None) or set()) if a
                                        })
-        if why and h not in out:
+        if not why or h in out:
+            continue
+        # 邻题入口仍拦；已扩容内网的同网同胞允许写图，Kali 直连仍由守卫拦截。
+        if "其它题目入口" not in why:
+            try:
+                from ..scope import same_pivot_lan
+                if same_pivot_lan(h, ctx.scope):
+                    continue
+            except Exception:
+                pass
+        out.append(h)
+    for h in public_hosts_in_text(blob):
+        if h in out:
+            continue
+        why = unauthorized_public_host(h, ctx.scope, primary=primary)
+        if why:
             out.append(h)
     return out
 
@@ -779,6 +950,15 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
         if res.blocked:
             return _text(f"[已拦截 · {res.category}] {res.reason}", is_error=True)
         try:
+            from ..engine.hop_auth_gate import command_timeout_note, remember_ssh_banner
+            from ..exec.guard import extract_host_ports
+            out = f"{res.stdout or ''}\n{res.stderr or ''}"
+            for h, p in extract_host_ports(command) or []:
+                remember_ssh_banner(ctx.workspace_dir, h, p, out)
+            note = command_timeout_note(command, res.stderr or "", res.stdout or "")
+        except Exception:
+            note = ""
+        try:
             from ..engine.spiral import record_command
             record_command(ctx.workspace_dir, command, stdout=res.stdout or "")
         except Exception:
@@ -788,6 +968,8 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
             f"----- STDOUT -----\n{_clip(res.stdout, 22000)}\n"
             f"----- STDERR -----\n{_clip(res.stderr, 4000)}"
         )
+        if note:
+            body = body + "\n" + note
         landed = await maybe_autoland_shell(ctx, body)
         if landed:
             body = body + f"\n[系统已根据远程 id 回显落定立足点 `{landed}`，关系图已更新。]"
@@ -796,6 +978,31 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
             probe = parse_curl_http(command=command, stdout=res.stdout or "")
             if probe:
                 _schedule_touch_http(ctx, probe["url"], {"status": probe["status"]})
+        except Exception:
+            pass
+        try:
+            note = await maybe_absorb_intranet(
+                ctx, command=command, output=f"{res.stdout or ''}\n{res.stderr or ''}",
+            )
+            if note:
+                body = body + "\n" + note
+        except Exception:
+            pass
+        try:
+            from ..engine.hop_auth_gate import hop_auth_followup_note, maybe_record_ssh_delivery
+            from ..exec.guard import extract_host_ports
+            for h, p in extract_host_ports(command) or []:
+                maybe_record_ssh_delivery(
+                    ctx.workspace_dir, command, host=h, port=p,
+                    allowed_secrets=set(getattr(ctx.guard, "allowed_secrets", None) or ()),
+                )
+            hop_note = hop_auth_followup_note(
+                situation=bool(getattr(ctx, "hop_auth_situation", False)),
+                workspace_dir=ctx.workspace_dir,
+                hop_host=str(getattr(ctx, "hop_auth_host", "") or ""),
+            )
+            if hop_note:
+                body = body + "\n" + hop_note
         except Exception:
             pass
         return _text(body)
@@ -854,12 +1061,46 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
         landed = await maybe_autoland_shell(ctx, body)
         if landed:
             body = body + f"\n[系统已根据远程 id 回显落定立足点 `{landed}`，关系图已更新。]"
+        try:
+            from ..engine.hop_auth_gate import http_login_notes
+            note = http_login_notes(method, data if isinstance(data, str) else "", res.get("body") or "", res.get("status"))
+            if note:
+                body = body + "\n" + note
+        except Exception:
+            pass
+        try:
+            note = await maybe_absorb_intranet(
+                ctx, url=url, data=data if isinstance(data, str) else "",
+                output=res.get("body") or "",
+            )
+            if note:
+                body = body + "\n" + note
+        except Exception:
+            pass
+        try:
+            from ..engine.hop_auth_gate import hop_auth_followup_note, maybe_record_http_delivery
+            maybe_record_http_delivery(
+                ctx.workspace_dir,
+                method=method,
+                data=data if isinstance(data, str) else "",
+                url=url,
+                hop_host=str(getattr(ctx, "hop_auth_host", "") or ""),
+            )
+            hop_note = hop_auth_followup_note(
+                situation=bool(getattr(ctx, "hop_auth_situation", False)),
+                workspace_dir=ctx.workspace_dir,
+                hop_host=str(getattr(ctx, "hop_auth_host", "") or ""),
+            )
+            if hop_note:
+                body = body + "\n" + hop_note
+        except Exception:
+            pass
         return _text(body)
 
     @tool(
         "add_node",
         "向攻击图新增/更新一个节点（信息点/服务/危险点/漏洞/凭证/立足点）。用 key 做稳定标识可重复调用更新。"
-        "本题只有一个黑色目标（授权入口）。内网 IP 用 type=info 或 service，不要 type=target。"
+        "本题入口是带 entry 的黑色目标。经漏洞发现的内网地址也用 type=target（不要标成信息）。"
         "形成 target→service→info/danger→vuln 链：漏洞/危险点务必再 add_edge 从对应 service 或 info 连过来（LEADS_TO），不要只留 target 直连。",
         {
             "type": "object",
@@ -924,7 +1165,7 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
                        run_id=ctx.run_id)
             return _text(
                 f"⛔ 越界主机 {hit}：尚未写入 Scope。"
-                + private_out_of_scope_hint(),
+                + _oos_hint(list(hit)),
                 is_error=True,
             )
         confirmed_shell = (
@@ -972,7 +1213,7 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
                            run_id=ctx.run_id)
                 return _text(
                     f"⛔ 越界：横向目标 {oos} 不在授权 Scope 内，边未记录。"
-                    + private_out_of_scope_hint(),
+                    + _oos_hint(oos),
                     is_error=True,
                 )
             if not await gstore.is_verified_lateral_pivot(ctx.project_id, args["from"], args["to"]):
@@ -1082,6 +1323,19 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
                        run_id=ctx.run_id)
             return _text(f"⛔ {plat}。平台故障不是目标漏洞，请回到授权业务资产。",
                          is_error=True)
+        oos = _out_of_scope_hosts(
+            ctx, args.get("node_key"), args.get("poc_curl"), args.get("proof_url"),
+        )
+        if oos and getattr(ctx.scope, "mode", "strict") == "strict":
+            await emit(ctx.project_id, "log",
+                       {"level": "warn",
+                        "message": f"越界拦截：report_finding 触碰非授权主机 {oos}。"},
+                       run_id=ctx.run_id)
+            return _text(
+                f"⛔ 越界主机 {oos}：不要把非作业对象注册域上的洞当成本题成果。"
+                + _oos_hint(oos),
+                is_error=True,
+            )
         from ..graph.model import secondary_review_error
         pair_err = secondary_review_error(
             _truthy(args.get("secondary_verified")),
@@ -1235,7 +1489,9 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
         "或经已有 shell 可达 to_host_or_ip。用于把内网资产加入 Scope。"
         "ssrf_*：后续 HTTP 必须把目标 URL 放进已验证 SSRF 参数，禁止 http_request 直连。"
         "必须提供可复现证据。mechanism 取 ssrf_direct / ssrf_gopher / ssrf_dns_rebind / "
-        "port_forward / socks_tunnel / dns_leak / rdp_relay / smb_relay / shell_reachable。",
+        "port_forward / socks_tunnel / dns_leak / rdp_relay / smb_relay / shell_reachable。"
+        "SRC 仅允许 ssrf_*：已验证 SSRF 看见内网必须调用本工具扩 Scope（图上跳板可达）；"
+        "socks/shell/端口转发横向仍禁止。",
         {
             "type": "object",
             "properties": {
@@ -1255,9 +1511,10 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
         evidence = args.get("evidence") or ""
         if not from_host or not to_host or not mechanism or not evidence:
             return _text("参数不足：from_host / to_host_or_ip / mechanism / evidence 均必填。", is_error=True)
-        if objective_is_src(ctx.objective):
+        if objective_is_src(ctx.objective) and not mechanism.startswith("ssrf"):
             return _text(
-                "⛔ SRC 赛道不打内网横向：不要 report_pivot_capability。命令执行只当高危证据，继续挖下一类。",
+                "⛔ SRC 只允许已验证 SSRF 扩网（mechanism 以 ssrf_ 开头，例如 ssrf_direct）。"
+                "socks/shell/端口转发横向仍禁止。命令执行只当高危证据。",
                 is_error=True,
             )
         blocked = _attacker_identity_reason(to_host)
@@ -1281,13 +1538,25 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
         except Exception as e:
             return _text(f"扩容失败：{e}", is_error=True)
         if not (res.get("expanded") or res.get("reason") == "already_in_scope"):
-            hint = (
-                " 这是同一场评测里其它题目的入口 IP，不是本题内网。"
-                if res.get("reason") == "peer_challenge_entry" else
-                " 公网/回环/本机无法加入；须从授权目标经 shell 或 SSRF 跳板核实。"
-            )
+            why = str(res.get("reason") or "")
+            if why == "ssrf_canary":
+                hint = (
+                    " 这是链路本地/云元数据/文档网段，只能当 SSRF 漏洞证据，"
+                    "不能当成新内网主机扩 Scope，也不要 hop_auth。"
+                )
+            elif why == "ssrf_oracle_only":
+                hint = (
+                    " 超时/Network error/无 title 的错误码差分只证明 SSRF 原语，"
+                    "不是已经看见业务邻机。只有登录页、横幅或目标响应里出现的具体主机才能扩。"
+                )
+            else:
+                hint = (
+                    " 这是同一场评测里其它题目的入口 IP，不是本题内网。"
+                    if why == "peer_challenge_entry" else
+                    " 公网/回环/本机无法加入；须从授权目标经 shell 或 SSRF 跳板核实。"
+                )
             return _text(
-                f"⛔ 未登记内网主机、未扩容 Scope（原因：{res.get('reason')}）。" + hint,
+                f"⛔ 未登记内网主机、未扩容 Scope（原因：{why}）。" + hint,
                 is_error=True,
             )
         if res.get("expanded"):
@@ -1296,21 +1565,23 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
         try:
             asset_key = await gstore.ensure_host_target(
                 ctx.project_id, to_host,
-                title=f"内网主机 {to_host}",
+                title=f"内网目标 {to_host}",
                 run_id=ctx.run_id,
+                live=True,
             )
         except Exception:
             asset_key = ""
-        primary = _primary_host(ctx)
+        src = ""
         try:
-            src = await gstore.find_pivot_source(ctx.project_id, from_host or primary)
+            src = await gstore.find_pivot_vuln(ctx.project_id, from_host, mechanism)
         except Exception:
             src = ""
         if src and asset_key and src != asset_key:
+            rel = "PIVOTS_TO" if mechanism == "shell_reachable" else "LEADS_TO"
             try:
                 await gstore.add_edge(
                     ctx.project_id,
-                    EdgeIn(**{"from": src, "to": asset_key}, relation="LEADS_TO",
+                    EdgeIn(**{"from": src, "to": asset_key}, relation=rel,
                            weight=0.9,
                            rationale=f"pivot_capability {mechanism}: {evidence[:120]}"),
                     run_id=ctx.run_id,
@@ -1636,6 +1907,26 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
         )
         if refused:
             return _text(refused, is_error=True)
+        intent_row = None
+        try:
+            intent_row = await gstore.get_intent(ctx.project_id, args.get("intent_id"))
+        except Exception:
+            intent_row = None
+        if not bool(args.get("verified")):
+            try:
+                from ..engine.hop_auth_gate import refuse_hop_auth_disprove
+                graph = await gstore.get_graph(ctx.project_id)
+                hop_refuse = refuse_hop_auth_disprove(
+                    intent_row,
+                    verified=False,
+                    summary=args.get("summary"),
+                    fingerprint=args.get("failure_fingerprint") or args.get("summary"),
+                    graph=graph,
+                )
+            except Exception:
+                hop_refuse = None
+            if hop_refuse:
+                return _text(hop_refuse, is_error=True)
         row = await gstore.resolve_intent(
             ctx.project_id,
             args["intent_id"],

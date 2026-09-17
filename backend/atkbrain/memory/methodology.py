@@ -66,7 +66,7 @@ _CONSUME: dict[str, frozenset[str]] = {
     "file_read_chain": frozenset({"weaponize", "finding_read_loot", "read_to_creds", "filter_bypass"}),
     "upload_bypass": frozenset({"weaponize"}),
     "finding_sqli_chain": frozenset({"weaponize", "finding_read_loot", "file_read_chain"}),
-    "ssrf_as_gateway": frozenset({"file_read_chain", "finding_read_loot"}),
+    "ssrf_as_gateway": frozenset({"file_read_chain", "finding_read_loot", "hop_auth", "access_control"}),
     "weaponize": frozenset({"finding_read_loot", "privesc_lateral"}),
     "ssti": frozenset({"weaponize"}),
     "access_control": frozenset({"weaponize", "finding_read_loot"}),
@@ -80,7 +80,7 @@ _CONSUME: dict[str, frozenset[str]] = {
     "deserialize_surface": frozenset({"restricted_deserialize", "weaponize"}),
     "auth_surface": frozenset({"access_control", "info_to_cred"}),
     "debug_endpoint": frozenset({"weaponize"}),
-    "foothold": frozenset({"finding_read_loot", "privesc_lateral", "access_control"}),
+    "foothold": frozenset({"finding_read_loot", "privesc_lateral", "access_control", "hop_auth"}),
 }
 
 

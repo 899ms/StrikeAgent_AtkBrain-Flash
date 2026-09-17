@@ -10,7 +10,7 @@ from ..config import settings
 from ..db import db, _loads
 from ..engine.scheduler import manager
 from ..graph import store as gstore
-from ..project_status import hunt_hard_stop_info
+from ..project_status import displayed_status, hunt_hard_stop_info
 from ..app_version import check_latest, local_version
 from ..projects import (
     assert_safe_project_target,
@@ -135,6 +135,14 @@ class ProxyEnableReq(BaseModel):
     enabled: bool
 
 
+class YakitEnableReq(BaseModel):
+    enabled: bool
+
+
+class YakitBackupReq(BaseModel):
+    backup_text: str = ""
+
+
 class ProxyPoolReq(BaseModel):
     custom_text: str = ""
 
@@ -151,9 +159,8 @@ async def _stop_project_tree(pid: str) -> list[str]:
     child_ids = await list_child_ids(pid)
     nested = await asyncio.gather(*(_stop_project_tree(cid) for cid in child_ids)) if child_ids else []
     stopped = [x for group in nested for x in group]
-    if manager.is_running(pid):
-        await manager.stop(pid)
-        stopped.append(pid)
+    await manager.halt(pid)
+    stopped.append(pid)
     return stopped
 
 
@@ -185,7 +192,22 @@ async def health():
         claude_sdk = {"state": "ready", "label": "Pi 就绪", "version": ver[:80], "bin": bin_path}
     except Exception as exc:
         claude_sdk = {"state": "unavailable", "label": "Pi 不可用", "error": str(exc)[:160]}
-    return {"ok": True, "version": local_version(), "claude_sdk": claude_sdk, "proxy": _proxy_snap(), **manager.snapshot()}
+    from ..agents.brief_creds import CREDS_MODE
+    yakit_snap: dict = {}
+    try:
+        from ..proxy.yakit import yakit as _yakit
+        yakit_snap = await _yakit.status(force=False)
+    except Exception as e:
+        yakit_snap = {"enabled": False, "error": str(e)[:160], "engine": {"ready": False, "label": "Yakit 未就绪"}, "cert": {"ready": False, "label": "证书异常"}}
+    return {
+        "ok": True,
+        "version": local_version(),
+        "creds_mode": CREDS_MODE,
+        "claude_sdk": claude_sdk,
+        "proxy": _proxy_snap(),
+        "yakit": yakit_snap,
+        **manager.snapshot(),
+    }
 
 
 @router.get("/version")
@@ -195,9 +217,16 @@ async def get_version(refresh: bool = False):
 
 @router.get("/settings")
 async def get_settings():
+    yakit_snap: dict = {}
+    try:
+        from ..proxy.yakit import yakit as _yakit
+        yakit_snap = await _yakit.status(force=False)
+    except Exception as e:
+        yakit_snap = {"error": str(e)[:160]}
     return {
         "concurrency": manager.snapshot(),
         "proxy": _proxy_snap(),
+        "yakit": yakit_snap,
         "defaults": {
             "model": settings.claude_model,
             "supervisor_model": (settings.supervisor_model or settings.claude_model),
@@ -208,6 +237,10 @@ async def get_settings():
                 "redteam": hunt_hard_stop_info("redteam"),
                 "flag": hunt_hard_stop_info("flag"),
             },
+            "yakit_mitm_host": getattr(settings, "yakit_mitm_host", "127.0.0.1"),
+            "yakit_mitm_port": int(getattr(settings, "yakit_mitm_port", 8084) or 8084),
+            "yakit_mcp_url": getattr(settings, "yakit_mcp_url", "http://127.0.0.1:11432/mcp"),
+            "yakit_mitm_ctf": bool(getattr(settings, "yakit_mitm_ctf", False)),
         },
     }
 
@@ -255,6 +288,51 @@ async def api_proxy_pool_set(req: ProxyPoolReq):
 async def api_proxy_verify():
     from ..proxy.pool import pool
     return await pool.verify()
+
+
+@router.get("/yakit/status")
+async def api_yakit_status():
+    from ..proxy.yakit import yakit
+    return await yakit.status(force=False)
+
+
+@router.post("/yakit/enabled")
+async def api_yakit_enabled(req: YakitEnableReq):
+    from ..proxy.yakit import yakit
+    return await yakit.set_enabled(bool(req.enabled))
+
+
+@router.post("/yakit/backup")
+async def api_yakit_backup(req: YakitBackupReq):
+    from ..proxy.yakit import yakit
+    return await yakit.set_backup_text(req.backup_text or "")
+
+
+@router.post("/yakit/cert")
+async def api_yakit_cert_download():
+    from ..proxy.yakit import cert_path, yakit
+    try:
+        path = await yakit.ensure_cert(force=True)
+    except Exception as e:
+        raise HTTPException(502, f"下载 MITM 证书失败：{e}")
+    yakit._status_cache = None
+    yakit._decrypt_ok = None
+    snap = await yakit.status(force=True)
+    snap["cert_saved"] = str(path)
+    return snap
+
+
+@router.get("/yakit/cert")
+async def api_yakit_cert_file():
+    from ..proxy.yakit import cert_path
+    p = cert_path()
+    if not p.is_file():
+        raise HTTPException(404, "尚未下载 MITM 证书")
+    return Response(
+        content=p.read_bytes(),
+        media_type="application/x-pem-file",
+        headers={"Content-Disposition": 'attachment; filename="yakit-mitm-ca.pem"'},
+    )
 
 
 def _slim_list_config(cfg: dict | None) -> dict:
@@ -334,6 +412,12 @@ async def api_list_projects():
         slim = {**p, "config": _slim_list_config(p.get("config")),
                 "stats": stats,
                 "running": (any(manager.is_running(cid) for cid in child_ids) if is_parent else manager.is_running(p["id"]))}
+        slim["queued"] = (
+            any(manager.is_queued(cid) for cid in child_ids) if is_parent else manager.is_queued(p["id"])
+        )
+        slim["status"] = displayed_status(
+            p.get("status"), running=bool(slim["running"]), queued=bool(slim["queued"]),
+        )
         out.append(slim)
     return out
 
@@ -430,10 +514,13 @@ async def api_get_project(pid: str):
         }
     g = await gstore.get_graph(pid)
     h = manager.get(pid)
+    running = manager.is_running(pid)
+    queued = manager.is_queued(pid)
     return {
         **p, "graph": g,
-        "running": manager.is_running(pid),
-        "queued": manager.is_queued(pid),
+        "status": displayed_status(p.get("status"), running=running, queued=queued),
+        "running": running,
+        "queued": queued,
         "run_id": (h.run_id if h else None),
     }
 
@@ -526,8 +613,8 @@ async def api_start(pid: str, confirm_restart: bool = Query(False)):
 
 @router.post("/projects/{pid}/stop")
 async def api_stop(pid: str):
-    ok = await manager.stop(pid)
-    return {"ok": ok}
+    await manager.halt(pid)
+    return {"ok": True}
 
 
 @router.patch("/projects/{pid}")
@@ -867,7 +954,7 @@ async def api_stop_all(pid: str):
         ids = [s["id"] for s in await cluster_mod.list_subprojects(pid) if manager.is_running(s["id"])]
         if not ids:
             break
-        await asyncio.gather(*(manager.stop(sid) for sid in ids))
+        await asyncio.gather(*(manager.halt(sid) for sid in ids))
         stopped.extend(ids)
     uniq = list(dict.fromkeys(stopped))
     return {"stopped": uniq, "count": len(uniq), "autopilot": False if p["kind"] == "benchmark" else None}

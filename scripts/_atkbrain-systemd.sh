@@ -127,19 +127,19 @@ PY
 }
 
 kill_stray_backend() {
-  # 只释放 Flash API 口 :5003。禁止 pkill 全部 atkbrain.main——本机还有其它仓库占用 :2233。
-  if ss -H -tlnp 2>/dev/null | grep -q ':5003 '; then
-    echo "[*] 释放 :5003 上的非 Flash 占用 …"
-    fuser -k 5003/tcp 2>/dev/null || true
+  # 只释放 Flash API 口 :2333。禁止 pkill 全部 atkbrain.main——本机还有其它仓库占用 :2233。
+  if ss -H -tlnp 2>/dev/null | grep -q ':2333 '; then
+    echo "[*] 释放 :2333 上的非 Flash 占用 …"
+    fuser -k 2333/tcp 2>/dev/null || true
     sleep 1
   fi
 }
 
 kill_stray_frontend() {
-  # 只释放 Flash 控制台 :5001，勿杀掉其它仓库的 Vite（:2234）。
-  if ss -H -tlnp 2>/dev/null | grep -q ':5001 '; then
-    echo "[*] 释放 :5001 上的非 Flash 占用 …"
-    fuser -k 5001/tcp 2>/dev/null || true
+  # 只释放 Flash 控制台 :2334，勿杀掉其它仓库的 Vite（:2234）。
+  if ss -H -tlnp 2>/dev/null | grep -q ':2334 '; then
+    echo "[*] 释放 :2334 上的非 Flash 占用 …"
+    fuser -k 2334/tcp 2>/dev/null || true
     sleep 1
   fi
 }

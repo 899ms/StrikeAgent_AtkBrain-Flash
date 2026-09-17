@@ -15,7 +15,7 @@ import { ClusterDashboard } from "../features/cluster/ClusterDashboard";
 import { BenchmarkDashboard } from "../features/benchmark/BenchmarkDashboard";
 import { ReportExportControls } from "../features/report/ExportReport";
 import { colors, displayFindingSeverity } from "../theme";
-import { huntFailedReason, hardStopLine } from "../projectStatus";
+import { hardStopLine, listStatusOf } from "../projectStatus";
 import { animate } from "animejs";
 import { countUp } from "../anim";
 
@@ -294,7 +294,13 @@ export function ProjectPage() {
     }
   };
   const start = async () => { await startResume(); };
-  const stop = async () => { if (id) { await api.stop(id).catch(() => {}); setRunning(false); } };
+  const stop = async () => {
+    if (!id) return;
+    await api.stop(id).catch(() => {});
+    setRunning(false);
+    setQueued(false);
+    setProject((prev) => (prev ? { ...prev, status: "idle", running: false } : prev));
+  };
   const handleSend = async (msg: string) => {
     if (!id) return;
     if (!running) {
@@ -336,7 +342,7 @@ export function ProjectPage() {
   const supervisorCount = countSupervisorRecords(events);
   const statusColor: Record<string, string> = { running: colors.success, queued: colors.warning, completed: colors.primary, idle: colors.mutedSoft, error: colors.error, stopped: colors.muted };
   const statusLabel: Record<string, string> = { running: "运行中", queued: "排队中", completed: "已完成", idle: "空闲", error: "失败", stopped: "已停止", goal_reached: "已完成" };
-  const shownStatus = queued ? "queued" : running ? "running" : (huntFailedReason(project) ? "error" : (project.status || "idle"));
+  const shownStatus = listStatusOf({ ...project, running, queued });
   const needed = Number(project.config?.flag_count) || 1;
   const canResume = (graph.stats?.nodes || 0) > 0 || events.length > 0;
   const flagsCorrect = graph.nodes.filter((n) =>

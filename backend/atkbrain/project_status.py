@@ -185,6 +185,22 @@ def hunt_max_turns(objective: str | None = None, *, is_benchmark: bool = False) 
     return max(0, n)
 
 
+def displayed_status(
+    db_status: str | None, *, running: bool = False, queued: bool = False,
+) -> str:
+    """给 UI 的状态：以活句柄为准。DB 里残留的 running 在没进程时算空闲。"""
+    if queued:
+        return "queued"
+    if running:
+        return "running"
+    st = (db_status or "idle").strip().lower()
+    if st == "running":
+        return "idle"
+    if st == "goal_reached":
+        return "completed"
+    return st or "idle"
+
+
 def final_project_status(
     *, goal: bool, exhausted: bool = False, pause_reason: str | None = None,
 ) -> str:

@@ -100,6 +100,24 @@ def _settings_path() -> Path:
     return Path(settings.data_dir) / "proxy-settings.json"
 
 
+def _merge_settings(updates: dict[str, Any]) -> None:
+    p = _settings_path()
+    data: dict[str, Any] = {}
+    if p.is_file():
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8") or "{}")
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+    data.update(updates)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
 @dataclass
 class LiveProxy:
     url: str
@@ -111,7 +129,7 @@ class LiveProxy:
 
 @dataclass
 class ProxyPool:
-    enabled: bool = True
+    enabled: bool = False
     custom_text: str = ""
     live: list[LiveProxy] = field(default_factory=list)
     fetching: bool = False
@@ -121,6 +139,7 @@ class ProxyPool:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _direct_ip: str | None = field(default=None, repr=False)
     _cooldown: dict[str, float] = field(default_factory=dict, repr=False)
+    _current_url: str | None = field(default=None, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -147,19 +166,7 @@ class ProxyPool:
         self.custom_text = str(data.get("custom_text") or "")
 
     def save(self) -> None:
-        p = _settings_path()
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(
-                json.dumps(
-                    {"enabled": bool(self.enabled), "custom_text": self.custom_text},
-                    ensure_ascii=False,
-                    indent=2,
-                ) + "\n",
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
+        _merge_settings({"enabled": bool(self.enabled), "custom_text": self.custom_text})
 
     def _custom_urls(self) -> list[str]:
         out: list[str] = []
@@ -187,10 +194,40 @@ class ProxyPool:
             u = "socks5://" + u.split("://", 1)[1]
         self._cooldown[u] = time.monotonic() + max(30.0, float(seconds or DROP_COOLDOWN_SEC))
         self.live = [i for i in self.live if i.url != u]
-        if self.live:
-            self.exit_ip = self.live[0].exit_ip
-        else:
-            self.exit_ip = None
+        self.refresh_exit()
+        try:
+            from .yakit import yakit
+            yakit.note_pool_changed()
+        except Exception:
+            pass
+
+    def current_item(self) -> LiveProxy | None:
+        """MITM / 顶栏 / pick 共用的当前池节点：第一条能过 HTTPS 的存活，否则第一条存活。"""
+        items = self._usable()
+        if not items:
+            return None
+        for item in items:
+            if item.https_ok:
+                return item
+        return items[0]
+
+    def current_url(self) -> str | None:
+        item = self.current_item()
+        return item.url if item else None
+
+    def refresh_exit(self) -> None:
+        """设置页「最近出口」必须等于当前池节点，不能另记一个 live[0]。"""
+        prev = self._current_url
+        item = self.current_item()
+        url = item.url if item else None
+        self.exit_ip = (item.exit_ip or None) if item else None
+        self._current_url = url
+        if url != prev:
+            try:
+                from .yakit import yakit
+                yakit.note_pool_changed()
+            except Exception:
+                pass
 
     def _usable(self, exclude: set[str] | None = None) -> list[LiveProxy]:
         skip = set(exclude or ()) | self._cooling()
@@ -213,10 +250,58 @@ class ProxyPool:
             return [custom_hit, https_http, http_plain, https_socks, socks_rest]
         return [custom_hit, https_http + https_socks, http_plain, socks_rest]
 
-    def pick(self, exclude: set[str] | None = None, *, prefer_http: bool = False) -> str | None:
-        """选一个出口。自建节点优先；命令通道默认 prefer_http，避免随机抽到已死 SOCKS。"""
+    def pick_https(self, exclude: set[str] | None = None) -> str | None:
+        """MITM 下游要 HTTPS CONNECT；没有 https_ok 就不要硬塞 HTTP-only 节点。"""
         if not self.enabled:
             return None
+        items = self._usable(exclude)
+        if not items:
+            return None
+        custom = set(self._custom_urls())
+        https_custom = [i for i in items if i.url in custom and i.https_ok]
+        https_http = [i for i in items if i.url not in custom and i.https_ok and (i.proto or "").startswith("http")]
+        https_socks = [i for i in items if i.url not in custom and i.https_ok and not (i.proto or "").startswith("http")]
+        for bucket in (https_custom, https_http, https_socks):
+            if bucket:
+                return random.choice(bucket).url
+        return None
+
+    def mitm_candidates(self, n: int = 16, exclude: set[str] | None = None) -> list[str]:
+        """给 Yakit 下游试的节点：自建 https → 池内 https → 其余存活（备用）。"""
+        if not self.enabled and not self._custom_urls():
+            return []
+        items = self._usable(exclude)
+        custom = set(self._custom_urls())
+        buckets = [
+            [i for i in items if i.url in custom and i.https_ok],
+            [i for i in items if i.url not in custom and i.https_ok and (i.proto or "").startswith("http")],
+            [i for i in items if i.url not in custom and i.https_ok],
+            [i for i in items if i.url in custom],
+            [i for i in items if (i.proto or "").startswith("http")],
+            list(items),
+        ]
+        out: list[str] = []
+        seen: set[str] = set()
+        want = max(1, min(int(n or 16), 24))
+        for bucket in buckets:
+            random.shuffle(bucket)
+            for item in bucket:
+                if item.url in seen:
+                    continue
+                seen.add(item.url)
+                out.append(item.url)
+                if len(out) >= want:
+                    return out
+        return out
+
+    def pick(self, exclude: set[str] | None = None, *, prefer_http: bool = False) -> str | None:
+        """出网出口与顶栏同一条：当前池节点。被排除时才从其余存活里再选。"""
+        if not self.enabled:
+            return None
+        skip = set(exclude or ())
+        cur = self.current_item()
+        if cur and cur.url not in skip:
+            return cur.url
         items = self._usable(exclude)
         if not items:
             return None
@@ -287,6 +372,11 @@ class ProxyPool:
             self.fetching = False
         self.save()
         self.ensure_loop()
+        try:
+            from .yakit import yakit
+            yakit.note_pool_changed()
+        except Exception:
+            pass
         return self.snapshot()
 
     async def set_custom_text(self, text: str) -> dict[str, Any]:
@@ -427,8 +517,8 @@ class ProxyPool:
                 else:
                     nxt.append(item)
             self.live = nxt[:MAX_LIVE]
+            self.refresh_exit()
             if self.live:
-                self.exit_ip = self.live[0].exit_ip
                 self.error = None
 
     async def _probe_urls(
@@ -487,8 +577,8 @@ class ProxyPool:
                     if item.url not in seen and item.url not in cooling:
                         self.live.append(item)
                     self.live = self.live[:MAX_LIVE]
+                    self.refresh_exit()
                     if self.live:
-                        self.exit_ip = self.live[0].exit_ip
                         self.error = None
                 if len(self.live) >= target:
                     break
@@ -546,6 +636,8 @@ class ProxyPool:
         ok = bool(direct and via and direct != via)
         if via:
             self.exit_ip = via
+            if used:
+                self._current_url = used
         return {
             "direct_ip": direct,
             "proxy_ip": via,

@@ -62,6 +62,7 @@ class SupervisorFacts:
     claim_unverified: bool = False
     invert_ops: bool = False
     postex_pivot: bool = False
+    proxy_auth: bool = False
     chain_close: bool = False
     channel_oracle_open: bool = False
     wrong_flags: int = 0
@@ -95,15 +96,29 @@ INVERT_OPS_GUIDE = (
 
 POSTEX_PIVOT_GUIDE = (
     "横向收口（可迁移，不是某题 payload）：本机已交过旗或已 GETSHELL，且 flag 未齐时，"
-    "剩余 flag 通常不在本容器。从跳板看见的容器网/内网主机（arp、hosts、init 拓扑）"
-    "用 report_pivot_capability 扩进 Scope。"
-    "图上凭证/备份/SQL/代理用法里出现的 RFC1918 是本题内网线索，不是邻题；简报「待扩容」必须先扩再打。"
-    "经 SSRF 扩容的主机，攻击机网卡通常到不了：把目标 URL 放进已验证 SSRF 参数，或从 webshell 访问；"
-    "禁止 Kali 直连，禁止把这些地址当邻题入口，禁止去打攻击机 docker 网桥。"
+    "本机已交过的目标不要再挖；图上另有未过门的活身份面时，经已有能力去走。"
+    "只扩经跳板真正打出业务面（登录页/横幅/非空服务回包）的主机；"
+    "arp/hosts/扫描邻居里的地址先当线索，不要一律 report_pivot_capability 写进 Scope，不要把扫段空号当目标。"
+    "图上凭证/备份/SQL/代理用法里出现的 RFC1918 是本题内网线索，不是邻题。"
+    "经 SSRF 扩容的主机，攻击机网卡通常到不了：把目标 URL 放进已验证 SSRF 参数，或从 webshell 访问。"
+    "SSH：不要 Kali 无隧道直连内网 IP（会打到攻击机 docker 网桥，不是题内网）；"
+    "也不要用 curl 的 sftp/libssh2 去讲 SSH，那不是 OpenSSH 客户端。"
+    "正路：立足点把 22/SOCKS 转到 Kali，再用本机 ssh/sshpass 打已扩容主机。"
+    "SSH 握手要长连接中转：立足点上常驻监听绑 0.0.0.0，stdin 与当前 webshell 请求断开，"
+    "Kali 再连「入口IP:监听端口」取 banner；一次性短超时脚本转发会超时，那是通道死了，不是口令否证，禁止因此改 hydra。"
+    "配置 JSON 没有 password 字段，只说明这份文件没有密钥，不是身份面已关闭。"
+    "SSH 身份只用题面或攻击图上已经出现的账密字面量（账号字段、用户名单、password=）；"
+    "不要按厂商名、主机名或 MOTD 合成默认口令，不要自造喷洒表。"
+    "banner 通了只试已出现的字面量；已经大量 Permission denied 后先停，避免把认证锁死。"
+    "失败不要 hydra、不要回头扫面板 API。"
+    "实例换址后常驻转发会断：先重建 0.0.0.0 监听再试身份。"
+    "禁止把这些地址当邻题入口，禁止去打攻击机 docker 网桥。"
     "邻机是新身份域：must_intents 按 tactic 正交，同一 tactic 只占一格。"
-    "身份验证与未授权可达并行；上一跳账密只是候选。同一身份面无新秘密则结束该跳 hop_auth。"
-    "跳板扫描到的每一台都要单独 report_pivot_capability，不要只扩一台。"
-    "本机已交过的旗不要再挖；再读本机下一项打不开 → 去邻机。"
+    "身份验证与未授权可达并行；上一跳账密只是候选。"
+    "经跳板 HTTP 打邻机登录：先确认认证处理接口收到方法与请求体，再判口令；"
+    "外壳 POST、站点根路径、只回登录页 HTML，都不是口令否证，不能结束该跳 hop_auth。"
+    "同一身份面在认证接口已送达后仍无新秘密、只重复失败，才结束该跳 hop_auth。"
+    "本机已交过的旗不要再挖。"
     "邻题入口（同评测其它 unique_code 的入口 IP/端口）仍然越界。"
 )
 
@@ -113,6 +128,7 @@ CHAIN_CLOSE_GUIDE = (
     "同一耗时通道按位 dump 只是退路。不要再校准耗时，也不要把库侧文件读原语当默认收口（常被配置挡住），更不要把抽出的哈希拿去超级大字典硬撞。"
     "前端/JS 字段反复 4xx、或错误正文点名了你没发的键 → 客户端契约过时，按错误正文与同接口其它泄露名换键，禁止对已否证键做编码变体；恒定 4xx 点名缺字段说明通道活着，不要把整条网关写成存根。"
     "已验证跳板（SSRF/导入/代理）不要改成攻击机直连错误正文里的内网地址。"
+    "经跳板打内层登录：确认内层收到方法与 body；外壳 POST 或只回登录页不算口令否证。"
     "图上已有机器密钥但还没 401/403：在跳板已到达的同一服务上换查询参数/请求头/Cookie/body 做有无密钥差分。"
     "浅层路径 404 只否证该路径，不关闭密钥，也不要因此转去旁路网段。"
     "过滤器拒绝的是这一次提交的形态：不要给同一形态加包装；同一绕过族已否证就换正交表示类。"
@@ -123,16 +139,60 @@ CHAIN_CLOSE_GUIDE = (
 )
 
 SRC_CYCLE_GUIDE = (
-    "SRC 挖洞循环（不是红队收口）：已验证洞不收工、不 GETSHELL、不横向。"
+    "SRC 挖洞循环（不是红队收口）：已验证洞不收工、不 GETSHELL、不以 socks/shell 横向。"
     "至多一格把已证洞打到高危标准（impact_escalate），其余格换简报「建议测」且还没覆盖的类型，"
     "每条独立 report_finding。禁止为凑数去打「暂缓」类型，禁止三格都消耗同一条利用链。"
-    "命令执行只写无害 txt canary 当高危证据。禁止 report_pivot_capability。"
+    "命令执行只写无害 txt canary 当高危证据。"
+    "已验证 SSRF 看见内网必须 report_pivot_capability（ssrf_*）扩网；禁止 socks/shell 横向与 GETSHELL 收工。"
 )
 
 SINGLE_CHANNEL_GUIDE = (
     "单通道否证：状态码/正文无差异，输入面未关；禁止把恒定错误页写成已验证利用，也禁止 defer channel_oracle。"
     "换通道 = 同一 URL、同一参数换观测；另一个路由因为允许 POST 不是换通道，禁止写成唯一可写面。"
 )
+PROXY_AUTH_GUIDE = (
+    "跳板转发认证（可迁移，不是某题路径）：经开放代理/SSRF 打内层登录时，"
+    "外壳与内层是两跳。外层 POST 打在代理脚本上、或 url 只指向站点根路径，"
+    "都不等于认证处理接口收到了用户名和密码。"
+    "先读内层表单的 action 与字段名，把同一方法与请求体转发到该处理接口；"
+    "GET-only 跳板要用它声明的转发方式，不要假设外层 -X POST 会带进内层。"
+    "口令是否无效，只能看内层差分：相对错误口令是否出现 3xx、Set-Cookie、"
+    "离开登录页或明确错误文案。"
+    "仍渲染登录页、长度与未登录相同，只说明没进会话，不能当口令已否证。"
+    "未确认送达就把个位数口令写成失败，再换用户、扫目录、对入口再打注入，"
+    "是把传输层失败当成方法失败。"
+    "题面个位数只试一次且须打在认证接口上；送达后失败不要升字典。"
+    "邻机过门未完成时，不要回到已交过旗的入口读链。"
+)
+_PROXY_AUTH_GADGET_RE = re.compile(
+    r"\bssrf\b|开放代理|open\s*proxy|gopher://|file://|"
+    r"ssrf_as_gateway|url=https?://",
+    re.I,
+)
+_PROXY_AUTH_LOGIN_RE = re.compile(
+    r"登录|鉴权|认证|hop_auth|auth_surface|过门|\blogin\b",
+    re.I,
+)
+
+
+def needs_proxy_auth_guidance(
+    graph: dict | None = None,
+    *,
+    postex_pivot: bool = False,
+    has_live_gadget: bool = False,
+    has_internal_hops: bool = False,
+) -> bool:
+    """跳板 HTTP 转发 + 内层登录同时出现时，提醒传输层≠口令否证。不写某题路径。"""
+    if has_live_gadget and (has_internal_hops or postex_pivot):
+        return True
+    blob = _graph_text(graph)
+    gadget = has_live_gadget or bool(_PROXY_AUTH_GADGET_RE.search(blob or ""))
+    login = has_internal_hops or bool(_PROXY_AUTH_LOGIN_RE.search(blob or ""))
+    if gadget and login:
+        return True
+    return bool(postex_pivot and gadget)
+
+
 CONSUME_SESSION_GUIDE = (
     "已有可用凭证：必须消费该会话打后认证功能面。"
     "普通文件/路径参数面：must 至少一格是 file_read_chain 或 access_control；"
@@ -791,8 +851,45 @@ def _intents_block(intents: list[dict], *, limit: int = 12) -> str:
     return "\n".join(lines)
 
 
-async def flag_submission_stats(project_id: str) -> tuple[int, int]:
-    """正确 flag 数、不同错误 flag 数。错旗常只在 events，不落 flags 表。"""
+def platform_correct_flag_count(project: dict | None) -> int | None:
+    """评测子题以平台记分牌为准。换箱后本地 flags 表会留下旧正确值，不能当本题已夺齐。"""
+    if not project:
+        return None
+    cfg = project.get("config") or {}
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            return None
+    if not isinstance(cfg, dict):
+        return None
+    bm = cfg.get("benchmark") or {}
+    if not isinstance(bm, dict) or bm.get("correct_flag_count") is None:
+        return None
+    try:
+        return int(bm["correct_flag_count"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _project_from_config_row(config) -> dict | None:
+    if not config:
+        return None
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except Exception:
+            return None
+    if not isinstance(config, dict):
+        return None
+    return {"config": config}
+
+
+async def flag_submission_stats(project_id: str, project: dict | None = None) -> tuple[int, int]:
+    """正确 flag 数、不同错误 flag 数。错旗常只在 events，不落 flags 表。
+
+    评测子题：平台 `benchmark.correct_flag_count` 优先于本地表里历次容器的正确值。
+    """
     correct_vals: set[str] = set()
     wrong_vals: set[str] = set()
     if not project_id:
@@ -831,10 +928,23 @@ async def flag_submission_stats(project_id: str) -> tuple[int, int]:
             _take(str(p.get("value") or ""), bool(p.get("correct")))
     except Exception:
         pass
-    return len(correct_vals), len(wrong_vals)
+    local_correct = len(correct_vals)
+    local_wrong = len(wrong_vals)
+    if project is None:
+        try:
+            row = await db.fetchone("SELECT config FROM projects WHERE id=?", (project_id,))
+            project = _project_from_config_row((row or {}).get("config"))
+        except Exception:
+            project = None
+    plat = platform_correct_flag_count(project)
+    if plat is not None:
+        return plat, local_wrong
+    return local_correct, local_wrong
 
 
-async def _flags_block(project_id: str) -> str:
+async def _flags_block(
+    project_id: str, *, platform_got: int | None = None, flag_count: int = 0,
+) -> str:
     seen: set[str] = set()
     lines: list[str] = []
 
@@ -871,9 +981,15 @@ async def _flags_block(project_id: str) -> str:
             _add(str(p.get("value") or ""), bool(p.get("correct")))
     except Exception:
         pass
-    if not lines:
-        return "（尚未夺旗）"
-    return "\n".join(lines[:12])
+    body = "\n".join(lines[:12]) if lines else "（尚未夺旗）"
+    if platform_got is None or not flag_count:
+        return body
+    remain = max(0, int(flag_count) - int(platform_got))
+    head = (
+        f"平台记分牌已接受 {int(platform_got)}/{int(flag_count)}，剩余 {remain}。"
+        "下列 ✓ 与图上 goal:flag 含换箱前旧值，条数不是本题进度；禁止当已夺齐收工。"
+    )
+    return head + "\n" + body
 
 
 def _facts_block(facts: SupervisorFacts) -> str:
@@ -890,7 +1006,14 @@ def _facts_block(facts: SupervisorFacts) -> str:
         f"- 已有立足点但无提权/横向能力边：{'是' if facts.postex else '否'}",
         f"- 入口栈/身份与 BRIEF 不一致：{'是' if facts.identity_mismatch else '否'}",
         f"- 图上有未挂载的机器密钥：{'是' if facts.unmounted_secret else '否'}",
-        f"- 正确 flag：{int(facts.correct_flags or 0)}；不同错误 flag：{int(facts.wrong_flags or 0)}",
+        f"- 正确 flag：{int(facts.correct_flags or 0)}"
+        + (
+            f"/{int(facts.flag_count)}，剩余 {max(0, int(facts.flag_count) - int(facts.correct_flags or 0))}"
+            if int(facts.flag_count or 0) > 0 else
+            ""
+        )
+        + f"；不同错误 flag：{int(facts.wrong_flags or 0)}"
+        + ("。评测以记分牌为准，禁止把本地旧 ✓ 或图上 goal:flag 当成已夺齐。" if int(facts.flag_count or 0) > 0 else ""),
     ]
     if facts.claim_unverified:
         lines.append(
@@ -901,11 +1024,14 @@ def _facts_block(facts: SupervisorFacts) -> str:
         lines.append("- " + INVERT_OPS_GUIDE)
     if facts.postex_pivot:
         lines.append("- " + POSTEX_PIVOT_GUIDE)
+    if facts.proxy_auth:
+        lines.append("- " + PROXY_AUTH_GUIDE)
     if facts.pending_internal:
         lines.append(
             "- 待扩容内网主机（图上已出现、尚未 Scope，不是邻题）："
             + "、".join(facts.pending_internal[:8])
-            + "。next_plan 必须先 report_pivot_capability，再经已有 shell/SSRF 打，禁止 Kali 直连。"
+            + "。next_plan 必须先 report_pivot_capability，再经已有 shell/SSRF 或立足点隧道+本机 ssh 打；"
+            "禁止无跳板 Kali 直连，禁止打攻击机 docker。"
         )
     if facts.chain_close:
         lines.append("- " + CHAIN_CLOSE_GUIDE)
@@ -1121,13 +1247,11 @@ async def assemble_supervisor_brief(
             if not _intent_cites_peer(i, facts.peer_entries)
         ]
     try:
-        c_flags, w_flags = await flag_submission_stats(project_id)
+        c_flags, w_flags = await flag_submission_stats(project_id, project=proj)
     except Exception:
         c_flags, w_flags = 0, 0
-    if not facts.correct_flags:
-        facts.correct_flags = int(c_flags or 0)
-    if not facts.wrong_flags:
-        facts.wrong_flags = int(w_flags or 0)
+    facts.correct_flags = int(c_flags or 0)
+    facts.wrong_flags = int(w_flags or 0)
     if not facts.claim_unverified:
         facts.claim_unverified = claimed_secret_disproved(
             plan=f"{facts.last_plan or ''} {facts.last_diagnosis or ''}",
@@ -1166,6 +1290,17 @@ async def assemble_supervisor_brief(
         or int(facts.flag_count or 0) > 1
     ):
         facts.postex_pivot = True
+    try:
+        from ..graph.hypothesize import live_gadget_tactics
+        _gadget = bool(live_gadget_tactics(graph))
+    except Exception:
+        _gadget = False
+    facts.proxy_auth = needs_proxy_auth_guidance(
+        graph,
+        postex_pivot=bool(facts.postex_pivot),
+        has_live_gadget=_gadget,
+        has_internal_hops=bool(facts.pending_internal),
+    )
     facts.chain_close = bool(facts.chain_live) and not bool(facts.postex_pivot)
     if not facts.channel_oracle_open:
         try:
@@ -1304,7 +1439,11 @@ async def assemble_supervisor_brief(
         _intents_block(open_intents or [], limit=intent_limit),
         "",
         "## 已夺 flag",
-        await _flags_block(project_id),
+        await _flags_block(
+            project_id,
+            platform_got=int(facts.correct_flags or 0) if facts.flag_count else None,
+            flag_count=int(facts.flag_count or 0),
+        ),
     ])
     text = "\n".join(parts)
     if len(text) > budget:

@@ -32,9 +32,6 @@ _FAMILY_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bspring\b",
         r"\bjsessionid\b",
         r"\.jsp(?:\b|\?|$|/)",
-        r"\bweaver\b",
-        r"\becology\b",
-        r"泛微",
     ),
     "aspnet": (
         r"\basp\.net\b",
@@ -150,8 +147,14 @@ async def probe_entry_http(
     must = False
     try:
         from ..proxy.pool import pool
+        from ..proxy.yakit import prepare_egress, should_use_yakit
         must = pool.must_proxy(objective)
-        if must:
+        if should_use_yakit(objective):
+            eg = await prepare_egress(objective)
+            if eg.refuse:
+                return {}
+            proxy = eg.proxy
+        elif must:
             proxy = await pool.wait_pick(8.0)
             if not proxy:
                 return {}

@@ -13,6 +13,34 @@ INFRA_ALLOWLIST = {
     "gitlab.com", "registry.npmjs.org",
 }
 
+# 不引入完整 PSL；仅覆盖常见两段后缀
+_MULTI_PART_TLDS = frozenset({
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+    "co.uk", "org.uk", "ac.uk", "gov.uk",
+    "co.jp", "or.jp", "ne.jp", "ac.jp",
+    "com.au", "net.au", "org.au", "co.nz",
+    "com.tw", "com.hk", "co.kr",
+})
+
+_PUBLIC_ECHO_HOSTS = frozenset({
+    "icanhazip.com", "ipv4.icanhazip.com", "ipv6.icanhazip.com",
+    "api.ipify.org", "ifconfig.me", "ifconfig.co", "ip.sb", "ipinfo.io",
+})
+_PUBLIC_DOC_HOSTS = frozenset({
+    "nvd.nist.gov", "cve.org", "www.cve.org", "cvedetails.com",
+    "exploit-db.com", "www.exploit-db.com", "attack.mitre.org",
+})
+_OOB_EXACT = frozenset({
+    "dnslog.cn", "ceye.io", "interact.sh", "oastify.com",
+    "webhook.site", "requestbin.net",
+})
+_OOB_SUFFIXES = (
+    ".dnslog.cn", ".dnslog.io", ".ceye.io", ".interact.sh", ".oastify.com",
+    ".burpcollaborator.net", ".webhook.site", ".requestbin.net",
+    ".ngrok.io", ".ngrok-free.app", ".ngrok.app", ".loca.lt",
+    ".iyhc.eu.org", ".lfcx.eu.org", ".zaza.eu.org",
+)
+
 _IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _HOSTNAME_IN_TEXT_RE = re.compile(
     r"(?:https?://)?("
@@ -22,6 +50,14 @@ _HOSTNAME_IN_TEXT_RE = re.compile(
     r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)+"
     r")(?::\d{1,5})?",
 )
+
+# 路径后缀，不能当 FQDN（robots.txt / _buildManifest.js）
+_FILE_LIKE_TLD = frozenset({
+    "txt", "xml", "js", "mjs", "cjs", "ts", "tsx", "jsx", "json", "map",
+    "html", "htm", "css", "scss", "png", "jpg", "jpeg", "gif", "svg", "webp",
+    "ico", "woff", "woff2", "ttf", "eot", "pdf", "zip", "gz", "tgz", "md",
+    "yml", "yaml", "toml", "lock", "log", "php", "asp", "aspx", "jsp",
+})
 
 
 def _norm_host(host: str) -> str:
@@ -135,16 +171,151 @@ def unauthorized_private_host(
 
 
 def private_out_of_scope_hint(why: str = "") -> str:
-    """未扩容私网：引导 report_pivot 经已有通道打，不要写成邻题、不要 Kali 直连。"""
+    """未扩容私网：引导 report_pivot 经已有通道打，不要写成邻题、不要无跳板 Kali 直连。"""
     head = (why or "").strip()
     if head and not head.endswith("。"):
         head += "。"
     return (
-        f"{head}不要 Kali 直连。"
+        f"{head}不要无跳板 Kali 直连。"
         "本题立足点、SSRF、备份或 SQL 里出现的 RFC1918 是本题内网，不是邻题入口。"
-        "先 report_pivot_capability 扩进 Scope，再经已有 shell 或已验证 SSRF/代理参数打。"
+        "先 report_pivot_capability 扩进 Scope，再经已有 shell、已验证 SSRF/代理参数，"
+        "或立足点隧道 + 本机 ssh/sshpass 打。"
         "攻击机 docker 网桥不是题目内网。"
     )
+
+
+def public_out_of_scope_hint(why: str = "") -> str:
+    """公网越界：作业对象是填写主机的注册域，不要改打同品牌其它 TLD。"""
+    head = (why or "").strip()
+    if head and not head.endswith("。"):
+        head += "。"
+    return (
+        f"{head}只打作业对象填写主机的注册域；"
+        "页面/JS/iframe 里出现的其它注册域不能当第一跳，可作 SSRF 载荷参数。"
+        "OOB/dnslog 与 CVE 文档域名除外。"
+    )
+
+
+def registrable_domain(host: str) -> str:
+    """eTLD+1。IP 原样；example.com.cn → example.com.cn。"""
+    h = _norm_host(host)
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if h.startswith("www.") and "." in h[4:]:
+        h = h[4:]
+    if not h:
+        return ""
+    if _IP_RE.match(h):
+        return h
+    parts = [p for p in h.split(".") if p]
+    if len(parts) < 2:
+        return h
+    last2 = ".".join(parts[-2:])
+    if last2 in _MULTI_PART_TLDS and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return last2
+
+
+def is_oob_or_infra_host(host: str) -> bool:
+    """工具链 / CVE 文档 / 出口探测 / DNSLog：允许作为连接目标。"""
+    h = _norm_host(host)
+    if not h:
+        return False
+    if h in INFRA_ALLOWLIST or h in _PUBLIC_ECHO_HOSTS or h in _PUBLIC_DOC_HOSTS or h in _OOB_EXACT:
+        return True
+    for t in INFRA_ALLOWLIST | _PUBLIC_ECHO_HOSTS | _PUBLIC_DOC_HOSTS:
+        if _IP_RE.match(t):
+            continue
+        apex = registrable_domain(t)
+        if apex and registrable_domain(h) == apex:
+            return True
+        if h == t or h.endswith("." + t):
+            return True
+    for suf in _OOB_SUFFIXES:
+        if h.endswith(suf) or h == suf[1:]:
+            return True
+    if ".oast." in h or h.startswith("oast."):
+        return True
+    return False
+
+
+def is_plausible_dns_host(host: str) -> bool:
+    """正文里抽到的名字是否像公网 FQDN。robots.txt / 10.0.0.1-http 不当主机。"""
+    h = _norm_host(host)
+    if not h or _IP_RE.match(h):
+        return False
+    if "." not in h:
+        return False
+    tld = h.rsplit(".", 1)[-1]
+    if not tld.isalpha() or tld in _FILE_LIKE_TLD or len(tld) < 2:
+        return False
+    labels = [p for p in h.split(".") if p]
+    if len(labels) < 2:
+        return False
+    if any(lab.isdigit() for lab in labels):
+        return False
+    return True
+
+
+def public_hosts_in_text(*texts: str) -> list[str]:
+    blob = " ".join(str(t or "") for t in texts)
+    out: list[str] = []
+    for raw in _HOSTNAME_IN_TEXT_RE.findall(blob):
+        h = _norm_host(str(raw or "").split(":")[0])
+        if not h or _IP_RE.match(h) or h in out:
+            continue
+        if is_plausible_dns_host(h):
+            out.append(h)
+    return out
+
+
+def unauthorized_public_host(
+    host: str,
+    scope: "Scope | None",
+    *,
+    primary: str = "",
+) -> str | None:
+    """公网 FQDN 不在作业对象注册域内：视为打歪。IP 交给私网闸。
+
+    同注册域子域放行；其它注册域拦截。INFRA / OOB / 文档域名除外。
+    """
+    h = _norm_host(host)
+    if not h or _IP_RE.match(h):
+        return None
+    if is_oob_or_infra_host(h):
+        return None
+    if scope is not None:
+        try:
+            if scope.host_in_scope(h):
+                return None
+        except Exception:
+            pass
+    apexes = authorized_registrable_domains(scope, primary)
+    h_reg = registrable_domain(h)
+    if h_reg and h_reg in apexes:
+        return None
+    shown = "、".join(apexes) or _norm_host(str(primary or "").split(":")[0]) or "当前作业对象"
+    return f"{h} 不是作业对象（授权注册域 {shown}，不要改打同品牌其它域）"
+
+
+def authorized_registrable_domains(scope: "Scope | None", primary: str = "") -> list[str]:
+    """当前作业对象的公网注册域（eTLD+1），按填写主机现算，不写死站点。"""
+    names: list[str] = []
+    if primary:
+        names.append(str(primary).split(":")[0])
+    if scope is not None:
+        names.extend(str(t).split(":")[0] for t in (scope.targets or []) if t)
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in names:
+        h = _norm_host(t)
+        if not h or _IP_RE.match(h):
+            continue
+        apex = registrable_domain(h)
+        if apex and apex not in seen:
+            seen.add(apex)
+            out.append(apex)
+    return out
 
 
 def www_aliases(host: str) -> set[str]:
@@ -484,6 +655,61 @@ def attacker_loopback_forbidden(
     return f"{ch} 是回环地址，禁止直连本机"
 
 
+def _docker_bridge_ifaces() -> list[tuple[str, ipaddress.IPv4Network]]:
+    """本机 docker0 / br-* 二层网段（Kali 直连会 ARP 到攻击机容器）。"""
+    rows: list[tuple[str, ipaddress.IPv4Network]] = []
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["ip", "-o", "-4", "addr", "show"],
+            text=True, timeout=2, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return rows
+    for line in (out or "").splitlines():
+        cols = line.split()
+        if len(cols) < 4:
+            continue
+        iface = cols[1].rstrip(":")
+        if iface != "docker0" and not iface.startswith("br-"):
+            continue
+        m = _IFACE_INET_RE.search(line)
+        if not m:
+            continue
+        try:
+            net = ipaddress.IPv4Network(f"{m.group(1)}/{int(m.group(2))}", strict=False)
+        except Exception:
+            continue
+        if isinstance(net, ipaddress.IPv4Network):
+            rows.append((iface, net))
+    return rows
+
+
+def on_local_docker_bridge(host: str, *, allow: set[str] | None = None) -> str | None:
+    """目的 IP 落在本机 docker 网桥上：即使已写入 Scope，Kali 直连也不是题内网。
+
+    题目入口经 allow 放行。SSRF/webshell 载荷里的内网地址不走本函数
+    （extract_hosts 只取外层入口）。
+    """
+    h = _norm_host(host)
+    if not h:
+        return None
+    allowed = {_norm_host(str(x).split(":")[0]) for x in (allow or ()) if x}
+    if h in allowed:
+        return None
+    try:
+        ip = ipaddress.IPv4Address(h)
+    except Exception:
+        return None
+    for iface, net in _docker_bridge_ifaces():
+        if ip in net:
+            return (
+                f"{h} 落在攻击机 docker 网桥 {iface}（{net}）上，"
+                "Kali 直连会打到本机容器，不是题内网"
+            )
+    return None
+
+
 def attacker_lan_forbidden(
     host: str,
     *,
@@ -491,7 +717,7 @@ def attacker_lan_forbidden(
     self_networks: list[ipaddress.IPv4Network] | None = None,
     authorized: set[str] | None = None,
 ) -> str | None:
-    """Kali 直连本机网卡或物机网关：禁止。不按网卡前缀把整段当成办公网。"""
+    """Kali 直连本机网卡或物机网关：禁止。不按网卡前缀把整段当成作业对象。"""
     del self_networks, authorized
     h = _norm_host(host)
     if not h:
@@ -644,6 +870,44 @@ def _entry_slash24s(scope: "Scope") -> list[ipaddress.IPv4Network]:
         if ip.version == 4:
             out.append(ipaddress.ip_network(f"{ip}/24", strict=False))
     return out
+
+
+def same_pivot_lan(host: str, scope: "Scope | None") -> bool:
+    """已扩容内网主机的同 /24 同胞。可写图 / 可逐台 report_pivot，不等于授权 Kali 直连。
+
+    不含入口 /24（评测 VPN / 邻题容器）。
+    """
+    if scope is None:
+        return False
+    h = _norm_host(host)
+    if not h or not is_private_ip(h):
+        return False
+    try:
+        addr = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    if addr.version != 4 or not addr.is_private:
+        return False
+    entry = {_norm_host(str(t)) for t in (scope.targets or [])}
+    if h in entry:
+        return False
+    for en in _entry_slash24s(scope):
+        if addr in en:
+            return False
+    for raw in scope.ips or []:
+        ph = _norm_host(str(raw))
+        if not ph or ph in entry:
+            continue
+        try:
+            paddr = ipaddress.ip_address(ph)
+        except ValueError:
+            continue
+        if paddr.version != 4 or not paddr.is_private:
+            continue
+        net = ipaddress.ip_network(f"{paddr}/24", strict=False)
+        if addr in net:
+            return True
+    return False
 
 
 def network_is_pivot_lan(net: ipaddress.IPv4Network, scope: "Scope") -> bool:

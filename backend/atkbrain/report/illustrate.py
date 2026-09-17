@@ -198,6 +198,10 @@ def graph_svg(graph: dict, *, max_nodes: int = 56) -> str:
         why = str(e.get("rationale") or "").lower()
         hop = rel == "LEADS_TO" and (
             "pivot_capability" in why
+            or str(e.get("from") or e.get("src") or "").startswith("vuln:")
+            and (
+                str(e.get("to") or e.get("dst") or "").startswith(("info:host:", "info:scope-expanded:", "target:"))
+            )
             or (
                 str(e.get("to") or e.get("dst") or "").startswith(("info:host:", "info:scope-expanded:"))
                 and str(e.get("from") or e.get("src") or "").startswith(("foothold:", "goal:shell"))

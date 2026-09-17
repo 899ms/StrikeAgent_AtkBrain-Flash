@@ -10,6 +10,30 @@ from dataclasses import dataclass
 from ..config import settings
 from .guard import Guard, GuardDecision
 
+_LIVE_CMDS: dict[int, str] = {}
+
+
+def kill_cmds_for_project(project_id: str) -> int:
+    """停猎时杀掉本项目仍在跑的 shell（start_new_session，取消 await 会漏）。"""
+    want = (project_id or "").strip()
+    if not want:
+        return 0
+    n = 0
+    for pid, owner in list(_LIVE_CMDS.items()):
+        if owner != want:
+            continue
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        _LIVE_CMDS.pop(pid, None)
+        n += 1
+    return n
+
+
 _PROXY_ENV_KEYS = (
     "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
     "ALL_PROXY", "all_proxy", "no_proxy", "NO_PROXY",
@@ -34,6 +58,7 @@ async def run_shell(
     guard: Guard,
     timeout: int | None = None,
     extra_env: dict[str, str] | None = None,
+    project_id: str | None = None,
 ) -> CmdResult:
     decision: GuardDecision = guard.check_command(command)
     if not decision.allow:
@@ -50,25 +75,30 @@ async def run_shell(
             limit = int(getattr(settings, "cmd_timeout", 0) or 0)
     t0 = time.monotonic()
     env = None
-    if extra_env:
+    if extra_env or project_id:
         from ..objective import objective_allows_flag
-        if objective_allows_flag(getattr(guard, "objective", None)):
+        via_yakit = str((extra_env or {}).get("ATKBRAIN_YAKIT_MITM") or "") == "1"
+        if extra_env and objective_allows_flag(getattr(guard, "objective", None)) and not via_yakit:
             extra_env = None
-    if extra_env:
+    if extra_env or project_id:
         env = os.environ.copy()
-        env.update(extra_env)
+        if extra_env:
+            env.update(extra_env)
+        if project_id:
+            env["ATKBRAIN_PROJECT_ID"] = str(project_id)
+        via_yakit = str((extra_env or {}).get("ATKBRAIN_YAKIT_MITM") or "") == "1"
         try:
-            from ..proxy.enforce import proxy_url_from_env, wrap_proxychains
-            from ..proxy.pool import pool as _proxy_pool
-            chain = _proxy_pool.pick_chain(8)
-            px = proxy_url_from_env(extra_env)
-            if px and px not in chain:
-                chain = [px, *[u for u in chain if u != px]]
-            if chain:
-                command = wrap_proxychains(command, chain)
-                # connect() 由 proxychains 接管；清掉 env，避免 curl 再套一层代理。
-                for k in _PROXY_ENV_KEYS:
-                    env.pop(k, None)
+            if extra_env and not via_yakit:
+                from ..proxy.enforce import proxy_url_from_env, wrap_proxychains
+                from ..proxy.pool import pool as _proxy_pool
+                chain = _proxy_pool.pick_chain(8)
+                px = proxy_url_from_env(extra_env)
+                if px and px not in chain:
+                    chain = [px, *[u for u in chain if u != px]]
+                if chain:
+                    command = wrap_proxychains(command, chain)
+                    for k in _PROXY_ENV_KEYS:
+                        env.pop(k, None)
         except FileNotFoundError as e:
             return CmdResult(
                 exit_code=-1, stdout="", stderr=str(e),
@@ -94,11 +124,26 @@ async def run_shell(
             env=env,
             start_new_session=True,
         )
+        if proc.pid and project_id:
+            _LIVE_CMDS[int(proc.pid)] = str(project_id)
         try:
             if limit <= 0:
                 out_b, err_b = await proc.communicate()
             else:
                 out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=limit)
+        except asyncio.CancelledError:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            raise
         except asyncio.TimeoutError:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -115,8 +160,13 @@ async def run_shell(
             stderr=(err_b or b"").decode("utf-8", "replace"),
             duration=round(time.monotonic() - t0, 2),
         )
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         return CmdResult(
             exit_code=-1, stdout="", stderr=str(e),
             duration=time.monotonic() - t0,
         )
+    finally:
+        if "proc" in locals() and getattr(proc, "pid", None):
+            _LIVE_CMDS.pop(int(proc.pid), None)

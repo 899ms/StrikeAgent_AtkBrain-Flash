@@ -1,7 +1,6 @@
 """按项目暴露图工具：Streamable HTTP MCP + 本地 REST（给 DSH 运行时插件桥接）。"""
 from __future__ import annotations
 
-import json
 import uuid
 from typing import Any
 
@@ -10,6 +9,33 @@ from fastapi.responses import JSONResponse, Response
 
 from .context import AgentContext
 from .tools import mcp_tool_defs, mcp_tool_map
+
+
+async def _yakit_defs(ctx: AgentContext | None) -> list[dict]:
+    if ctx is None:
+        return []
+    try:
+        from ..proxy.yakit import yakit
+        return await yakit.hunter_tool_defs(objective=ctx.objective, project=ctx.project)
+    except Exception:
+        return []
+
+
+async def _yakit_names(pid: str) -> set[str]:
+    extra = await _yakit_defs(_CTX.get(pid))
+    return {str(t.get("name") or "") for t in extra if t.get("name")}
+
+
+async def _merged_defs(pid: str) -> list[dict]:
+    defs = list(_DEFS.get(pid) or [])
+    extra = await _yakit_defs(_CTX.get(pid))
+    names = {str(d.get("name") or "") for d in defs}
+    for t in extra:
+        n = str(t.get("name") or "")
+        if n and n not in names:
+            defs.append(t)
+            names.add(n)
+    return defs
 
 router = APIRouter()
 
@@ -64,13 +90,32 @@ async def _dispatch(pid: str, body: dict) -> dict | None:
     if method == "ping":
         return _rpc_result(rid, {})
     if method == "tools/list":
-        return _rpc_result(rid, {"tools": _DEFS.get(pid) or []})
+        return _rpc_result(rid, {"tools": await _merged_defs(pid)})
     if method == "tools/call":
         name = str(params.get("name") or "")
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         fns = _TOOLS.get(pid) or {}
         fn = fns.get(name)
         if fn is None:
+            ctx = _CTX.get(pid)
+            if ctx is not None and name in await _yakit_names(pid):
+                try:
+                    from ..proxy.yakit import yakit
+                    out = await yakit.hunter_call(
+                        name, args,
+                        objective=ctx.objective, project=ctx.project,
+                        scope_check=ctx._http_blocked,
+                    )
+                    content = out.get("content") if isinstance(out, dict) else [{"type": "text", "text": str(out)}]
+                    return _rpc_result(rid, {
+                        "content": content,
+                        "isError": bool(isinstance(out, dict) and out.get("is_error")),
+                    })
+                except Exception as e:
+                    return _rpc_result(rid, {
+                        "content": [{"type": "text", "text": str(e)[:400]}],
+                        "isError": True,
+                    })
             return _rpc_result(rid, {
                 "content": [{"type": "text", "text": f"unknown tool {name}"}],
                 "isError": True,
@@ -131,22 +176,56 @@ async def mcp_endpoint(pid: str, request: Request, path: str = ""):
 async def list_agent_tools(pid: str):
     if pid not in _CTX:
         return JSONResponse({"detail": "project tools not registered"}, status_code=404)
-    return {"tools": _DEFS[pid]}
+    return {"tools": await _merged_defs(pid)}
 
 
 @router.post("/projects/{pid}/agent-tools/{name}")
 async def call_agent_tool(pid: str, name: str, request: Request):
     if pid not in _CTX:
         return JSONResponse({"detail": "project tools not registered"}, status_code=404)
+    try:
+        from ..engine.scheduler import manager as _mgr
+        if not _mgr.is_running(pid) and not _mgr.is_queued(pid):
+            return JSONResponse(
+                {"text": "hunt stopped", "is_error": True}, status_code=409,
+            )
+    except Exception:
+        pass
+    role = (request.headers.get("x-atkbrain-role") or "").strip().lower()
+    if role == "lead" and name in ("http_request", "http_fuzzer", "web_crawler"):
+        return {
+            "text": "从者不要自己打 HTTP，交给工人 src-hunt/web-exploit/recon。你只计划、写图与汇总。",
+            "is_error": True,
+        }
     fn = (_TOOLS.get(pid) or {}).get(name)
-    if fn is None:
-        return JSONResponse({"text": f"unknown tool {name}", "is_error": True}, status_code=404)
     try:
         args = await request.json()
     except Exception:
         args = {}
     if not isinstance(args, dict):
         args = {}
+    if fn is None:
+        ctx = _CTX.get(pid)
+        if ctx is not None and name in await _yakit_names(pid):
+            try:
+                from ..proxy.yakit import yakit
+                out = await yakit.hunter_call(
+                    name, args,
+                    objective=ctx.objective, project=ctx.project,
+                    scope_check=ctx._http_blocked,
+                )
+                text = ""
+                if isinstance(out, dict):
+                    content = out.get("content") or []
+                    if isinstance(content, list):
+                        text = "\n".join(
+                            str(c.get("text") or "") for c in content if isinstance(c, dict)
+                        )
+                    return {"text": text, "is_error": bool(out.get("is_error"))}
+                return {"text": str(out), "is_error": False}
+            except Exception as e:
+                return JSONResponse({"text": str(e)[:400], "is_error": True}, status_code=502)
+        return JSONResponse({"text": f"unknown tool {name}", "is_error": True}, status_code=404)
     out = await fn(args)
     text = ""
     if isinstance(out, dict):

@@ -711,6 +711,13 @@ async def _bind_container(sub_project: dict, addrs: list) -> dict:
                 target = h
     if surfaces:
         cfg["benchmark"]["entry_surface"] = surfaces
+    new_h = str(target or "").split(":")[0].strip().lower()
+    peer_ips = {
+        str(p or "").split(":")[0].strip().lower()
+        for p in (peers or ()) if p
+    }
+    if new_h and new_h in peer_ips:
+        target = t if t and t not in peer_ips else None
     await db.execute(
         "UPDATE projects SET target=?, ports=?, scope=?, config=?, updated_at=? WHERE id=?",
         (target, _dumps(scope.ports), _dumps(scope.to_dict()), _dumps(cfg), now(), sub_project["id"]),

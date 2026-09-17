@@ -57,33 +57,47 @@ def ssrf_gateway_hosts(graph: dict | None) -> set[str]:
 
     for n in graph.get("nodes") or []:
         key = str(n.get("key") or "")
-        if not key.startswith("info:scope-expanded:"):
-            continue
         detail = str(n.get("detail") or "").lower()
         blob = f"{key} {n.get('title') or ''} {detail}"
         tags = n.get("tags") or []
         if isinstance(tags, str):
             tags = [tags]
         tagset = {str(t).lower() for t in tags}
+        if key.startswith("info:scope-expanded:"):
+            pass
+        elif key.startswith("target:") and (
+            "ssrf" in tagset or "pivot" in tagset or "scope-expanded" in tagset
+            or "ssrf" in blob or any(m in blob for m in markers)
+        ):
+            pass
+        else:
+            continue
         via_ssrf = any(m in blob for m in markers) or "ssrf" in blob or any(
             str(t).startswith("ssrf") for t in tagset
         )
         if not via_ssrf:
             continue
-        _absorb(key.split(":", 2)[-1])
+        if key.startswith("target:"):
+            _absorb(key.split(":", 1)[-1])
+        else:
+            _absorb(key.split(":", 2)[-1])
         for t in tagset:
             if t.startswith("host:"):
                 _absorb(t[5:])
     for e in graph.get("edges") or []:
         rel = str(e.get("relation") or "").upper()
-        if rel and rel != "PIVOTS_TO":
-            continue
         rat = str(e.get("rationale") or e.get("detail") or "").lower()
-        if not any(m in rat for m in markers) and "ssrf" not in rat:
+        if rel == "PIVOTS_TO":
+            if not any(m in rat for m in markers) and "ssrf" not in rat:
+                continue
+        elif rel == "LEADS_TO":
+            if "pivot_capability" not in rat and "ssrf" not in rat:
+                continue
+        else:
             continue
         dst = str(e.get("to") or e.get("dst") or "")
         if dst.startswith("target:"):
-            _absorb(dst[7:])
+            _absorb(dst.split(":", 1)[-1])
         elif dst.startswith("info:host:"):
             _absorb(dst.split(":", 2)[-1])
         elif dst.startswith("info:scope-expanded:"):
@@ -132,6 +146,14 @@ async def _peer_challenge_enabled(row) -> bool:
         if prow:
             parent_cfg = _as_project_cfg(prow["config"])
     return cluster_uses_peer_challenge(own, parent_cfg)
+
+
+_PEER_INACTIVE = frozenset({"completed", "failed"})
+
+
+def sibling_still_peer_entry(status: str | None) -> bool:
+    """已收口子题的入口 IP 会被平台回收给正在跑的题，不能再当邻题。"""
+    return str(status or "").strip().lower() not in _PEER_INACTIVE
 
 
 def merge_scope_keep_pivots(
@@ -187,12 +209,14 @@ async def peer_challenge_entry_addrs(project_id: str) -> set[str]:
         own_proj["config"] = _loads(own_proj["config"]) or {}
     own = set(project_entry_addrs(own_proj))
     sibs = await _db.fetchall(
-        "SELECT id, target, ports, config FROM projects WHERE parent_id=?",
+        "SELECT id, target, ports, config, status FROM projects WHERE parent_id=?",
         (row["parent_id"],),
     )
     out: set[str] = set()
     for s in sibs or []:
         if str(s["id"]) == str(project_id):
+            continue
+        if not sibling_still_peer_entry(s.get("status")):
             continue
         host = _norm_host(str(s["target"] or "").split(":")[0])
         ports: list[int] = []
@@ -252,12 +276,14 @@ async def peer_challenge_entry_hosts(project_id: str) -> set[str]:
         own_proj["config"] = _loads(own_proj["config"]) or {}
     own_hosts = project_entry_hosts(own_proj)
     sibs = await _db.fetchall(
-        "SELECT id, target, config FROM projects WHERE parent_id=?",
+        "SELECT id, target, config, status FROM projects WHERE parent_id=?",
         (row["parent_id"],),
     )
     out: set[str] = set()
     for s in sibs or []:
         if str(s["id"]) == str(project_id):
+            continue
+        if not sibling_still_peer_entry(s.get("status")):
             continue
         t = _norm_host(str(s["target"] or "").split(":")[0])
         if t and _IP_RE.match(t):
@@ -309,13 +335,28 @@ async def hydrate_scope_from_graph(
     if not project_id:
         return False
     rows = await _db.fetchall(
-        "SELECT key, tags FROM nodes WHERE project_id=? AND key LIKE 'info:scope-expanded:%'",
+        """SELECT key, type, tags FROM nodes WHERE project_id=? AND (
+             key LIKE 'info:scope-expanded:%' OR key LIKE 'info:host:%'
+             OR (type='target' AND key LIKE 'target:%')
+           )""",
         (project_id,),
     )
     reject = {_norm_host(h) for h in (reject_hosts or ()) if h}
     added = False
     for r in rows or []:
-        for raw in _hosts_from_scope_node(r["key"], r["tags"] if "tags" in r.keys() else None):
+        tags_raw = r["tags"] if "tags" in r.keys() else None
+        tagset = set()
+        if isinstance(tags_raw, str):
+            try:
+                import json as _json
+                tagset = {str(t).lower() for t in (_json.loads(tags_raw) or [])}
+            except Exception:
+                tagset = {str(tags_raw).lower()}
+        elif tags_raw:
+            tagset = {str(t).lower() for t in tags_raw}
+        if "entry" in tagset:
+            continue
+        for raw in _hosts_from_scope_node(r["key"], tags_raw):
             h = _norm_host(raw)
             if not h or h in reject or scope._explicit_member(h):
                 continue
@@ -357,6 +398,16 @@ async def try_expand_scope(
     if is_attacker_identity(dst) or is_loopback(dst):
         result["reason"] = "attacker_or_loopback"
         return result
+    try:
+        from .engine.intranet_reach import is_ssrf_canary_host, ssrf_evidence_is_oracle_only
+        if is_ssrf_canary_host(dst):
+            result["reason"] = "ssrf_canary"
+            return result
+        if (mechanism or "").startswith("ssrf") and ssrf_evidence_is_oracle_only(evidence):
+            result["reason"] = "ssrf_oracle_only"
+            return result
+    except Exception:
+        pass
     if dst in {_norm_host(x) for x in local_self_hosts()}:
         result["reason"] = "attacker_or_loopback"
         return result
@@ -406,14 +457,14 @@ async def try_expand_scope(
             await gstore.upsert_node(
                 project_id,
                 NodeIn(
-                    key=f"info:scope-expanded:{dst}",
-                    type="info",
-                    title=f"内网资产 {dst} 加入 Scope",
+                    key=f"target:{dst}",
+                    type="target",
+                    title=f"内网目标 {dst}",
                     detail=(
                         f"通过 {mechanism} 触发扩容；跳板：{src or '未知'}；"
                         f"证据摘要：{(evidence or '')[:280]}"
                     ),
-                    tags=["scope", "pivot", f"host:{dst}", "internal"]
+                    tags=["scope", "pivot", f"host:{dst}", "internal", "scope-expanded"]
                     + (["ssrf"] if mechanism.startswith("ssrf") else []),
                 ),
                 run_id=run_id,

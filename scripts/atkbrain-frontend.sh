@@ -63,8 +63,8 @@ cmd_restart() {
 cmd_status() {
   systemctl --no-pager --full status atkbrain-flash-frontend.service || true
   echo "---"
-  code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:5001/ 2>/dev/null || echo 000)"
-  echo "vite: HTTP $code (5001)"
+  code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:2334/ 2>/dev/null || echo 000)"
+  echo "vite: HTTP $code (2334)"
 }
 
 cmd_logs() {

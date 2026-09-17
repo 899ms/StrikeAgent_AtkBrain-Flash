@@ -85,7 +85,14 @@ function hostOfNode(n: { key: string; type?: string; tags?: string[] }) {
   return "";
 }
 
-/** 跳板发现内网（SSRF/shell 可达），尚未在邻机落下已验证 shell。 */
+/** 跳板发现内网（SSRF/shell 可达）：漏洞 → 新内网目标。 */
+function isRfc1918Host(host: string) {
+  const p = host.split(".").map((x) => Number(x));
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+  const a = p[0], b = p[1];
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
 function isPivotDiscoveryEdge(e: { relation?: string; rationale?: string; from?: string; to?: string }) {
   if (e.relation === "PIVOTS_TO") return false;
   if (e.relation && e.relation !== "LEADS_TO") return false;
@@ -93,9 +100,13 @@ function isPivotDiscoveryEdge(e: { relation?: string; rationale?: string; from?:
   if (why.includes("pivot_capability")) return true;
   const to = String(e.to || "");
   const from = String(e.from || "");
-  const dstHost = to.startsWith("info:host:") || to.startsWith("info:scope-expanded:");
+  const srcVuln = from.startsWith("vuln:");
+  const dstOldInfo = to.startsWith("info:host:") || to.startsWith("info:scope-expanded:");
+  const dstHost = to.startsWith("target:") ? to.slice(7).split(":")[0] : "";
+  const dstIntranetTarget = to.startsWith("target:") && isRfc1918Host(dstHost);
+  if (srcVuln && (dstIntranetTarget || dstOldInfo)) return true;
   const srcCtrl = from.startsWith("foothold:") || from.startsWith("goal:shell");
-  return dstHost && srcCtrl;
+  return dstOldInfo && srcCtrl;
 }
 
 /**
@@ -1081,12 +1092,12 @@ export function AttackGraph({ graph, onSelect, selectedKey, onClear }: { graph: 
           <i style={{ width: 16, height: 3, background: "var(--primary)", display: "inline-block" }} /> RCE 最优路径
         </span>
         <span className="row">
-          <i style={{ width: 16, height: 3, background: lateralColor, display: "inline-block" }} /> 内网横向 (shell→新主机)
+          <i style={{ width: 16, height: 3, background: lateralColor, display: "inline-block" }} /> 内网横向 (漏洞→新目标)
         </span>
         <span className="row">
           <i style={{
             width: 16, height: 0, borderTop: `2px dashed ${lateralColor}`, display: "inline-block", opacity: 0.85,
-          }} /> 跳板可达 (发现内网)
+          }} /> 跳板可达 (漏洞→新内网)
         </span>
         <span className="row">
           <span style={{

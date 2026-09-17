@@ -14,6 +14,19 @@ SRC = "src"
 ROLE_EXECUTOR = "从者"  # 攻击主会话
 ROLE_MASTER = "御主"  # 顾问会话
 
+BUSINESS_SAFE_WRITE_BRIEF = """\
+红队与 SRC 共用：洞要报，状态不要改。http/https 同一套。
+可注册只用自己的 2 个测试号做越权；不可注册则停在证明能登，不改线上用户。
+越权读真实数据不超过 5 条，禁止脚本扫穿。
+条件竞争只证明缺锁，禁止对真实库存/优惠券/名额打爆。
+支付改价/重复支付/0 元购看回包差分，不提交落地、不真退款。
+改密/越权重置只证明 token/IDOR，不覆盖已有管理员口令。
+存储 XSS 用 console.log，禁止 alert 打到他人；测完删自己的 payload。
+禁止 hydra/喷口令把线上账号锁死；禁止对有关系链的号做社交蠕虫。
+禁止批量注册/灌评论/刷单、短信邮件轰炸、改生产配置、关服务、持久 webshell。
+RCE 只写无害短 txt canary，取回即删。
+"""
+
 RT_GETSHELL = "getshell"
 RT_DATA_ACCESS = "data_access"
 RT_ADMIN_ACCESS = "admin_access"
@@ -79,8 +92,10 @@ phpinfo/指纹/Banner 不算漏洞。
 禁止高危破坏：DoS、打满磁盘、删库删站、改生产配置、关服务、持久化 webshell。
 禁止无限制写垃圾：批量注册/灌评论/刷订单、INSERT/UPDATE 业务表、短信邮件轰炸。
 禁止破坏业务：不准 DROP/TRUNCATE/DELETE FROM；SQLi 只用 SELECT/布尔/报错证明；RCE 只写无害短 txt canary，取回后立刻删掉。
+""" + BUSINESS_SAFE_WRITE_BRIEF + """
 不算漏洞：phpinfo/指纹/Banner/目录列表；错误页回显的内网 IP；CSRF、开放重定向、前台弱口令。
-不夺旗、不以 getshell 收工、不打内网横向（其它环境主机交给集群对应子项目）。
+不夺旗、不以 getshell 收工。已验证 SSRF 必须 report_pivot_capability 扩网，且只走 SSRF 参数打内网；
+禁止 Kali 直连、禁止 socks/shell 横向（其它环境主机交给集群对应子项目）。
 """
 
 _FINDING_FAMILY = {

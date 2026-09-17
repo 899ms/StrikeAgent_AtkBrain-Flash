@@ -1,5 +1,5 @@
 [Unit]
-Description=StrikeAgent_AtkBrain-Flash Vite frontend (LAN :5001)
+Description=StrikeAgent_AtkBrain-Flash Vite frontend (LAN :2334)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60
@@ -11,10 +11,10 @@ WorkingDirectory=__REPO__/frontend
 Environment=NODE_ENV=development
 Environment=HOME=/root
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=ATKBRAIN_API_ORIGIN=http://127.0.0.1:5003
-Environment=ATKBRAIN_FRONTEND_PORT=5001
+Environment=ATKBRAIN_API_ORIGIN=http://127.0.0.1:2333
+Environment=ATKBRAIN_FRONTEND_PORT=2334
 ExecStartPre=/bin/mkdir -p __REPO__/backend/data/logs
-ExecStart=/usr/bin/npm run dev -- --host 0.0.0.0 --port 5001 --strictPort
+ExecStart=/usr/bin/npm run dev -- --host 0.0.0.0 --port 2334 --strictPort
 Restart=always
 RestartSec=2
 TimeoutStopSec=20

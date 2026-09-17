@@ -37,6 +37,12 @@ KIT_RULES = """# 本机工具纪律
 - 开局策略（CTF 先看入口 vs 红队三圈）见 skill `recon-fanout` / `recon-spiral`。本 skill 只给路径和可复制命令。
 """
 
+KIT_YAKIT = """# Yakit（红队/SRC 且顶栏开关开时）
+- 禁止自设 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`，禁止 `--noproxy`，禁止再套 proxychains。HTTP 已由平台指到本机 MITM。
+- 需要 Fuzzer、History、爬虫、替换规则时，调用已注入的 Yakit MCP 工具（`http_fuzzer`、`query_http_flow`、`web_crawler`、`start_mitm_v2` 等），不要自己找 Burp 端口。
+- 不要把代理改成空或直连；出口由平台写入池节点。
+"""
+
 
 def kit_web(repo_root: str) -> str:
     jsfinder = f"{repo_root}/tools/JSFinder/JSFinder.py"
@@ -58,6 +64,8 @@ def kit_web(repo_root: str) -> str:
   - 中：`-P {WL_PASS_MED}`
   - 大（未超 10 万，红队可用；CTF 不要升到这档）：`-P {WL_PASS_LARGE}`
 - HTTP：`http_request` 优先；`/usr/bin/curl` 仅管道/原始报文。
+  经开放代理/SSRF 打内层登录：先读表单 action，把同一方法与 body 转发到认证处理接口；
+  外层 `-X POST --data` 打在代理外壳或站点根路径上，不等于内层收到账密，不能当口令失败。
 - sqlmap：仅已确认注入点。`/usr/bin/sqlmap -u <url> --batch --risk=1 --level=1`
 """
 
@@ -71,9 +79,16 @@ KIT_EXTRA_WEB = f"""# 已装备选（绝对路径；目录默认仍 ffuf，不�
 """
 
 KIT_EXTRA_LATERAL = """# 横向 / 服务（何时用 + 一条模板）
+- `/usr/bin/ssh`：已扩容内网的 SSH。本机有客户端。禁止 Kali 直连攻击机 docker 网桥——那不是题内网（守卫按本机 docker0/br-* 实机拦截）。
+  立足点上常常没有能用的 ssh 客户端：不要用 curl 的 sftp/libssh2 去讲 SSH。
+  正路：立足点上把 22 或 SOCKS 转到 Kali（webshell 反连 / `socat TCP-LISTEN` / `ssh -D`），再用本机 ssh 打已 `report_pivot_capability` 的主机。
+  必须是常驻转发（listen+fork 或反连保持）：绑定 0.0.0.0，后台进程断开 webshell 的 stdin。
+  Kali 打「入口 IP:监听端口」先拿到 SSH banner。一次性 HTTP/脚本短超时转发撑不住握手：banner 超时先修通道，不要改字典。
+  `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand='nc -x 127.0.0.1:<socks> %h %p' user@<in-scope-host>`
+- `/usr/bin/sshpass`：只用题面或图上已经出现的口令字面量，不要按厂商名合成。`sshpass -p '<pass>' ssh ...`。banner 通了试一轮；失败不要升字典。
 - `/usr/bin/masscan`：大网段快速探活，不替代 nmap 服务识别。`masscan <cidr> -p 22,80,443,445 --rate 1000`
-- `/usr/bin/nc`：短连 banner / 管道。`nc -nv <host> <port>`
-- `/usr/bin/socat`：转发与持久管道。`socat TCP-LISTEN:<lport>,fork TCP:<host>:<port>`
+- `/usr/bin/nc`：短连 banner / 管道 / SOCKS 客户端。`nc -nv <host> <port>`；`nc -x 127.0.0.1:<socks> <host> 22`
+- `/usr/bin/socat`：本地监听与转发。Kali 侧收反连：`socat TCP-LISTEN:<lport>,reuseaddr,fork -`；已能路由时：`socat TCP-LISTEN:<lport>,reuseaddr,fork TCP:<in-scope-host>:22`
 - `/usr/bin/smbclient`：SMB 列共享。`smbclient -L //<host> -N`
 - `/usr/bin/enum4linux`：SMB/RPC 枚举。`enum4linux -a <host>`
 - `/usr/bin/smbmap`：SMB 权限图。`smbmap -H <host>`
@@ -100,10 +115,10 @@ SKILL_FRONTMATTER = """---
 name: kali-kit
 description: >
   This machine's Kali pentest tools: absolute binary paths, pinned wordlists,
-  copy-paste commands (nmap, ffuf, hydra, sqlmap, JSFinder, bypass-403, nxc,
-  impacket, binutils). Call only after you already decided you need that
-  scanner or wordlist for an unknown surface. Do not call to start a CTF
-  puzzle — encoding, crypto, protocol, or a hinted path is local python3 /
+  copy-paste commands (nmap, ffuf, hydra, ssh, sshpass, socat, sqlmap, JSFinder,
+  bypass-403, nxc, impacket, binutils). Call only after you already decided you
+  need that scanner or wordlist for an unknown surface. Do not call to start a
+  CTF puzzle — encoding, crypto, protocol, or a hinted path is local python3 /
   openssl / http_request, not this skill. Never which / ls wordlists.
   Shared by CTF and red team. Not recon policy — that is recon-fanout /
   recon-spiral.
@@ -115,7 +130,15 @@ def commander_kit(repo_root: str | None = None, *, objective: str | None = None)
     """清单正文（无 YAML）。objective 忽略：目录对 CTF/红队共用，策略在 recon skill。"""
     del objective
     root = repo_root if repo_root is not None else str(REPO_ROOT)
-    return "\n".join([KIT_RULES, kit_web(root), KIT_EXTRA_WEB, KIT_EXTRA_LATERAL, KIT_BIN]).strip() + "\n"
+    parts = [KIT_RULES]
+    try:
+        from ..proxy.yakit import yakit
+        if yakit.enabled:
+            parts.append(KIT_YAKIT)
+    except Exception:
+        pass
+    parts.extend([kit_web(root), KIT_EXTRA_WEB, KIT_EXTRA_LATERAL, KIT_BIN])
+    return "\n".join(parts).strip() + "\n"
 
 
 def skill_markdown(repo_root: str | None = None) -> str:
@@ -139,6 +162,6 @@ def lateral_kit() -> str:
         f"- 小：用户 `{WL_USER_SMALL}` + 密码 `{WL_PASS_SMALL}`；HTTP `{WL_HTTP_DEFAULT}`\n"
         f"- 中：`{WL_PASS_MED}`\n"
         f"- 大（未超 10 万，红队可用；CTF 不要升档）：`{WL_PASS_LARGE}`。一律禁止 `{WL_ROCKYOU}` 与 hashcat 全库。\n"
-        "- 路径：`/usr/bin/hydra`、`/usr/bin/medusa`、`/usr/bin/ncrack`、`/usr/sbin/john`、`/usr/bin/hashcat`。\n"
+        "- 路径：`/usr/bin/ssh`、`/usr/bin/sshpass`、`/usr/bin/hydra`、`/usr/bin/medusa`、`/usr/bin/ncrack`、`/usr/sbin/john`、`/usr/bin/hashcat`。\n"
     )
     return "\n".join([KIT_RULES, KIT_EXTRA_LATERAL, creds]).strip() + "\n"
