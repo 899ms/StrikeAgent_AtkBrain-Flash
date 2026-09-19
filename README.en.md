@@ -16,9 +16,11 @@
 
 ![This project proposes: self-loop · self-supervise · self-evolve](docs/assets/coined-triad.gif)
 
-Built by Yean-Sec to explore what AI can actually do in authorized offensive security — something with its own ideas, not another generic “AI pentest” wrapper.
+Built by Yean-Sec to explore what AI can actually do in pentesting — something with its own ideas, not another generic AI product thrown together like everything else.
 
-The console looks simple. It is not. Flash is about staying on target while still growing the attack surface. Red-team re-rating and a second verification pass exist so findings are usable. The team’s private Pro build has been used on dozens of programs and well over a thousand authorized internet-facing environments.
+The project looks simple as a whole. It is not. It went through many live engagements and a great deal of the team’s effort. The small rules are countless: staying on target while still growing a larger attack surface alone took serious work (the Flash edition). To keep AI findings from being inflated or false positives, the team added red-team re-rating and a second verification pass, so what you see is what you can use — details like that.
+
+The team’s private Pro build has already shipped on dozens of programs and well over a thousand real authorized internet-facing environments. All of that work aims at one job: external foothold. Do one thing, and do it to the extreme.
 
 ## Architecture
 
