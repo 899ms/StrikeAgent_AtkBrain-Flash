@@ -174,6 +174,9 @@ app = FastAPI(
 )
 
 _cors = [x.strip() for x in str(getattr(settings, "cors_origins", "") or "").split(",") if x.strip()]
+_pub = str(getattr(settings, "public_origin", "") or "").strip().rstrip("/")
+if _pub and _pub not in _cors:
+    _cors.append(_pub)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors or ["http://127.0.0.1:2334", "http://localhost:2334"],
@@ -246,8 +249,20 @@ app.include_router(ws_router)
 
 from .auth.entry import SecurityEntryMiddleware, entry_prefix
 
-# 最外层：无入口则本机展示产品介绍页（含 docs / assets / api）。
+# 入口伪装页。再外包一层公网 HTTP→HTTPS（最后注册最先跑）。
 app.add_middleware(SecurityEntryMiddleware)
+
+
+@app.middleware("http")
+async def force_https_middleware(request: Request, call_next):
+    """公网 HTTP 301 到 HTTPS。本机回环与已是 https（含 X-Forwarded-Proto）不跳。"""
+    if (request.headers.get("upgrade") or "").lower() == "websocket":
+        return await call_next(request)
+    from .auth.https_redirect import https_redirect_response
+    bounced = https_redirect_response(request)
+    if bounced is not None:
+        return bounced
+    return await call_next(request)
 
 # 生产：若前端已构建，则托管静态资源
 _FRONT_DIST = os.path.join(str(REPO_ROOT), "frontend", "dist")

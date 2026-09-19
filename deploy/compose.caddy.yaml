@@ -1,0 +1,22 @@
+# Let's Encrypt overlay（有域名且安全组放行 80/443）。
+# .env：
+#   ATKBRAIN_PUBLIC_HOST=atkbrain.example.com
+#   ATKBRAIN_PUBLIC_ORIGIN=https://atkbrain.example.com
+#   docker compose -f compose.yaml -f deploy/compose.caddy.yaml up -d --wait
+#
+# 默认 compose 已在 :2334 提供自签 HTTPS。这份只换 Caddyfile 走公信证书。
+
+services:
+  atkbrain:
+    environment:
+      ATKBRAIN_FORCE_HTTPS: ${ATKBRAIN_FORCE_HTTPS:-true}
+      ATKBRAIN_PUBLIC_ORIGIN: ${ATKBRAIN_PUBLIC_ORIGIN:-}
+
+  caddy:
+    environment:
+      ATKBRAIN_PUBLIC_HOST: ${ATKBRAIN_PUBLIC_HOST:?set ATKBRAIN_PUBLIC_HOST to a DNS name pointing at this host}
+    volumes: !override
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./backend/data/tls:/etc/caddy/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config

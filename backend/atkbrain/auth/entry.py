@@ -260,13 +260,19 @@ class SecurityEntryMiddleware:
 
 
 def public_console_url(*, host: str | None = None, port: int | None = None) -> str:
+    prefix = entry_prefix()
+    origin = str(getattr(settings, "public_origin", "") or "").strip().rstrip("/")
+    if origin.lower().startswith("https://"):
+        return f"{origin}{prefix}/login"
     h = (host or guess_lan_ip() or "127.0.0.1").strip()
     try:
         p = int(port if port is not None else getattr(settings, "frontend_port", 2334) or 2334)
     except (TypeError, ValueError):
         p = 2334
-    prefix = entry_prefix()
-    return f"http://{h}:{p}{prefix}/login"
+    scheme = "https" if bool(getattr(settings, "force_https", True)) else "http"
+    if scheme == "https" and p in (80, 443):
+        return f"https://{h}{prefix}/login"
+    return f"{scheme}://{h}:{p}{prefix}/login"
 
 
 def guess_lan_ip() -> str:

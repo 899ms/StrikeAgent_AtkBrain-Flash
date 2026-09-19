@@ -64,8 +64,8 @@ cmd_restart() {
 cmd_status() {
   systemctl --no-pager --full status atkbrain-flash-frontend.service || true
   echo "---"
-  code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:2334/ 2>/dev/null || echo 000)"
-  echo "console: HTTP $code (2334 → 2333；无入口显示产品介绍页)"
+  code="$(curl -skS -m 3 -o /dev/null -w '%{http_code}' https://127.0.0.1:2334/ 2>/dev/null || echo 000)"
+  echo "console: HTTPS $code (2334 TLS → 2333；无入口显示产品介绍页；自签须 -k)"
 }
 
 cmd_logs() {

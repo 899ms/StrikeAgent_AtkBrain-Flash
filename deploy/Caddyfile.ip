@@ -1,0 +1,15 @@
+# 默认：:2334 HTTPS（自签）。证书由控制台入口写到 backend/data/tls/。
+# 有域名要 Let's Encrypt 时叠 deploy/compose.caddy.yaml。
+{
+	auto_https off
+}
+
+:2334 {
+	tls /etc/caddy/certs/cert.pem /etc/caddy/certs/key.pem
+	encode gzip
+	reverse_proxy 127.0.0.1:2333 {
+		header_up X-Forwarded-Proto https
+		header_up Host {host}
+		flush_interval -1
+	}
+}

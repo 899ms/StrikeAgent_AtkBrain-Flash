@@ -4,6 +4,7 @@
 #   用编辑器打开 .env，填 DEEPSEEK_API_KEY=你的密钥（或 ANTHROPIC_AUTH_TOKEN）
 #   docker compose -f compose.yaml -f deploy/compose.build.yaml up -d --build --wait
 #
+# 默认 HTTPS：浏览器打开 https://<主机>:2334/…（自签，点继续）。API 仍是本机 HTTP :2333。
 # 不要和本机 systemd（atkbrain-flash-backend / frontend）同时抢 2333/2334。
 # TSecBench 托管镜像仍用根目录 Dockerfile，与本文件无关。
 
@@ -26,7 +27,10 @@ services:
       ATKBRAIN_ADMIN_USER: ${ATKBRAIN_ADMIN_USER:-admin}
       ATKBRAIN_ADMIN_PASSWORD: ${ATKBRAIN_ADMIN_PASSWORD:-admin}
       ATKBRAIN_ADMIN_PASSWORD_RESET: ${ATKBRAIN_ADMIN_PASSWORD_RESET:-false}
-      ATKBRAIN_CORS_ORIGINS: ${ATKBRAIN_CORS_ORIGINS:-http://127.0.0.1:2334,http://localhost:2334,http://127.0.0.1:2333,http://localhost:2333}
+      ATKBRAIN_CORS_ORIGINS: ${ATKBRAIN_CORS_ORIGINS:-https://127.0.0.1:2334,https://localhost:2334,http://127.0.0.1:2333,http://localhost:2333}
+      ATKBRAIN_FORCE_HTTPS: ${ATKBRAIN_FORCE_HTTPS:-true}
+      ATKBRAIN_PUBLIC_ORIGIN: ${ATKBRAIN_PUBLIC_ORIGIN:-}
+      ATKBRAIN_SKIP_SOCAT: ${ATKBRAIN_SKIP_SOCAT:-true}
       ATKBRAIN_API_TOKEN: ${ATKBRAIN_API_TOKEN:-}
       ATKBRAIN_PI_BIN: ${ATKBRAIN_PI_BIN:-pi}
       ATKBRAIN_PI_PROVIDER: ${ATKBRAIN_PI_PROVIDER:-deepseek}
@@ -39,9 +43,29 @@ services:
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./backend/data:/opt/atkbrain/backend/data
+      - ./scripts/docker-console-entrypoint.sh:/opt/atkbrain/docker-console-entrypoint.sh:ro
+      - ./scripts/ensure-console-tls.sh:/opt/atkbrain/scripts/ensure-console-tls.sh:ro
     healthcheck:
       test: ["CMD", "python3", "-m", "atkbrain.healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 18
       start_period: 90s
+
+  caddy:
+    image: ${CADDY_IMAGE:-docker.m.daocloud.io/library/caddy:2-alpine}
+    container_name: strikeagent-atkbrain-caddy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./deploy/Caddyfile.ip:/etc/caddy/Caddyfile:ro
+      - ./backend/data/tls:/etc/caddy/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      atkbrain:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

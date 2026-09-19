@@ -142,7 +142,11 @@ class Settings(BaseSettings):
     auth_no_auth: str = ""  # 仅 1/true/yes/on 关掉登录；空字符串不能关
     # 只认 off（关掉随机入口，仅本机 npm run dev）。其它值忽略，首次用 secrets 生成。
     security_entry: str = ""
-    cors_origins: str = "http://127.0.0.1:2334,http://localhost:2334"
+    cors_origins: str = "https://127.0.0.1:2334,https://localhost:2334"
+    # 默认强制 HTTPS。应用仍听 HTTP :2333，:2334 由 Caddy / socat TLS 终止。
+    force_https: bool = True
+    # 例如 https://atkbrain.example.com ；有则 panel/跳转都用它，不要带路径。
+    public_origin: str = ""
     session_max_age_sec: int = 24 * 3600  # 登录起算 24 小时，不滑动续期
     # Yakit：MCP 全能力桥 + MITM。proxy-settings.json 无 yakit_enabled 且本机有 yak 时默认开。
     yakit_mcp_url: str = "http://127.0.0.1:11432/mcp"
@@ -193,7 +197,7 @@ class Settings(BaseSettings):
     # 只打这些 unique_code（逗号分隔）。空=全量。托管分阶段冒烟用，不写死题号。
     benchmark_focus_codes: str = ""
 
-    @field_validator("admin_password_reset", mode="before")
+    @field_validator("admin_password_reset", "force_https", mode="before")
     @classmethod
     def _empty_reset_is_false(cls, v):
         # Docker Compose 会把未填的 ATKBRAIN_ADMIN_PASSWORD_RESET 写成空字符串，Pydantic bool 解析会崩。
@@ -202,6 +206,19 @@ class Settings(BaseSettings):
         if isinstance(v, str) and v.strip() == "":
             return False
         return v
+
+    @field_validator("public_origin", mode="before")
+    @classmethod
+    def _strip_public_origin(cls, v):
+        s = str(v or "").strip().rstrip("/")
+        if not s:
+            return ""
+        low = s.lower()
+        if low.startswith("http://"):
+            s = "https://" + s[7:]
+        elif not low.startswith("https://"):
+            s = "https://" + s
+        return s.rstrip("/")
 
     def ensure_dirs(self) -> None:
         for p in [self.data_dir, self.workspaces_dir, self.loot_dir, self.reports_dir]:

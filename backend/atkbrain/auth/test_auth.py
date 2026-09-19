@@ -18,10 +18,18 @@ from .routes import LoginBody, auth_login, totp_setup
 from . import crypto, rate
 
 
-def http_request(*, scheme: str = "http", headers: list[tuple[str, str]] | None = None, path: str = "/") -> Request:
+def http_request(
+    *,
+    scheme: str = "http",
+    headers: list[tuple[str, str]] | None = None,
+    path: str = "/",
+    client: str = "127.0.0.1",
+    query: str = "",
+) -> Request:
     hdrs = []
     for k, v in headers or []:
         hdrs.append((k.lower().encode("latin-1"), v.encode("latin-1")))
+    qs = query.encode("latin-1") if query else b""
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -30,9 +38,9 @@ def http_request(*, scheme: str = "http", headers: list[tuple[str, str]] | None 
         "scheme": scheme,
         "path": path,
         "raw_path": path.encode(),
-        "query_string": b"",
+        "query_string": qs,
         "headers": hdrs,
-        "client": ("127.0.0.1", 9),
+        "client": (client, 9),
         "server": ("test", 80),
     }
     return Request(scope)
@@ -144,6 +152,96 @@ class EnvFlagTests(unittest.TestCase):
         self.assertFalse(env_truthy("0"))
         self.assertTrue(env_truthy("1"))
         self.assertTrue(env_truthy("YES"))
+
+
+class ForceHttpsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from ..config import settings
+
+        self.settings = settings
+        self.old_force = bool(settings.force_https)
+        self.old_origin = str(getattr(settings, "public_origin", "") or "")
+
+    def tearDown(self) -> None:
+        self.settings.force_https = self.old_force
+        self.settings.public_origin = self.old_origin
+
+    def test_off_does_not_redirect(self) -> None:
+        from .https_redirect import https_redirect_target
+
+        self.settings.force_https = False
+        self.settings.public_origin = "https://atkbrain.example.com"
+        req = http_request(client="203.0.113.1", path="/AbCdef12/login")
+        self.assertIsNone(https_redirect_target(req))
+
+    def test_loopback_skips(self) -> None:
+        from .https_redirect import https_redirect_target
+
+        self.settings.force_https = True
+        self.settings.public_origin = "https://atkbrain.example.com"
+        req = http_request(client="127.0.0.1", path="/")
+        self.assertIsNone(https_redirect_target(req))
+
+    def test_wan_http_redirects_to_public_origin(self) -> None:
+        from .https_redirect import https_redirect_target
+
+        self.settings.force_https = True
+        self.settings.public_origin = "https://atkbrain.example.com"
+        req = http_request(client="203.0.113.1", path="/AbCdef12/login", query="x=1")
+        self.assertEqual(
+            https_redirect_target(req),
+            "https://atkbrain.example.com/AbCdef12/login?x=1",
+        )
+
+    def test_wan_without_origin_uses_2334(self) -> None:
+        from .https_redirect import https_redirect_target
+
+        self.settings.force_https = True
+        self.settings.public_origin = ""
+        req = http_request(
+            client="203.0.113.1",
+            path="/AbCdef12/login",
+            headers=[("host", "203.0.113.9:2333")],
+        )
+        self.assertEqual(
+            https_redirect_target(req),
+            "https://203.0.113.9:2334/AbCdef12/login",
+        )
+
+    def test_public_console_url_keeps_2334(self) -> None:
+        from .entry import public_console_url
+
+        self.settings.force_https = True
+        self.settings.public_origin = ""
+        with patch("atkbrain.auth.entry.entry_prefix", return_value="/AbCdef12"), \
+             patch("atkbrain.auth.entry.guess_lan_ip", return_value="10.0.0.8"):
+            self.assertEqual(
+                public_console_url(),
+                "https://10.0.0.8:2334/AbCdef12/login",
+            )
+
+    def test_forwarded_proto_https_skips(self) -> None:
+        from .https_redirect import https_redirect_target
+
+        self.settings.force_https = True
+        self.settings.public_origin = "https://atkbrain.example.com"
+        req = http_request(
+            scheme="http",
+            client="203.0.113.1",
+            headers=[("x-forwarded-proto", "https")],
+        )
+        self.assertIsNone(https_redirect_target(req))
+
+    def test_public_console_url_uses_origin(self) -> None:
+        from .entry import public_console_url
+
+        self.settings.force_https = True
+        self.settings.public_origin = "https://atkbrain.example.com"
+        with patch("atkbrain.auth.entry.entry_prefix", return_value="/AbCdef12"):
+            self.assertEqual(
+                public_console_url(),
+                "https://atkbrain.example.com/AbCdef12/login",
+            )
 
 
 class LockoutTests(unittest.IsolatedAsyncioTestCase):

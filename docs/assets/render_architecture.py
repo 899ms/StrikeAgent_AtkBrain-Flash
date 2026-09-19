@@ -18,6 +18,7 @@ HAIR = (230, 223, 216, 255)
 CARD = (255, 254, 252, 255)
 PRIMARY = (204, 120, 92, 255)
 PRIMARY_DIM = (204, 120, 92, 36)
+CHIP = (247, 244, 240, 255)
 
 SERIF_B = "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc"
 SERIF_R = "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc"
@@ -63,8 +64,7 @@ def main() -> None:
     f_num = font(LATO_B, 10)
 
     S = SCALE
-    # header
-    tx(d, (W * S / 2, 36 * S), "STRIKEAGENT-ATKBRAIN", f_kicker, PRIMARY, "mt")
+    tx(d, (W * S / 2, 36 * S), "STRIKEAGENT_ATKBRAIN-FLASH", f_kicker, PRIMARY, "mt")
     tx(d, (W * S / 2, 68 * S), "架构", f_title, INK, "mt")
     tx(
         d,
@@ -76,40 +76,39 @@ def main() -> None:
     )
     d.line([(520 * S, 128 * S), (880 * S, 128 * S)], fill=HAIR, width=S)
 
-    # layer: console
     rr(d, (40 * S, 148 * S, 1360 * S, 268 * S), 10, CARD, HAIR, 1)
     tx(d, (60 * S, 164 * S), "01  控制台", f_h, INK)
     tx(d, (180 * S, 168 * S), "Vite  :2334", f_en, MUTED)
+    tx(d, (268 * S, 166 * S), "随机 8 位入口", f_small, MUTED)
     chips = [
-        (70, "项目  单目标 / 集群 / 评测"),
-        (330, "猎面  攻击图 · 时间线 · 漏洞 · 对话"),
-        (700, "交付报告"),
-        (880, "人工 steering"),
-        (1080, "设置 · 并发"),
+        (70, 248, "项目  红队 / CTF / 蓝队/SRC"),
+        (328, 268, "猎面  攻击图 · 时间线 · 对话"),
+        (606, 220, "漏洞管理 · 交付报告"),
+        (836, 228, "人工 steering · 授权身份"),
+        (1074, 246, "设置 · 撞墙钟 · 热更新"),
     ]
-    for x, label in chips:
-        rr(d, (x * S, 200 * S, (x + 230 if x != 330 else x + 340) * S, 244 * S), 6, PRIMARY_DIM, None, 0)
+    for x, w, label in chips:
+        rr(d, (x * S, 200 * S, (x + w) * S, 244 * S), 6, PRIMARY_DIM, None, 0)
         tx(d, ((x + 12) * S, 222 * S), label, f_small, INK, "lm")
 
     arrow_down(d, 700 * S, 268 * S, 292 * S)
 
-    # layer: api
     rr(d, (40 * S, 292 * S, 1360 * S, 400 * S), 10, CARD, HAIR, 1)
     tx(d, (60 * S, 308 * S), "02  API 与调度", f_h, INK)
     tx(d, (220 * S, 312 * S), "FastAPI  :2333", f_en, MUTED)
+    tx(d, (330 * S, 310 * S), "Pi  deepseek-flash", f_small, MUTED)
     api = [
-        (70, 240, "REST  项目 / 图 / 发现 / 报告 / 记忆"),
-        (340, 260, "WebSocket  轮次事件推到控制台"),
-        (630, 280, "RunManager  默认 10 项目 × 2 路 Claude"),
-        (940, 280, "Hunt clock  空转 / 挂起 / 硬停止"),
+        (70, 250, "REST  项目 / 图 / 漏洞 / 报告"),
+        (330, 250, "WebSocket  轮次事件推到控制台"),
+        (590, 360, "槽位  红队+蓝队/SRC 5 · CTF 3 互不占"),
+        (960, 360, "墙钟  红 12h / SRC 6h / CTF 遍次"),
     ]
     for x, w, label in api:
-        rr(d, (x * S, 344 * S, (x + w) * S, 380 * S), 6, (247, 244, 240, 255), HAIR, 1)
+        rr(d, (x * S, 344 * S, (x + w) * S, 380 * S), 6, CHIP, HAIR, 1)
         tx(d, ((x + 12) * S, 362 * S), label, f_small, INK, "lm")
 
     arrow_down(d, 700 * S, 400 * S, 428 * S)
 
-    # triad columns
     cols = [
         (
             40,
@@ -117,10 +116,10 @@ def main() -> None:
             "SELF-LOOP",
             False,
             [
-                "每轮新开 Claude 会话，局面只靠图与简报",
-                "注入：steering + 攻击图快照 + 可迁移剧本",
-                "御主推进一轮，MCP 实时 add_node / finding",
-                "验证后监督开口，路线包绑定再进入下一轮",
+                "每轮新开 Pi 会话，局面只靠图与简报",
+                "注入 steering、图快照、可迁移剧本",
+                "从者整轮含角色工人打完再问御主",
+                "人工对话立刻打断；监督后再进下一轮",
             ],
         ),
         (
@@ -132,7 +131,7 @@ def main() -> None:
                 "只在轮次边界、当前验证结束后复盘",
                 "无工具：读全局简报，只输出 JSON 方案",
                 "must_intents / prefer_tactics 硬约束",
-                "未执行则收紧同一绑定，禁止同义换路散文",
+                "未执行则收紧同一绑定，禁止同义换路",
             ],
         ),
         (
@@ -163,39 +162,38 @@ def main() -> None:
 
     arrow_down(d, 700 * S, 720 * S, 748 * S)
 
-    # bottom infrastructure
     rr(d, (40 * S, 748 * S, 1360 * S, 1068 * S), 10, CARD, HAIR, 1)
     tx(d, (60 * S, 764 * S), "06  受控执行与落盘", f_h, INK)
-    tx(d, (240 * S, 768 * S), "MCP 是智能体对外的唯一通道", f_en, MUTED)
+    tx(d, (240 * S, 768 * S), "Pi · Yakit MITM · Yak MCP :11433 · SQLite", f_en, MUTED)
 
     blocks = [
         (
             70,
             310,
-            "MCP 工具",
-            "run_cmd  ·  http_request\nadd_node / add_edge\nreport_finding / report_shell\npropose_intents  ·  note",
+            "Pi 与 MCP",
+            "Pi  runtime  deepseek-flash\n图工具  本机 HTTP 扩展\nYak MCP  :11433 全能力\nrun_cmd / http_request / report_*",
         ),
         (
             400,
             300,
-            "执行层",
-            "Guard 作业与范围校验\n本机 Kali 渗透工具\n工作区 loot / 产物\n禁止打控制台自身端口",
+            "出网",
+            "红队/蓝队 HTTP 第一跳 MITM\nDownstream 必须走出口代理池\n无存活节点则拒绝出网\nCTF 始终直连，默认不进 Yakit",
         ),
         (
             720,
             300,
             "攻击图  SQLite",
-            "target / service / vuln / foothold\n橙线 RCE  ·  紫线横向 PIVOTS_TO\nIntent 开放 / 验证 / 否证\n节点实时推到控制台",
+            "target / service / vuln / foothold\n橙线 RCE  ·  紫线横向 PIVOTS_TO\nIntent 开放 / 验证 / 否证\n二次验证 · 红队评级",
         ),
         (
             1040,
             280,
-            "交付",
-            "HTML / Markdown / PDF\n关键攻击路径\n资产画像\nfinding 机制与复现步骤",
+            "闸与交付",
+            "Guard 范围校验 · 过门字面量\n授权测试账密 / token\nHTML / Markdown / PDF\n关键路径 · 资产画像",
         ),
     ]
     for x, w, title, body in blocks:
-        rr(d, (x * S, 804 * S, (x + w) * S, 1036 * S), 8, (247, 244, 240, 255), HAIR, 1)
+        rr(d, (x * S, 804 * S, (x + w) * S, 1036 * S), 8, CHIP, HAIR, 1)
         tx(d, ((x + 16) * S, 824 * S), title, f_h, INK)
         yy = 860
         for line in body.split("\n"):
