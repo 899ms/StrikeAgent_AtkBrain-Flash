@@ -360,30 +360,70 @@ def redteam_rating_label(raw: str | None) -> str:
     return _RT_RATING_ZH.get(rt, rt)
 
 
+def _row_get(row: Any, key: str, default=None):
+    try:
+        if isinstance(row, dict):
+            return row.get(key, default)
+        v = getattr(row, key, None)
+        if v is None:
+            try:
+                v = row[key]
+            except Exception:
+                v = default
+        return v
+    except Exception:
+        return default
+
+
+def finding_review_need(
+    row: Any,
+    *,
+    want_secondary: bool,
+    want_rating: bool,
+) -> str | None:
+    """本条还缺哪份复核：secondary / rating / both；两份都齐或对应开关关则 None。"""
+    done_sec = bool(_row_get(row, "secondary_verified"))
+    has_rating = bool(normalize_redteam_rating(_row_get(row, "redteam_rating")))
+    need_sec = bool(want_secondary) and not done_sec
+    need_rate = bool(want_rating) and not has_rating
+    if need_sec and need_rate:
+        return "both"
+    if need_sec:
+        return "secondary"
+    if need_rate:
+        return "rating"
+    return None
+
+
 def secondary_review_error(
     secondary_verified: bool,
     rating: str | None,
     rationale: str | None,
 ) -> str | None:
-    """二次验证与红队评级必须同一轮完成；缺一则拒绝。首次上报两者都不填则放行。"""
+    """按本轮意图放行：首次两者都不填；只交二次或只交评级各须理由≥40字；两者都交则三者齐全。"""
     has_rating = bool(normalize_redteam_rating(rating))
     why = (rationale or "").strip()
     if not secondary_verified and not has_rating and not why:
         return None
-    if not secondary_verified:
-        return (
-            "二次验证与红队评级必须一起做：请 secondary_verified=true，"
-            "并同时给 redteam_rating 与 redteam_rating_rationale"
-            "（须写清二次怎么打：换通道/重放/对照，以及为何是这个级）。"
-        )
-    if not has_rating:
-        return "二次验证已标完成，但缺少 redteam_rating。"
-    if len(why) < 40:
-        return (
-            "redteam_rating_rationale 须同时阐述二次验证过程（换通道/重放 PoC/对照预期）"
-            "和进攻侧评级理由，不要只写「高危」。"
-        )
-    return None
+    if secondary_verified and has_rating:
+        if len(why) < 40:
+            return (
+                "redteam_rating_rationale 须同时阐述二次验证过程（换通道/重放 PoC/对照预期）"
+                "和进攻侧评级理由，不要只写「高危」。"
+            )
+        return None
+    if secondary_verified:
+        if len(why) < 40:
+            return (
+                "二次验证须写清怎么再打的（换通道/重放 PoC/对照预期），"
+                "redteam_rating_rationale 至少 40 字。"
+            )
+        return None
+    if has_rating:
+        if len(why) < 40:
+            return "红队评级须写清为何是这个级，redteam_rating_rationale 至少 40 字。"
+        return None
+    return "只写了理由但既未 secondary_verified=true 也未给出 redteam_rating。"
 
 
 def secondary_review_narrative(row: Any) -> str:

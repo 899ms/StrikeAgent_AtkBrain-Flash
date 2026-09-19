@@ -44,5 +44,16 @@ class DisplayedStatusTests(unittest.TestCase):
         )
 
 
+class ProjectTrackTests(unittest.TestCase):
+    def test_explicit_and_backfill(self) -> None:
+        from .projects import project_track
+        self.assertEqual(project_track("single", {"track": "src"}), "src")
+        self.assertEqual(project_track("single", {"track": "redteam"}), "redteam")
+        self.assertEqual(project_track("single", {"track": "ctf"}), "ctf")
+        self.assertEqual(project_track("single", {"objective": "src"}), "src")
+        self.assertEqual(project_track("benchmark", {}), "ctf")
+        self.assertEqual(project_track("single", {}), "redteam")
+
+
 if __name__ == "__main__":
     unittest.main()

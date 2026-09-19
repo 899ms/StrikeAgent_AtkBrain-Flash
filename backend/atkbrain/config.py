@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .llm_gateway import (
@@ -46,10 +47,19 @@ class Settings(BaseSettings):
     max_concurrency: int = 8                  # 默认展示：红队 5 + CTF 3 项目槽
     max_concurrency_cap: int = 40             # 红队 cap 20 + CTF cap 20
 
-    # 项目内 Pi 工人不设上限；保留字段以免旧环境变量报未知。0=不封顶。
-    claude_per_project: int = 0
-    claude_per_project_cap: int = 0
-    claude_spawn_max_concurrent: int = 0
+    # 整机同时活着的 `pi --mode rpc`（含从者/工人/复核/御主一次性）。
+    pi_max_live: int = 32
+    pi_max_live_cap: int = 96
+    # 每个猎面：从者 + 工人。finding-review / 御主一次性另占全局闸，不算进这一项。
+    pi_per_project: int = 4
+    pi_per_project_cap: int = 8
+    # 旧名：与 pi_per_project 同义；0 不再表示不封顶。
+    claude_per_project: int = 4
+    claude_per_project_cap: int = 8
+    claude_spawn_max_concurrent: int = 32
+    # 工人 abort 后闲置这么久（或连续 2 回合未 prompt）就关进程；从者保活。
+    pi_worker_idle_sec: float = 180.0
+    pi_worker_idle_turns: int = 2
     claude_spawn_jitter_max_sec: float = 0.0
     claude_spawn_settle_ms: int = 0
     claude_connect_retries: int = 4
@@ -57,9 +67,12 @@ class Settings(BaseSettings):
 
     loop_max_turns: int = 0           # CTF 不限轮次（含评测）；停猎看墙钟 / 图空转
     loop_max_turns_src: int = 0       # SRC：不限轮次；停猎看 6 小时墙钟 / 入口不可达 / 空转暂停
+    loop_max_turns_redteam: int = 0   # 红队：默认不限轮次
     src_runtime_hard_stop_sec: int = 6 * 60 * 60  # SRC：6 小时墙钟硬停
     loop_max_turns_benchmark: int = 0  # 已弃用：评测 CTF 不走轮次硬停
     loop_stall_limit: int = 10
+    loop_stall_limit_redteam: int = 10
+    loop_stall_limit_src: int = 10
     loop_stall_limit_flag: int = 0     # CTF：不走「连续 N 轮无进展」暂停，改看 6 个空方案
     loop_spiral_empty_plans: int = 6  # 红队：连续这么多御主方案无高质量增长才升圈
     # 换路监督：连续 N 轮无高质量进展 → 软转向（method/chain）；再加重 → 硬空转可打断 hold。
@@ -123,7 +136,15 @@ class Settings(BaseSettings):
 
     default_objective: str = "getshell"
     api_token: str = ""
-    # Yakit：MCP 全能力桥 + MITM。开关默认关，存在 proxy-settings.json 的 yakit_enabled。
+    admin_user: str = "admin"
+    admin_password: str = ""
+    admin_password_reset: bool = False
+    auth_no_auth: str = ""  # 仅 1/true/yes/on 关掉登录；空字符串不能关
+    # 只认 off（关掉随机入口，仅本机 npm run dev）。其它值忽略，首次用 secrets 生成。
+    security_entry: str = ""
+    cors_origins: str = "http://127.0.0.1:2334,http://localhost:2334"
+    session_max_age_sec: int = 24 * 3600  # 登录起算 24 小时，不滑动续期
+    # Yakit：MCP 全能力桥 + MITM。proxy-settings.json 无 yakit_enabled 且本机有 yak 时默认开。
     yakit_mcp_url: str = "http://127.0.0.1:11432/mcp"
     yakit_mcp_host: str = "127.0.0.1"
     yakit_mcp_port: int = 11432
@@ -171,6 +192,16 @@ class Settings(BaseSettings):
     benchmark_max_multiflag_concurrent: int = 1
     # 只打这些 unique_code（逗号分隔）。空=全量。托管分阶段冒烟用，不写死题号。
     benchmark_focus_codes: str = ""
+
+    @field_validator("admin_password_reset", mode="before")
+    @classmethod
+    def _empty_reset_is_false(cls, v):
+        # Docker Compose 会把未填的 ATKBRAIN_ADMIN_PASSWORD_RESET 写成空字符串，Pydantic bool 解析会崩。
+        if v is None:
+            return False
+        if isinstance(v, str) and v.strip() == "":
+            return False
+        return v
 
     def ensure_dirs(self) -> None:
         for p in [self.data_dir, self.workspaces_dir, self.loot_dir, self.reports_dir]:

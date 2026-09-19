@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../../api";
 import { colors } from "../../theme";
+import { useT } from "../../i18n";
 
 type MemoryRow = {
   id: string;
@@ -28,6 +29,7 @@ type MemoryRow = {
 };
 
 export function MemoryPanel({ projectId }: { projectId: string }) {
+  const { t } = useT();
   const [episodes, setEpisodes] = useState<MemoryRow[]>([]);
   const [playbook, setPlaybook] = useState<MemoryRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -48,47 +50,47 @@ export function MemoryPanel({ projectId }: { projectId: string }) {
     return () => { live = false; };
   }, [projectId]);
 
-  if (loading) return <p className="muted" style={{ padding: 16 }}>正在读取自进化记忆…</p>;
-  if (error) return <p style={{ padding: 16, color: colors.error }}>自进化记忆读取失败：{error}</p>;
+  if (loading) return <p className="muted" style={{ padding: 16 }}>{t("memory.loading")}</p>;
+  if (error) return <p style={{ padding: 16, color: colors.error }}>{t("memory.loadFailed", { msg: error })}</p>;
   if (!episodes.length && !playbook.length) {
-    return <p className="muted" style={{ padding: 16 }}>尚无自进化剧本或本局 episode。跑完一局会自动蒸馏；之后的项目会按技术栈取回。</p>;
+    return <p className="muted" style={{ padding: 16 }}>{t("memory.emptyLong")}</p>;
   }
 
   return (
     <div style={{ padding: "14px 2px", display: "grid", gap: 16 }}>
       <section>
         <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
-          <b>自进化剧本</b>
-          <span className="badge">{playbook.length} 条</span>
+          <b>{t("memory.playbookTitle")}</b>
+          <span className="badge">{t("memory.count", { n: playbook.length })}</span>
         </div>
         {!playbook.length && (
-          <p className="muted" style={{ fontSize: 13 }}>还没有与当前攻击图匹配的跨局手法。</p>
+          <p className="muted" style={{ fontSize: 13 }}>{t("memory.noPlaybook")}</p>
         )}
         {playbook.map((ls) => {
-          const c = ls.content || ls;
-          const rule = ls.rule || c.rule || c.approach;
-          const chain = ls.chain || c.chain;
-          const conf = ls.confidence ?? c.confidence;
+          const c = ls.content;
+          const rule = ls.rule || c?.rule || c?.approach;
+          const chain = ls.chain || c?.chain;
+          const conf = ls.confidence ?? c?.confidence;
           return (
             <div key={ls.id} style={{ borderTop: "1px solid var(--hairline)", padding: "10px 0" }}>
               <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
                 <span className="badge badge-coral">playbook</span>
                 {conf != null && (
-                  <span className="muted" style={{ fontSize: 12 }}>置信 {Number(conf).toFixed(2)}</span>
+                  <span className="muted" style={{ fontSize: 12 }}>{t("memory.conf", { n: Number(conf).toFixed(2) })}</span>
                 )}
-                <span className="mono muted" style={{ fontSize: 12 }}>{ls.target_fp || "通用"}</span>
+                <span className="mono muted" style={{ fontSize: 12 }}>{ls.target_fp || t("memory.generic")}</span>
               </div>
               {rule && (
                 <p style={{ fontSize: 13, margin: "7px 0 0", lineHeight: 1.5 }}>{rule}</p>
               )}
-              {!!(ls.do || c.do)?.length && (
+              {!!(ls.do || c?.do)?.length && (
                 <p className="muted" style={{ fontSize: 12, margin: "6px 0 0" }}>
-                  优先：{(ls.do || c.do || []).join(" · ")}
+                  {t("memory.prefer", { text: (ls.do || c?.do || []).join(" · ") })}
                 </p>
               )}
-              {!!(ls.avoid || c.avoid)?.length && (
+              {!!(ls.avoid || c?.avoid)?.length && (
                 <p className="muted" style={{ fontSize: 12, margin: "4px 0 0" }}>
-                  避免：{(ls.avoid || c.avoid || []).join(" · ")}
+                  {t("memory.avoid", { text: (ls.avoid || c?.avoid || []).join(" · ") })}
                 </p>
               )}
               {chain && (
@@ -102,22 +104,22 @@ export function MemoryPanel({ projectId }: { projectId: string }) {
       </section>
       <section>
         <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
-          <b>本局 episode</b>
-          <span className="badge">{episodes.length} 条 episode</span>
+          <b>{t("memory.episodes")}</b>
+          <span className="badge">{t("memory.episodeCount", { n: episodes.length })}</span>
         </div>
         {!episodes.length && (
-          <p className="muted" style={{ fontSize: 13 }}>本项目尚未生成 episode。</p>
+          <p className="muted" style={{ fontSize: 13 }}>{t("memory.noEpisodes")}</p>
         )}
         {episodes.map((ep) => (
           <div key={ep.id} style={{ borderTop: "1px solid var(--hairline)", padding: "10px 0" }}>
             <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
               <span className="badge badge-coral">{ep.outcome || "unknown"}</span>
-              <span className="mono muted" style={{ fontSize: 12 }}>{ep.target_fp || "未分类"}</span>
+              <span className="mono muted" style={{ fontSize: 12 }}>{ep.target_fp || t("memory.unclassified")}</span>
               <span className="muted" style={{ fontSize: 12 }}>v{ep.version || 1}</span>
             </div>
             {!!ep.content?.techniques?.length && (
               <p className="muted" style={{ fontSize: 12, margin: "7px 0 0" }}>
-                技术：{ep.content.techniques.join(" · ")}
+                {t("memory.tech", { text: ep.content.techniques.join(" · ") })}
               </p>
             )}
             {(ep.content?.approach || ep.content?.winning_path) && (

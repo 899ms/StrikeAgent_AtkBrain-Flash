@@ -4,14 +4,19 @@ import { TopNav } from "./TopNav";
 import { Spike } from "./Spike";
 import { api } from "../api";
 import type { AppVersion } from "../types";
+import { useAuth } from "../AuthGate";
+import { useT } from "../i18n";
+import { consumeShowUpdate, UpdateModal } from "./UpdateModal";
 
-type IconName = "projects" | "plus" | "settings" | "collapse";
+type IconName = "projects" | "plus" | "settings" | "collapse" | "logout" | "vulns";
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const common = { width: size, height: size, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
   if (name === "projects") return <svg {...common}><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M7 8h10M7 12h10M7 16h6" /></svg>;
+  if (name === "vulns") return <svg {...common}><path d="M12 3l8 4v6c0 5-3.4 7.6-8 9-4.6-1.4-8-4-8-9V7z" /><path d="M9 12l2 2 4-4" /></svg>;
   if (name === "plus") return <svg {...common}><path d="M12 5v14M5 12h14" /></svg>;
   if (name === "settings") return <svg {...common}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.12 2.12-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V20h-3v-.08A1.7 1.7 0 0 0 10.68 18.36a1.7 1.7 0 0 0-1.88.34l-.06.06-2.12-2.12.06-.06A1.7 1.7 0 0 0 7.02 14.7 1.7 1.7 0 0 0 5.46 13.7H5v-3h.08a1.7 1.7 0 0 0 1.56-1.03 1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.12-2.12.06.06a1.7 1.7 0 0 0 1.88.34A1.7 1.7 0 0 0 11.3 4.46V4h3v.08a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 2.12 2.12-.06.06a1.7 1.7 0 0 0-.34 1.88 1.7 1.7 0 0 0 1.56 1.03H20v3h-.08A1.7 1.7 0 0 0 18.36 14.4Z" /></svg>;
+  if (name === "logout") return <svg {...common}><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="M16 17l5-5-5-5" /><path d="M21 12H9" /></svg>;
   return <svg {...common}><path d="M15 18l-6-6 6-6" /></svg>;
 }
 
@@ -21,48 +26,82 @@ function fmtVer(raw?: string | null): string {
   return s.toLowerCase().startsWith("v") ? s : `v${s}`;
 }
 
-function statusText(v: AppVersion | null, busy: boolean): string {
-  if (busy) return "正在检查…";
-  if (!v) return "正在检查…";
-  if (v.status === "update_available") {
-    return v.latest ? `有新版本 ${fmtVer(v.latest)}` : "有新版本";
-  }
-  return "已是最新";
+function splitVer(raw?: string | null): { core: string; pre: string } {
+  const s = fmtVer(raw) || "v—";
+  const cut = s.search(/[-+]/);
+  if (cut < 0) return { core: s, pre: "" };
+  return { core: s.slice(0, cut), pre: s.slice(cut).replace(/^[-+]/, "") };
 }
 
 export function AppShell({ children }: { children: React.ReactNode }) {
+  const { t } = useT();
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("atkbrain_sidebar_collapsed") === "1");
   const [ver, setVer] = useState<AppVersion | null>(null);
   const [busy, setBusy] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
+  const { me, logout } = useAuth();
   useEffect(() => localStorage.setItem("atkbrain_sidebar_collapsed", collapsed ? "1" : "0"), [collapsed]);
   useEffect(() => {
     api.health().then((h: any) => {
       const localVer = String(h?.version || "");
       if (!localVer) return;
-      setVer((cur) => cur || { local: localVer, is_latest: true, status: "latest", message: "已是最新" });
+      setVer((cur) => cur || { local: localVer, is_latest: false, status: "checking", message: t("shell.checking") });
     }).catch(() => {});
-    const load = () => api.version().then(setVer).catch(() => {});
+    const applyVer = (v: AppVersion) => {
+      setVer(v);
+      if (v.status === "update_available" && consumeShowUpdate()) setUpdateOpen(true);
+    };
+    const load = () => api.version().then(applyVer).catch(() => {});
     load();
-    const t = setInterval(load, 10 * 60 * 1000);
-    return () => clearInterval(t);
-  }, []);
+    const timer = setInterval(load, 10 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [t]);
+
+  const statusText = (v: AppVersion | null, checking: boolean): string => {
+    if (checking || !v || v.status === "checking") return t("shell.checking");
+    if (v.status === "update_available") return t("shell.updateReady");
+    return t("shell.latest");
+  };
+
   const create = () => navigate("/?create=1");
   const onProjects = location.pathname === "/";
+  const onVulns = location.pathname === "/vulns";
   const local = fmtVer(ver?.local) || "v—";
+  const parts = splitVer(ver?.local);
   const hasUpdate = ver?.status === "update_available";
+  const isLatest = !busy && ver?.status === "latest";
+  const checking = busy || !ver || ver.status === "checking";
   const line = statusText(ver, busy);
-  const verTitle = hasUpdate
-    ? `${local} · ${line}（本系统不自动更新）`
+  const latestLabel = fmtVer(ver?.latest || ver?.latest_tag);
+  const hint = checking
+    ? t("shell.checkingHint")
+    : hasUpdate
+      ? t("shell.updateHint", { ver: latestLabel || t("shell.latestVersion") })
+      : t("shell.latestHint");
+  const verTitle = hasUpdate && latestLabel
+    ? `${local} · ${t("shell.updateAvailableVer", { ver: latestLabel })}`
     : `${local} · ${line}`;
+  const versionClass = [
+    "sidebar-version",
+    hasUpdate ? "has-update" : "",
+    isLatest ? "is-latest" : "",
+    checking ? "is-checking" : "",
+  ].filter(Boolean).join(" ");
 
   const refresh = async () => {
+    if (hasUpdate && !busy) {
+      setUpdateOpen(true);
+      return;
+    }
     setBusy(true);
     try {
-      setVer(await api.version(true));
+      const v = await api.version(true);
+      setVer(v);
+      if (v.status === "update_available") setUpdateOpen(true);
     } catch {
-      /* 检查失败时保持本机版本展示 */
+      /* keep local version */
     } finally {
       setBusy(false);
     }
@@ -80,28 +119,51 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
           )}
         </div>
-        <nav className="sidebar-nav" aria-label="主导航">
-          <button className="sidebar-link sidebar-create" onClick={create} title="新建项目">
-            <Icon name="plus" /><span>新建项目</span>
+        <nav className="sidebar-nav" aria-label={t("shell.nav")}>
+          <button className="sidebar-link sidebar-create" onClick={create} title={t("shell.newProject")}>
+            <Icon name="plus" /><span>{t("shell.newProject")}</span>
           </button>
-          <Link to="/" className={`sidebar-link ${onProjects ? "active" : ""}`} title="所有项目">
-            <Icon name="projects" /><span>所有项目</span>
+          <Link to="/" className={`sidebar-link ${onProjects ? "active" : ""}`} title={t("shell.allProjects")}>
+            <Icon name="projects" /><span>{t("shell.allProjects")}</span>
           </Link>
-          <Link to="/settings" className={`sidebar-link ${location.pathname === "/settings" ? "active" : ""}`} title="设置">
-            <Icon name="settings" /><span>设置</span>
+          <Link to="/vulns" className={`sidebar-link ${onVulns ? "active" : ""}`} title={t("shell.vulns")}>
+            <Icon name="vulns" /><span>{t("shell.vulns")}</span>
           </Link>
-        </nav>
-        <div className={`sidebar-version${hasUpdate ? " has-update" : ""}`} title={verTitle}>
-          <button type="button" className="sidebar-version-hit" onClick={refresh} disabled={busy} title={collapsed ? verTitle : "检查是否有新版本"}>
-            <span className="sidebar-version-dot" aria-hidden />
-            <span className="sidebar-version-num">{local}</span>
-            <span className="sidebar-version-status">{line}</span>
-          </button>
-          {hasUpdate && ver?.html_url && !collapsed ? (
-            <a className="sidebar-version-hint" href={ver.html_url} target="_blank" rel="noreferrer">查看发行说明</a>
+          <Link to="/settings" className={`sidebar-link ${location.pathname === "/settings" ? "active" : ""}`} title={t("shell.settings")}>
+            <Icon name="settings" /><span>{t("shell.settings")}</span>
+          </Link>
+          {me?.authenticated ? (
+            <button
+              className="sidebar-link"
+              title={t("shell.logoutTitle")}
+              onClick={() => {
+                void logout().then(() => navigate("/login", { replace: true }));
+              }}
+            >
+              <Icon name="logout" /><span>{t("shell.logout")}{me.username ? ` · ${me.username}` : ""}</span>
+            </button>
           ) : null}
+        </nav>
+        <div className={versionClass} title={verTitle}>
+          <button type="button" className="sidebar-version-hit" onClick={refresh} disabled={busy} title={collapsed ? verTitle : (hasUpdate ? t("shell.releaseNotes") : t("shell.checkVersion"))}>
+            <span className="sidebar-version-kicker">
+              <span className="sidebar-version-lamp" aria-hidden />
+              {t("shell.buildKicker")}
+            </span>
+            <span className="sidebar-version-num">
+              <span className="sidebar-version-core">{parts.core}</span>
+              {parts.pre ? <span className="sidebar-version-pre">{parts.pre}</span> : null}
+            </span>
+            <span className="sidebar-version-pill">
+              <span className="sidebar-version-dot" aria-hidden />
+              <span className="sidebar-version-status">{line}</span>
+            </span>
+            {!collapsed ? (
+              <span className="sidebar-version-hint">{hint}</span>
+            ) : null}
+          </button>
         </div>
-        <button className="sidebar-toggle" onClick={() => setCollapsed((v) => !v)} title={collapsed ? "展开菜单" : "收起菜单"} aria-label={collapsed ? "展开菜单" : "收起菜单"}>
+        <button className="sidebar-toggle" onClick={() => setCollapsed((v) => !v)} title={collapsed ? t("shell.expand") : t("shell.collapse")} aria-label={collapsed ? t("shell.expand") : t("shell.collapse")}>
           <Icon name="collapse" />
         </button>
       </aside>
@@ -109,6 +171,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <TopNav />
         <main className="app-main">{children}</main>
       </section>
+      {updateOpen && ver?.status === "update_available" ? (
+        <UpdateModal ver={ver} onClose={() => setUpdateOpen(false)} />
+      ) : null}
     </div>
   );
 }

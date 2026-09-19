@@ -6,8 +6,10 @@ import base64
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,6 +38,40 @@ _DECRYPT_TTL = 20.0
 _DECRYPT_FAIL_TTL = 2.0
 _SCOPE_HOST_TTL = 8.0
 _ECHO_IP_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_CERT_PEM_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
+
+
+def pems_from_text(text: str) -> list[str]:
+    return [m.group(0).strip() + "\n" for m in _CERT_PEM_RE.finditer(text or "")]
+
+
+def root_pem_from_chain_text(text: str) -> str | None:
+    """MITM 握手链里最后一张才是现场 Root CA。download_mitm_cert 经常是另一把同名钥匙。"""
+    pems = pems_from_text(text)
+    if len(pems) >= 2:
+        return pems[-1]
+    return None
+
+
+def capture_mitm_root_pem(host: str, port: int, *, timeout: float = 12.0) -> str | None:
+    """从本桥 MITM 的 TLS 链抠出现场 Root CA。"""
+    try:
+        proc = subprocess.run(
+            [
+                "openssl", "s_client",
+                "-connect", "ipv4.icanhazip.com:443",
+                "-proxy", f"{host}:{int(port)}",
+                "-servername", "ipv4.icanhazip.com",
+                "-showcerts",
+            ],
+            input=b"Q\n",
+            capture_output=True,
+            timeout=max(4.0, float(timeout)),
+        )
+    except Exception:
+        return None
+    text = (proc.stdout or b"").decode("utf-8", "replace")
+    return root_pem_from_chain_text(text)
 
 
 def parse_echo_ip(status_code: int | None, body: str | None) -> str | None:
@@ -79,6 +115,11 @@ def engine_cert_stale(
 
 def cert_path() -> Path:
     return Path(settings.data_dir) / "yakit-mitm-ca.pem"
+
+
+def yak_binary() -> str | None:
+    p = shutil.which("yak") or "/usr/local/bin/yak"
+    return p if p and os.path.isfile(p) else None
 
 
 def _settings_file() -> Path:
@@ -424,11 +465,17 @@ class YakitBridge:
 
     def load(self) -> None:
         data = _read_settings()
-        self.enabled = bool(data.get("yakit_enabled"))
         self.backup_text = str(data.get("yakit_backup_text") or "")
         self.last_good_proxy = str(data.get("yakit_last_good_proxy") or "")
         self._cert_mcp_url = str(data.get("yakit_cert_mcp_url") or "") or None
         self._cert_fp = str(data.get("yakit_cert_fp") or "")
+        if "yakit_enabled" in data:
+            self.enabled = bool(data.get("yakit_enabled"))
+        else:
+            # 从未点过开关：镜像/本机有 yak 就开，开箱即用（MCP + MITM 证书）。
+            self.enabled = bool(yak_binary())
+            if self.enabled:
+                self.save()
 
     def save(self) -> None:
         _write_settings({
@@ -563,12 +610,17 @@ class YakitBridge:
         )
         if not force and not stale and info.get("readable") and not info.get("expired"):
             return path
-        result = await mcp_client.call_tool("download_mitm_cert", {})
-        if result.get("isError"):
-            raise RuntimeError(_content_text(result) or "download_mitm_cert 失败")
-        pem = _extract_pem(_content_text(result))
+        pem = None
+        host, port = mitm_listen()
+        if self.listen_owned and port_listening(host, port):
+            pem = await asyncio.to_thread(capture_mitm_root_pem, host, port)
         if not pem:
-            raise RuntimeError("MCP 未返回可用的 MITM CA PEM")
+            result = await mcp_client.call_tool("download_mitm_cert", {})
+            if result.get("isError"):
+                raise RuntimeError(_content_text(result) or "download_mitm_cert 失败")
+            pem = _extract_pem(_content_text(result))
+        if not pem:
+            raise RuntimeError("未能取得可用的 MITM CA PEM")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(pem, encoding="utf-8")
         os.chmod(path, 0o644)
@@ -581,8 +633,20 @@ class YakitBridge:
         return path
 
     async def _bind_live_cert(self) -> bool:
-        """本桥 MITM 起来后必须能用当前 CA 校验叶子证，否则立即重拉 CA。"""
+        """本桥 MITM 起来后必须能用当前 CA 校验叶子证；MCP 下的 CA 经常不是现场那把。"""
         self._decrypt_ok = None
+        host, port = mitm_listen()
+        pem = await asyncio.to_thread(capture_mitm_root_pem, host, port) if self.listen_owned else None
+        if pem:
+            path = cert_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(pem, encoding="utf-8")
+            os.chmod(path, 0o644)
+            info = _openssl_cert_info(path)
+            self._cert_mcp_url = mcp_client.url or ""
+            self._cert_fp = str(info.get("fingerprint") or "")
+            self._status_cache = None
+            self.save()
         if await self._https_decrypt_ok():
             return True
         try:

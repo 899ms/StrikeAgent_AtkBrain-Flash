@@ -17,7 +17,7 @@ backend/data/**
 **/workspaces/**
 frontend/node_modules
 frontend/dist
-frontend
+frontend/tsconfig.tsbuildinfo
 demo
 docs
 deploy

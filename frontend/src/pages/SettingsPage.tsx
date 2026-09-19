@@ -1,12 +1,62 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { useAuth } from "../AuthGate";
+import { LangToggle } from "../components/LangToggle";
+import { PasswordChangeForm } from "../components/PasswordChangeForm";
+import { useT } from "../i18n";
+
+type HuntClocks = {
+  loop_max_turns: number;
+  loop_max_turns_src: number;
+  loop_max_turns_redteam: number;
+  src_runtime_hard_stop_sec: number;
+  redteam_runtime_hard_stop_sec: number;
+  runtime_hard_stop_sec: number;
+  runtime_hard_stop_pass2_sec: number;
+  runtime_hard_stop_pass3_sec: number;
+  runtime_hard_stop_pass_step_sec: number;
+  graph_idle_empty_plans: number;
+  loop_stall_limit_redteam: number;
+  loop_stall_limit_src: number;
+};
+
+const EMPTY_CLOCKS: HuntClocks = {
+  loop_max_turns: 0,
+  loop_max_turns_src: 0,
+  loop_max_turns_redteam: 0,
+  src_runtime_hard_stop_sec: 6 * 3600,
+  redteam_runtime_hard_stop_sec: 12 * 3600,
+  runtime_hard_stop_sec: 40 * 60,
+  runtime_hard_stop_pass2_sec: 120 * 60,
+  runtime_hard_stop_pass3_sec: 180 * 60,
+  runtime_hard_stop_pass_step_sec: 60 * 60,
+  graph_idle_empty_plans: 6,
+  loop_stall_limit_redteam: 10,
+  loop_stall_limit_src: 10,
+};
+
+function secToHours(sec: number) {
+  return String(Math.round((Number(sec) || 0) / 3600 * 100) / 100);
+}
+function secToMin(sec: number) {
+  return String(Math.round((Number(sec) || 0) / 60));
+}
 
 export function SettingsPage() {
+  const { t, locale } = useT();
+  const { me, refresh } = useAuth();
   const [message, setMessage] = useState("");
   const [custom, setCustom] = useState("");
   const [backup, setBackup] = useState("");
   const [proxy, setProxy] = useState<any>(null);
   const [yakit, setYakit] = useState<any>(null);
+  const [review, setReview] = useState({ secondary_verify: true, redteam_rating: true });
+  const [totpUrl, setTotpUrl] = useState("");
+  const [totpSecret, setTotpSecret] = useState("");
+  const [setupId, setSetupId] = useState("");
+  const [totpCode, setTotpCode] = useState("");
+  const [clocks, setClocks] = useState<HuntClocks>(EMPTY_CLOCKS);
+  const [clockPreview, setClockPreview] = useState<Record<string, { label?: string; conditions?: string[] }>>({});
   useEffect(() => {
     let first = true;
     let yakitFirst = true;
@@ -27,17 +77,45 @@ export function SettingsPage() {
       }).catch(() => {});
     };
     load();
-    const t = setInterval(load, 2000);
-    return () => clearInterval(t);
+    api.settings().then((r) => {
+      const rv = r?.review;
+      if (rv && typeof rv.secondary_verify === "boolean" && typeof rv.redteam_rating === "boolean") {
+        setReview({ secondary_verify: rv.secondary_verify, redteam_rating: rv.redteam_rating });
+      }
+      const hc = r?.defaults?.hunt_clocks;
+      if (hc && typeof hc === "object") setClocks({ ...EMPTY_CLOCKS, ...hc });
+      if (r?.defaults?.hard_stop) setClockPreview(r.defaults.hard_stop);
+    }).catch(() => {});
+    const tmr = setInterval(load, 2000);
+    return () => clearInterval(tmr);
   }, []);
+
+  useEffect(() => {
+    api.settings().then((r) => {
+      if (r?.defaults?.hard_stop) setClockPreview(r.defaults.hard_stop);
+    }).catch(() => {});
+  }, [locale]);
 
   const savePool = async () => {
     setMessage("");
     try {
       const r = await api.saveProxyPool(custom);
       setProxy(r);
-      setMessage("自建代理池已保存");
+      setMessage(t("settings.poolSaved"));
     } catch (e: any) {
+      setMessage(String(e?.message || e));
+    }
+  };
+
+  const toggleReview = async (key: "secondary_verify" | "redteam_rating") => {
+    setMessage("");
+    const next = { ...review, [key]: !review[key] };
+    setReview(next);
+    try {
+      const r = await api.setReviewFlags({ [key]: next[key] });
+      if (r?.review) setReview(r.review);
+    } catch (e: any) {
+      setReview(review);
       setMessage(String(e?.message || e));
     }
   };
@@ -57,7 +135,7 @@ export function SettingsPage() {
     try {
       const r = await api.saveYakitBackup(backup);
       setYakit(r);
-      setMessage("Yakit 备用下游已保存");
+      setMessage(t("settings.backupSaved"));
     } catch (e: any) {
       setMessage(String(e?.message || e));
     }
@@ -68,29 +146,225 @@ export function SettingsPage() {
     try {
       const r = await api.downloadYakitCert();
       setYakit(r);
-      setMessage("MITM 证书已保存");
+      setMessage(t("settings.certSaved"));
     } catch (e: any) {
       setMessage(String(e?.message || e));
     }
+  };
+
+  const startTotp = async () => {
+    setMessage("");
+    try {
+      const r = await api.totpSetup();
+      setTotpUrl(r.otpauth_url);
+      setTotpSecret(r.secret);
+      setSetupId(r.setup_id);
+    } catch (e: any) {
+      setMessage(String(e?.message || e));
+    }
+  };
+
+  const confirmTotp = async () => {
+    setMessage("");
+    try {
+      await api.totpConfirm(setupId, totpCode.trim());
+      setTotpUrl("");
+      setTotpSecret("");
+      setSetupId("");
+      setTotpCode("");
+      await refresh();
+      setMessage(t("settings.totpOk"));
+    } catch (e: any) {
+      setMessage(String(e?.message || e));
+    }
+  };
+
+  const saveClocks = async () => {
+    setMessage("");
+    try {
+      const r = await api.setHuntClocks(clocks);
+      if (r?.hunt_clocks) setClocks({ ...EMPTY_CLOCKS, ...r.hunt_clocks });
+      if (r?.hard_stop) setClockPreview(r.hard_stop);
+      setMessage(t("settings.clocksSaved"));
+    } catch (e: any) {
+      setMessage(String(e?.message || e));
+    }
+  };
+
+  const setClock = (key: keyof HuntClocks, raw: string, unit: "sec" | "min" | "hour" | "int") => {
+    const n = Number(raw);
+    let sec = 0;
+    if (Number.isFinite(n)) {
+      if (unit === "hour") sec = Math.round(n * 3600);
+      else if (unit === "min") sec = Math.round(n * 60);
+      else sec = Math.round(n);
+    }
+    setClocks((c) => ({ ...c, [key]: sec }));
   };
 
   return (
     <div className="page-container settings-page">
       <header className="page-heading">
         <p className="eyebrow">SYSTEM</p>
-        <h1>设置</h1>
-        <p>出口代理池与 Yakit MITM。</p>
+        <h1>{t("settings.title")}</h1>
+        <p>{t("settings.subtitle")}</p>
       </header>
-      {message && <p className={/失败|Error|error/i.test(message) ? "error-text" : "muted"}>{message}</p>}
+      {message && <p className={/失败|Error|error|already/i.test(message) ? "error-text" : "muted"}>{message}</p>}
       <div className="settings-grid">
         <section className="card-cream" style={{ gridColumn: "1 / -1" }}>
-          <h3>出口代理池</h3>
-          <p className="muted">红队/SRC 打目标时必须走代理，无存活节点则拒绝出网，不会回落真实 IP。CTF 始终直连。一行一条，支持 <span className="mono">http://ip:port</span>、<span className="mono">socks5://ip:port</span> 或 <span className="mono">ip:port</span>。</p>
+          <h3>{t("settings.langCard")}</h3>
+          <LangToggle />
+          <p className="muted" style={{ marginTop: 10 }}>{t("common.legacyHint")}</p>
+        </section>
+        {me?.authenticated ? (
+          <section className="card-cream" style={{ gridColumn: "1 / -1" }}>
+            <h3>{t("password.settingsTitle")}</h3>
+            <p className="muted">{t("password.settingsHint")}</p>
+            <PasswordChangeForm requireOld onDone={() => { void refresh(); }} />
+          </section>
+        ) : null}
+        <section className="card-cream" style={{ gridColumn: "1 / -1" }}>
+          <h3>{t("settings.clocksTitle")}</h3>
+          <p className="muted">{t("settings.clocksHint")}</p>
+          <div className="hunt-clock-grid">
+            <div>
+              <h4>{t("projects.trackRedBtn")}</h4>
+              <label className="login-field">
+                <span>{t("settings.clockHours")}</span>
+                <input className="input" type="number" min={0} max={72} step={0.5} value={secToHours(clocks.redteam_runtime_hard_stop_sec)} onChange={(e) => setClock("redteam_runtime_hard_stop_sec", e.target.value, "hour")} />
+              </label>
+              <label className="login-field">
+                <span>{t("settings.clockTurns")}</span>
+                <input className="input" type="number" min={0} max={9999} value={clocks.loop_max_turns_redteam} onChange={(e) => setClock("loop_max_turns_redteam", e.target.value, "int")} />
+              </label>
+              <label className="login-field">
+                <span>{t("settings.clockStall")}</span>
+                <input className="input" type="number" min={0} max={9999} value={clocks.loop_stall_limit_redteam} onChange={(e) => setClock("loop_stall_limit_redteam", e.target.value, "int")} />
+              </label>
+              <p className="muted" style={{ fontSize: 12 }}>{clockPreview.redteam?.label || ""}</p>
+            </div>
+            <div>
+              <h4>{t("projects.trackSrcBtn")}</h4>
+              <label className="login-field">
+                <span>{t("settings.clockHours")}</span>
+                <input className="input" type="number" min={0} max={72} step={0.5} value={secToHours(clocks.src_runtime_hard_stop_sec)} onChange={(e) => setClock("src_runtime_hard_stop_sec", e.target.value, "hour")} />
+              </label>
+              <label className="login-field">
+                <span>{t("settings.clockTurns")}</span>
+                <input className="input" type="number" min={0} max={9999} value={clocks.loop_max_turns_src} onChange={(e) => setClock("loop_max_turns_src", e.target.value, "int")} />
+              </label>
+              <label className="login-field">
+                <span>{t("settings.clockStall")}</span>
+                <input className="input" type="number" min={0} max={9999} value={clocks.loop_stall_limit_src} onChange={(e) => setClock("loop_stall_limit_src", e.target.value, "int")} />
+              </label>
+              <p className="muted" style={{ fontSize: 12 }}>{clockPreview.src?.label || ""}</p>
+            </div>
+            <div>
+              <h4>{t("projects.trackCtfBtn")}</h4>
+              <label className="login-field">
+                <span>{t("settings.clockCtfPass1")}</span>
+                <input className="input" type="number" min={0} max={4320} value={secToMin(clocks.runtime_hard_stop_sec)} onChange={(e) => setClock("runtime_hard_stop_sec", e.target.value, "min")} />
+              </label>
+              <label className="login-field">
+                <span>{t("settings.clockCtfPass2")}</span>
+                <input className="input" type="number" min={0} max={4320} value={secToMin(clocks.runtime_hard_stop_pass2_sec)} onChange={(e) => setClock("runtime_hard_stop_pass2_sec", e.target.value, "min")} />
+              </label>
+              <label className="login-field">
+                <span>{t("settings.clockCtfPass3")}</span>
+                <input className="input" type="number" min={0} max={4320} value={secToMin(clocks.runtime_hard_stop_pass3_sec)} onChange={(e) => setClock("runtime_hard_stop_pass3_sec", e.target.value, "min")} />
+              </label>
+              <label className="login-field">
+                <span>{t("settings.clockCtfStep")}</span>
+                <input className="input" type="number" min={0} max={4320} value={secToMin(clocks.runtime_hard_stop_pass_step_sec)} onChange={(e) => setClock("runtime_hard_stop_pass_step_sec", e.target.value, "min")} />
+              </label>
+              <label className="login-field">
+                <span>{t("settings.clockTurns")}</span>
+                <input className="input" type="number" min={0} max={9999} value={clocks.loop_max_turns} onChange={(e) => setClock("loop_max_turns", e.target.value, "int")} />
+              </label>
+              <label className="login-field">
+                <span>{t("settings.clockIdlePlans")}</span>
+                <input className="input" type="number" min={1} max={100} value={clocks.graph_idle_empty_plans} onChange={(e) => setClock("graph_idle_empty_plans", e.target.value, "int")} />
+              </label>
+              <p className="muted" style={{ fontSize: 12 }}>{clockPreview.flag?.label || ""}</p>
+            </div>
+          </div>
+          <div className="row" style={{ gap: 8, marginTop: 12 }}>
+            <button className="btn btn-primary btn-sm" type="button" onClick={() => { void saveClocks(); }}>{t("settings.saveClocks")}</button>
+          </div>
+        </section>
+        <section className="card-cream" style={{ gridColumn: "1 / -1" }}>
+          <h3>{t("settings.reviewTitle")}</h3>
+          <p className="muted">{t("settings.reviewHint")}</p>
           <dl className="settings-list">
-            <dt>开关</dt><dd>{proxy?.enabled ? "开" : "关"}（顶栏切换）</dd>
-            <dt>存活</dt><dd>{proxy?.live ?? 0}</dd>
-            <dt>最近出口 IP</dt><dd className="mono">{proxy?.exit_ip || "-"}</dd>
-            {proxy?.error ? <><dt>状态</dt><dd className="error-text">{proxy.error}</dd></> : null}
+            <dt>{t("settings.reviewSecondary")}</dt>
+            <dd>
+              <button
+                type="button"
+                className={`proxy-switch${review.secondary_verify ? " is-on" : ""}`}
+                aria-pressed={review.secondary_verify}
+                onClick={() => { void toggleReview("secondary_verify"); }}
+              >
+                <span className="proxy-switch-knob" />
+              </button>
+              <span style={{ marginLeft: 8 }}>{review.secondary_verify ? t("common.on") : t("common.off")}</span>
+            </dd>
+            <dt>{t("settings.reviewRating")}</dt>
+            <dd>
+              <button
+                type="button"
+                className={`proxy-switch${review.redteam_rating ? " is-on" : ""}`}
+                aria-pressed={review.redteam_rating}
+                onClick={() => { void toggleReview("redteam_rating"); }}
+              >
+                <span className="proxy-switch-knob" />
+              </button>
+              <span style={{ marginLeft: 8 }}>{review.redteam_rating ? t("common.on") : t("common.off")}</span>
+            </dd>
+          </dl>
+        </section>
+        {me?.authenticated ? (
+          <section className="card-cream" style={{ gridColumn: "1 / -1" }}>
+            <h3>{t("settings.totpTitle")}</h3>
+            <p className="muted">{t("settings.totpHint")}</p>
+            <dl className="settings-list">
+              <dt>{t("common.status")}</dt>
+              <dd>{me.totp_enabled ? t("settings.bound") : t("settings.unbound")}</dd>
+              <dt>{t("common.user")}</dt>
+              <dd className="mono">{me.username || "-"}</dd>
+            </dl>
+            {!me.totp_enabled && (
+              <div className="row" style={{ gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                <button className="btn btn-secondary btn-sm" type="button" onClick={() => { void startTotp(); }}>{t("settings.genTotp")}</button>
+                {setupId ? (
+                  <>
+                    <input
+                      className="input"
+                      style={{ width: 140 }}
+                      placeholder={t("settings.totpPh")}
+                      value={totpCode}
+                      onChange={(e) => setTotpCode(e.target.value)}
+                    />
+                    <button className="btn btn-primary btn-sm" type="button" onClick={() => { void confirmTotp(); }}>{t("settings.confirmTotp")}</button>
+                  </>
+                ) : null}
+              </div>
+            )}
+            {totpSecret ? (
+              <p className="mono table-sub" style={{ marginTop: 10, wordBreak: "break-all" }}>
+                {totpSecret}
+                {totpUrl ? <><br />{totpUrl}</> : null}
+              </p>
+            ) : null}
+          </section>
+        ) : null}
+        <section className="card-cream" style={{ gridColumn: "1 / -1" }}>
+          <h3>{t("settings.proxyTitle")}</h3>
+          <p className="muted">{t("settings.proxyHint")}</p>
+          <dl className="settings-list">
+            <dt>{t("settings.switch")}</dt><dd>{proxy?.enabled ? t("common.on") : t("common.off")}{t("settings.switchHint")}</dd>
+            <dt>{t("settings.live")}</dt><dd>{proxy?.live ?? 0}</dd>
+            <dt>{t("settings.exitIp")}</dt><dd className="mono">{proxy?.exit_ip || "-"}</dd>
+            {proxy?.error ? <><dt>{t("common.status")}</dt><dd className="error-text">{proxy.error}</dd></> : null}
           </dl>
           <textarea
             className="input"
@@ -100,14 +374,14 @@ export function SettingsPage() {
             onChange={(e) => setCustom(e.target.value)}
           />
           <div className="row" style={{ gap: 8, marginTop: 12 }}>
-            <button className="btn btn-primary btn-sm" type="button" onClick={() => { void savePool(); }}>保存自建池</button>
+            <button className="btn btn-primary btn-sm" type="button" onClick={() => { void savePool(); }}>{t("settings.savePool")}</button>
           </div>
         </section>
         <section className="card-cream" style={{ gridColumn: "1 / -1" }}>
           <h3>Yakit</h3>
-          <p className="muted">红队/SRC 打开后从者 HTTP 走本机 MITM（默认 127.0.0.1:8084），下游写入出口池；池子连不上时用下面的备用节点。出口 IP 必须验收通过才放行，不会回落本机。CTF 默认不抓包。证书异常时请下载 CA。</p>
+          <p className="muted">{t("settings.yakitHint")}</p>
           <dl className="settings-list">
-            <dt>开关</dt>
+            <dt>{t("settings.switch")}</dt>
             <dd>
               <button
                 type="button"
@@ -117,33 +391,33 @@ export function SettingsPage() {
               >
                 <span className="proxy-switch-knob" />
               </button>
-              <span style={{ marginLeft: 8 }}>{yakit?.enabled ? "开" : "关"}</span>
+              <span style={{ marginLeft: 8 }}>{yakit?.enabled ? t("common.on") : t("common.off")}</span>
             </dd>
-            <dt>引擎</dt>
+            <dt>{t("settings.engine")}</dt>
             <dd>
               <span className="pulse-dot" style={{ background: yakit?.engine?.ready ? "var(--success)" : "var(--error)", marginRight: 8 }} />
-              {yakit?.engine?.ready ? "Yakit 就绪" : "Yakit 未就绪"}
+              {yakit?.engine?.ready ? t("settings.yakitReady") : t("settings.yakitDown")}
               <span className="mono table-sub" style={{ marginLeft: 8 }}>{yakit?.engine?.url || "-"}</span>
             </dd>
-            <dt>证书</dt>
+            <dt>{t("settings.cert")}</dt>
             <dd>
               <span className="pulse-dot" style={{ background: yakit?.cert?.ready ? "var(--success)" : "var(--error)", marginRight: 8 }} />
-              {yakit?.cert?.ready ? "证书就绪" : "证书异常"}
+              {yakit?.cert?.ready ? t("settings.certReady") : t("settings.certBad")}
             </dd>
-            <dt>指纹</dt><dd className="mono" style={{ wordBreak: "break-all" }}>{yakit?.cert?.fingerprint || "-"}</dd>
-            <dt>过期</dt><dd className="mono">{yakit?.cert?.expires_at || "-"}</dd>
+            <dt>{t("settings.fp")}</dt><dd className="mono" style={{ wordBreak: "break-all" }}>{yakit?.cert?.fingerprint || "-"}</dd>
+            <dt>{t("settings.expires")}</dt><dd className="mono">{yakit?.cert?.expires_at || "-"}</dd>
             <dt>MITM</dt>
-            <dd className="mono">{yakit?.mitm?.host || "127.0.0.1"}:{yakit?.mitm?.port || 8084} {yakit?.mitm?.listening ? "监听中" : "未监听"}</dd>
-            <dt>下游</dt><dd className="mono">{yakit?.mitm?.downstream || "（空）"}</dd>
-            <dt>验收出口</dt>
+            <dd className="mono">{yakit?.mitm?.host || "127.0.0.1"}:{yakit?.mitm?.port || 8084} {yakit?.mitm?.listening ? t("settings.listening") : t("settings.notListening")}</dd>
+            <dt>{t("settings.downstream")}</dt><dd className="mono">{yakit?.mitm?.downstream || t("common.empty")}</dd>
+            <dt>{t("settings.verifiedExit")}</dt>
             <dd className="mono">
-              {yakit?.mitm?.verified ? (yakit?.mitm?.exit_ip || "已验收") : "未验收"}
+              {yakit?.mitm?.verified ? (yakit?.mitm?.exit_ip || t("settings.verified")) : t("settings.unverified")}
             </dd>
-            <dt>MCP 工具</dt>
-            <dd>{yakit?.tools_count ?? 0}{yakit?.oob_ready ? " · DNS/反连已导出" : ""}</dd>
+            <dt>{t("settings.mcp")}</dt>
+            <dd>{yakit?.tools_count ?? 0}{yakit?.oob_ready ? t("settings.oob") : ""}</dd>
             {yakit?.engine?.error || yakit?.cert?.error || yakit?.error ? (
               <>
-                <dt>状态</dt>
+                <dt>{t("common.status")}</dt>
                 <dd className="error-text">{yakit?.error || yakit?.engine?.error || yakit?.cert?.error}</dd>
               </>
             ) : null}
@@ -151,13 +425,13 @@ export function SettingsPage() {
           <textarea
             className="input"
             style={{ width: "100%", minHeight: 88, marginTop: 14, fontFamily: "var(--font-mono)", fontSize: 12 }}
-            placeholder={"备用下游（池子失效时用）\nhttp://203.0.113.10:8080"}
+            placeholder={t("settings.backupPh")}
             value={backup}
             onChange={(e) => setBackup(e.target.value)}
           />
           <div className="row" style={{ gap: 8, marginTop: 12 }}>
-            <button className="btn btn-primary btn-sm" type="button" onClick={() => { void saveBackup(); }}>保存备用下游</button>
-            <button className="btn btn-secondary btn-sm" type="button" onClick={() => { void downloadCert(); }}>下载 MITM 证书</button>
+            <button className="btn btn-primary btn-sm" type="button" onClick={() => { void saveBackup(); }}>{t("settings.saveBackup")}</button>
+            <button className="btn btn-secondary btn-sm" type="button" onClick={() => { void downloadCert(); }}>{t("settings.downloadCert")}</button>
           </div>
         </section>
       </div>

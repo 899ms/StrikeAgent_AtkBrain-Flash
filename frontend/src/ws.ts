@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { getApiToken } from "./api";
+import { appBase } from "./appBase";
 import type { Graph, RTEvent } from "./types";
 
 type Handlers = {
@@ -59,12 +59,11 @@ export function useProjectSocket(projectId: string | undefined, handlers: Handle
     const connect = () => {
       clearTimeout(retry);
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      const tok = getApiToken();
-      const q = tok ? `?token=${encodeURIComponent(tok)}` : "";
+      const base = appBase();
       if (wsRef.current && (wsRef.current.readyState === WebSocket.CONNECTING || wsRef.current.readyState === WebSocket.OPEN)) {
         return;
       }
-      const ws = new WebSocket(`${proto}://${location.host}/api/projects/${projectId}/ws${q}`);
+      const ws = new WebSocket(`${proto}://${location.host}${base}/api/projects/${projectId}/ws`);
       wsRef.current = ws;
       ws.onopen = () => {
         attempts = 0;

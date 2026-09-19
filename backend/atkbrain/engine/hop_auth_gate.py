@@ -20,8 +20,8 @@ HOP_AUTH_FALSE_DISPROVE_MSG = (
 )
 HOP_AUTH_NUDGE_MSG = (
     "经已验证跳板看到活着的邻机后，本轮主线是 hop_auth："
-    "用图上已有字面量账密，经该跳板把认证请求体送到邻机处理接口。"
-    "禁止 Kali 直连，禁止喷字典，禁止再把扫段空号扩进 Scope。"
+    "用图上或简报已有字面量账密/token（含授权测试身份），经该跳板把认证请求体送到邻机处理接口。"
+    "无请求体的空 POST 不能否证。禁止 Kali 直连，禁止喷字典，禁止再把扫段空号扩进 Scope。"
 )
 SITUATION_HOP_AUTH = (
     "【局面·邻机过门】本轮第一动作必须经已有立足点 shell、已验证 SSRF/代理参数、"
@@ -338,13 +338,17 @@ def hop_auth_followup_note(
     situation: bool,
     workspace_dir: str = "",
     hop_host: str = "",
+    allowed_secrets: set[str] | None = None,
 ) -> str:
     if not situation:
         return ""
     if hop_delivered(workspace_dir, hop_host):
         return ""
     extra = f"目标邻机 {hop_host}。" if hop_host else ""
-    return "【系统】" + extra + HOP_AUTH_NUDGE_MSG
+    note = "【系统】" + extra + HOP_AUTH_NUDGE_MSG
+    if allowed_secrets:
+        note += "有授权测试身份时第一动作必须用这组字面量过登录口。"
+    return note
 
 
 def apply_kali_direct_reason(

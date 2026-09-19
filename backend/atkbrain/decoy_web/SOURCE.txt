@@ -1,0 +1,5 @@
+Vendored production build of https://github.com/Bouquets-ai/StrikeAgent-Web
+GitHub icon links to https://github.com/orgs/Yean-Sec
+Served locally when the random console entrance is missing (HTTP 200, no redirect).
+No Google Fonts (Kali/Windows often cannot reach fonts.googleapis.com).
+Rebuild: clone that repo, run npx vite build, copy dist/* here, then strip Google Fonts from index.html.

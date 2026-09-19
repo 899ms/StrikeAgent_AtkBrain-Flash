@@ -18,6 +18,7 @@ import { colors, displayFindingSeverity } from "../theme";
 import { hardStopLine, listStatusOf } from "../projectStatus";
 import { animate } from "animejs";
 import { countUp } from "../anim";
+import { useT } from "../i18n";
 
 const EMPTY: Graph = { nodes: [], edges: [], findings: [], intents: [], frontier: {}, rce_path: { path: [], likelihood: 0 }, stats: { nodes: 0, edges: 0, findings: 0, critical: 0, has_shell: false, frontier_open: 0 } };
 const GRAPH_EVENTS = new Set(["node", "edge", "finding", "rce_path", "shell", "lateral"]);
@@ -136,6 +137,7 @@ function capEvents(evs: RTEvent[]): RTEvent[] {
 }
 
 export function ProjectPage() {
+  const { t, locale } = useT();
   const { id } = useParams();
   const [project, setProject] = useState<Project | null>(null);
   const [graph, setGraph] = useState<Graph>(EMPTY);
@@ -166,9 +168,16 @@ export function ProjectPage() {
       setQueued(!!p.queued);
       setLiveWs(p.kind === "single");
     }).catch((e: any) => {
-      setLoadErr(String(e?.message || e || "加载失败"));
+      setLoadErr(String(e?.message || e || t("project.loadFailed")));
     });
   }, [id]);
+
+  useEffect(() => {
+    if (!id) return;
+    api.getProject(id).then((p) => {
+      setProject((prev) => (prev ? { ...prev, hard_stop: p.hard_stop } : prev));
+    }).catch(() => {});
+  }, [id, locale]);
 
   useEffect(() => {
     if (!id || !liveWs) return;
@@ -277,20 +286,20 @@ export function ProjectPage() {
       setQueued(true);
       return true;
     } catch (e: any) {
-      setLoadErr(String(e?.message || e || "启动失败"));
+      setLoadErr(String(e?.message || e || t("project.startFailed")));
       return false;
     }
   };
   const startHardRestart = async () => {
     if (!id) return;
-    const tip = "重新开题将清空攻击图；已提交的 flag 与历史日志会保留。确认？";
+    const tip = t("project.restartConfirm");
     if (!window.confirm(tip)) return;
     try {
       await api.start(id, true);
       setRunning(true);
       setQueued(true);
     } catch (e: any) {
-      setLoadErr(String(e?.message || e || "重新开题失败"));
+      setLoadErr(String(e?.message || e || t("project.restartFailed")));
     }
   };
   const start = async () => { await startResume(); };
@@ -317,7 +326,7 @@ export function ProjectPage() {
     return (
       <div className="container" style={{ paddingTop: 40 }}>
         <p className={loadErr ? "" : "muted"} style={loadErr ? { color: "var(--error)" } : undefined}>
-          {loadErr || "加载中…"}
+          {loadErr || t("common.loading")}
         </p>
       </div>
     );
@@ -341,7 +350,15 @@ export function ProjectPage() {
   const serviceCount = graph.nodes.filter((n) => n.type === "service").length;
   const supervisorCount = countSupervisorRecords(events);
   const statusColor: Record<string, string> = { running: colors.success, queued: colors.warning, completed: colors.primary, idle: colors.mutedSoft, error: colors.error, stopped: colors.muted };
-  const statusLabel: Record<string, string> = { running: "运行中", queued: "排队中", completed: "已完成", idle: "空闲", error: "失败", stopped: "已停止", goal_reached: "已完成" };
+  const statusLabel: Record<string, string> = {
+    running: t("status.running"),
+    queued: t("status.queued"),
+    completed: t("status.completed"),
+    idle: t("status.idle"),
+    error: t("status.error"),
+    stopped: t("status.stopped"),
+    goal_reached: t("status.completed"),
+  };
   const shownStatus = listStatusOf({ ...project, running, queued });
   const needed = Number(project.config?.flag_count) || 1;
   const canResume = (graph.stats?.nodes || 0) > 0 || events.length > 0;
@@ -363,7 +380,7 @@ export function ProjectPage() {
     <div className="container" style={{ paddingTop: 24, paddingBottom: 40 }}>
       <div ref={headRef}>
         <Link to={project.parent_id ? `/project/${project.parent_id}` : "/"} className="muted" style={{ fontSize: 13 }}>
-          &larr; {project.parent_id ? "返回上级集群" : "返回项目列表"}
+          &larr; {project.parent_id ? t("project.backCluster") : t("project.backList")}
         </Link>
         <div className="project-head">
           <div>
@@ -371,53 +388,53 @@ export function ProjectPage() {
               <h1 style={{ fontSize: 34 }}>{project.name}</h1>
               {isFlag ? (
                 ctfFull
-                  ? <span className="badge badge-coral" style={{ fontSize: 13 }}>已完成 {ctfProgress}</span>
+                  ? <span className="badge badge-coral" style={{ fontSize: 13 }}>{t("project.ctfDone", { progress: ctfProgress })}</span>
                   : flagsCorrect > 0
-                    ? <span className="badge" style={{ fontSize: 13 }}>{ctfProgress} 未满分</span>
+                    ? <span className="badge" style={{ fontSize: 13 }}>{t("project.ctfPartial", { progress: ctfProgress })}</span>
                     : null
               ) : isSrc ? (
                 (visibleHigh + visibleCritical) > 0
-                  ? <span className="badge" style={{ fontSize: 13 }}>已验证高危 {visibleHigh + visibleCritical}</span>
+                  ? <span className="badge" style={{ fontSize: 13 }}>{t("project.srcVerified", { n: visibleHigh + visibleCritical })}</span>
                   : null
               ) : (
-                graph.stats.has_shell && <span className="badge badge-coral" style={{ fontSize: 13 }}>GETSHELL 已达成</span>
+                graph.stats.has_shell && <span className="badge badge-coral" style={{ fontSize: 13 }}>{t("project.getshell")}</span>
               )}
               {!isSrc && graph.stats.lateral_active && (
                 <span className="badge" style={{ fontSize: 13, background: "rgba(109,92,240,0.14)", color: "#4a3fb0", border: "1px solid #6d5cf0" }}>
-                  内网横向{graph.stats.hosts_footed ? ` · ${graph.stats.hosts_footed} 台` : ""}
+                  {graph.stats.hosts_footed ? t("project.lateralHosts", { n: graph.stats.hosts_footed }) : t("project.lateral")}
                 </span>
               )}
             </div>
             <div className="row" style={{ gap: 12, marginTop: 6 }}>
-              <span className="mono muted" style={{ fontSize: 14 }}>{project.target || "集群"}</span>
+              <span className="mono muted" style={{ fontSize: 14 }}>{project.target || t("project.cluster")}</span>
               <span className="row" style={{ gap: 6 }}>
                 <span className="pulse-dot" style={{ background: statusColor[shownStatus] || colors.muted }} />
                 <span className="muted" style={{ fontSize: 13 }}>{statusLabel[shownStatus] || shownStatus}</span>
                 {queued ? (
-                  <span className="badge" style={{ background: "rgba(217,190,132,0.16)", color: "#d9be84", borderColor: "rgba(217,190,132,0.35)" }} title="已启动，等待本赛道（红队/SRC 或 CTF）并发槽空出后才会真正开跑">等并发槽</span>
+                  <span className="badge" style={{ background: "rgba(217,190,132,0.16)", color: "#d9be84", borderColor: "rgba(217,190,132,0.35)" }} title={t("status.waitingSlotTitle")}>{t("status.waitingSlot")}</span>
                 ) : null}
                 {stopReason === "entry_dead" ? (
-                  <span className="badge" style={{ background: "rgba(217,190,132,0.16)", color: "#d9be84", borderColor: "rgba(217,190,132,0.35)" }} title="入口连续不可达；站点恢复后可再启动">入口不可达</span>
+                  <span className="badge" style={{ background: "rgba(217,190,132,0.16)", color: "#d9be84", borderColor: "rgba(217,190,132,0.35)" }} title={t("status.entryDeadTitle")}>{t("status.entryDead")}</span>
                 ) : null}
                 {stopReason === "env_closed" || stopReason === "env_unreachable" || project.config?.env_closed ? (
-                  <span className="badge" style={{ background: "rgba(198,69,69,.12)", color: "#c64545", borderColor: "rgba(198,69,69,.35)" }} title="评测任务已到期或平台不可达，已停止空转">环境已到期</span>
+                  <span className="badge" style={{ background: "rgba(198,69,69,.12)", color: "#c64545", borderColor: "rgba(198,69,69,.35)" }} title={t("status.envClosedTitle")}>{t("status.envClosed")}</span>
                 ) : null}
               </span>
               {isFlag ? (
-                <span className="muted" style={{ fontSize: 13 }} title="CTF 只看正确 flag 收工">
-                  正确 flag <b style={{ color: colors.primary }}>{flagsCorrect}/{needed}</b>
+                <span className="muted" style={{ fontSize: 13 }} title={t("project.flagsTitle")}>
+                  {t("project.flags")} <b style={{ color: colors.primary }}>{flagsCorrect}/{needed}</b>
                 </span>
               ) : isSrc ? (
-                <span className="muted" style={{ fontSize: 13 }} title="SRC 看已验证高危/严重，单条不停工">
-                  高危/严重 <b style={{ color: colors.primary }}>{visibleHigh + visibleCritical}</b>
+                <span className="muted" style={{ fontSize: 13 }} title={t("project.highCritTitle")}>
+                  {t("project.highCrit")} <b style={{ color: colors.primary }}>{visibleHigh + visibleCritical}</b>
                 </span>
               ) : null}
               <span
                 className="muted"
                 style={{ fontSize: 13 }}
-                title="沿橙线各边 weight 的乘积，只给控制台看。不是校准过的 getshell/夺旗概率，不参与调度、收工或御主决策。"
+                title={t("project.rceProbTitle")}
               >
-                RCE 概率 ≈ <b style={{ color: colors.primary }}>{graph.rce_path?.likelihood ?? 0}</b>
+                {t("project.rceProb")} <b style={{ color: colors.primary }}>{graph.rce_path?.likelihood ?? 0}</b>
               </span>
             </div>
             {stopHint ? (
@@ -431,17 +448,17 @@ export function ProjectPage() {
           </div>
           <div className="project-head-metrics">
             <div className="project-head-stats">
-              <Stat value={graph.stats.nodes} label="节点" />
-              <Stat value={visibleFindings.length} label="漏洞" />
-              <Stat value={visibleHigh} label="高危" warn={visibleHigh > 0} />
-              <Stat value={visibleCritical} label="严重" danger={visibleCritical > 0} />
-              <Stat value={graph.stats.frontier_open || graph.frontier?.open || 0} label="前沿" />
+              <Stat value={graph.stats.nodes} label={t("project.statNodes")} />
+              <Stat value={visibleFindings.length} label={t("project.statFindings")} />
+              <Stat value={visibleHigh} label={t("project.statHigh")} warn={visibleHigh > 0} />
+              <Stat value={visibleCritical} label={t("project.statCritical")} danger={visibleCritical > 0} />
+              <Stat value={graph.stats.frontier_open || graph.frontier?.open || 0} label={t("project.statFrontier")} />
             </div>
             <div className="project-head-actions">
               {id ? <ReportExportControls projectId={id} /> : null}
-              {running ? <button className="btn btn-danger" onClick={stop}>停止</button> : (
+              {running ? <button className="btn btn-danger" onClick={stop}>{t("project.stop")}</button> : (
                 canResume && isFlag ? (
-                  <button className="btn btn-ghost" onClick={startHardRestart} title="清空攻击图后重新开题">重新开题</button>
+                  <button className="btn btn-ghost" onClick={startHardRestart} title={t("project.restartTitle")}>{t("project.restart")}</button>
                 ) : null
               )}
             </div>
@@ -455,7 +472,7 @@ export function ProjectPage() {
         </div>
         <div className="card-cream project-side-pane">
           <div className="tabs project-side-tabs">
-            {([["timeline", "时间线"], ["findings", `漏洞 ${visibleFindings.length || ""}`], ["services", `发现的服务 ${serviceCount || ""}`], ["memory", "自进化"], ["supervisor", `自监督 ${supervisorCount || ""}`]] as const).map(([k, label]) => (
+            {([["timeline", t("project.tabTimeline")], ["findings", t("project.tabFindings", { n: visibleFindings.length || "" })], ["services", t("project.tabServices", { n: serviceCount || "" })], ["memory", t("project.tabMemory")], ["supervisor", t("project.tabSupervisor", { n: supervisorCount || "" })]] as const).map(([k, label]) => (
               <div key={k} className={`tab ${tab === k ? "active" : ""}`} onClick={() => setTab(k)}>{label}</div>
             ))}
           </div>
@@ -485,7 +502,7 @@ export function ProjectPage() {
       </div>
 
       <div style={{ marginTop: 20 }}>
-        <ChatDock events={events} running={running} queued={queued} onSend={handleSend} onStart={start} onStop={stop} startLabel={canResume ? "继续渗透" : "启动自动渗透"} />
+        <ChatDock events={events} running={running} queued={queued} onSend={handleSend} onStart={start} onStop={stop} startLabel={canResume ? t("project.resume") : t("project.startAuto")} />
       </div>
     </div>
   );

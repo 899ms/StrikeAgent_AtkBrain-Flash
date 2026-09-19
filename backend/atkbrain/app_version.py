@@ -90,7 +90,7 @@ def _from_release(data: dict) -> dict[str, Any]:
         "latest_tag": tag,
         "latest": normalize_ver(tag),
         "html_url": html,
-        "notes": body[:1200],
+        "notes": body[:20000],
     }
 
 
@@ -110,7 +110,7 @@ def _newest_release(items: list) -> dict[str, Any] | None:
 
 
 def _status_for(local: str, remote: str | None) -> tuple[str, str, bool]:
-    """远程没有发行、或本机不低于远程，都算最新。只提示，不升级。"""
+    """远程没有发行、或本机不低于远程，都算最新。落后则提示可热更新。"""
     if not remote:
         return "latest", "已是最新", True
     lv = _parse(local)

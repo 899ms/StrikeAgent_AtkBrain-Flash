@@ -199,7 +199,10 @@ class AgentContext:
                 brief = build_brief(self.project or {}, graph=g)
             except Exception:
                 brief = ""
-            apply_gate_to_guard(self.guard, g, brief=brief)
+            apply_gate_to_guard(
+                self.guard, g, brief=brief,
+                supplied_auth=((self.project or {}).get("config") or {}).get("supplied_auth"),
+            )
             self.guard.workspace_dir = self.workspace_dir
             self._gate_mono = now
         except Exception:

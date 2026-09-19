@@ -1834,10 +1834,19 @@ class LoopSupervisor:
         plan = None
         consult_error = ""
         obj = self.objective
+        from ..i18n.locale import config_output_lang
+        olang = "zh"
+        try:
+            crow = await db.fetchone("SELECT config FROM projects WHERE id=?", (self.project_id,))
+            olang = config_output_lang((crow or {}).get("config") if crow else {})
+        except Exception:
+            olang = "zh"
 
         async def _consult(brief: str, timeout: float | None = None, **_kw):
             return await consult_supervisor(
-                brief, timeout=timeout, system_prompt=supervisor_system_prompt(obj),
+                brief, timeout=timeout,
+                system_prompt=supervisor_system_prompt(obj, output_lang=olang),
+                project_id=self.project_id,
             )
 
         try:

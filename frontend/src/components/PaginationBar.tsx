@@ -1,3 +1,5 @@
+import { useT } from "../i18n";
+
 const PAGE_SIZES = [10, 30, 50] as const;
 const STORAGE_KEY = "atkbrain.pageSize";
 
@@ -45,6 +47,7 @@ export function PaginationBar({
   onPage: (p: number) => void;
   onPageSize: (n: number) => void;
 }) {
+  const { t } = useT();
   if (total <= 0) return null;
   const pages = Math.max(1, Math.ceil(total / pageSize));
   const cur = Math.min(Math.max(1, page), pages);
@@ -55,7 +58,7 @@ export function PaginationBar({
       <span className="muted pager-count">
         {from}–{to} / {total}
       </span>
-      <div className="pager-sizes" role="group" aria-label="每页条数">
+      <div className="pager-sizes" role="group" aria-label={t("pager.ariaSize")}>
         {PAGE_SIZES.map((n) => (
           <button
             key={n}
@@ -67,13 +70,13 @@ export function PaginationBar({
               onPage(1);
             }}
           >
-            {n} / 页
+            {t("pager.perPage", { n })}
           </button>
         ))}
       </div>
       <div className="pager-pages">
-        <button type="button" disabled={cur <= 1} onClick={() => onPage(cur - 1)} aria-label="上一页">
-          上一页
+        <button type="button" disabled={cur <= 1} onClick={() => onPage(cur - 1)} aria-label={t("pager.prev")}>
+          {t("pager.prev")}
         </button>
         {pageWindow(cur, pages).map((item, i) =>
           item === "…" ? (
@@ -89,8 +92,8 @@ export function PaginationBar({
             </button>
           ),
         )}
-        <button type="button" disabled={cur >= pages} onClick={() => onPage(cur + 1)} aria-label="下一页">
-          下一页
+        <button type="button" disabled={cur >= pages} onClick={() => onPage(cur + 1)} aria-label={t("pager.next")}>
+          {t("pager.next")}
         </button>
       </div>
     </div>

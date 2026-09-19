@@ -12,6 +12,7 @@ atkbrain-claude.env
 !**/.env.example
 yakit-mitm-ca.pem
 **/*.pem
+admin_bootstrap.secret
 
 # python / node
 __pycache__/

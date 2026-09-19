@@ -29,6 +29,7 @@ from .model import (
     coerce_declared_node_type,
     compute_risk_score,
     display_finding_severity,
+    finding_review_need,
     humanize_node_key,
     infer_node_type_from_key,
     is_critical,
@@ -2355,9 +2356,21 @@ async def _find_duplicate_finding(project_id: str, finding: FindingIn) -> dict |
     return None
 
 
-async def findings_pending_secondary(project_id: str) -> list[dict]:
-    """已入库但未完成二次验证+红队评级的可见漏洞（每个项目专职复核 Pi 用）。"""
+async def findings_pending_review(
+    project_id: str,
+    *,
+    want_secondary: bool | None = None,
+    want_rating: bool | None = None,
+) -> list[dict]:
+    """按开关过滤还缺二次验证和/或红队评级的可见漏洞。每条带 _review_mode。"""
     from .verify import is_visible_finding
+    from ..review.flags import get_review_flags
+
+    flags = get_review_flags()
+    do_sec = flags["secondary_verify"] if want_secondary is None else bool(want_secondary)
+    do_rate = flags["redteam_rating"] if want_rating is None else bool(want_rating)
+    if not do_sec and not do_rate:
+        return []
 
     rows = await db.fetchall(
         "SELECT * FROM findings WHERE project_id=? ORDER BY created_at DESC",
@@ -2370,23 +2383,41 @@ async def findings_pending_secondary(project_id: str) -> list[dict]:
         obj = normalize_objective(cfg.get("objective") or cfg.get("track"))
     except Exception:
         obj = None
-    out: list[dict] = []
-    reviewed_keys: set[str] = set()
+    sec_done_keys: set[str] = set()
+    rate_done_keys: set[str] = set()
     pending_rows: list[tuple[dict, set[str]]] = []
     for row in rows:
         if not finding_row_visible(obj, row) or not is_visible_finding(row):
             continue
         data = _serialize_finding(row)
         keys = finding_dedup_keys_from_row(row)
-        if data.get("secondary_verified") and normalize_redteam_rating(data.get("redteam_rating")):
-            reviewed_keys |= keys
-            continue
+        if data.get("secondary_verified"):
+            sec_done_keys |= keys
+        if normalize_redteam_rating(data.get("redteam_rating")):
+            rate_done_keys |= keys
         pending_rows.append((data, keys))
+    out: list[dict] = []
     for data, keys in pending_rows:
-        if keys and keys & reviewed_keys:
+        covered_sec = bool(data.get("secondary_verified")) or bool(keys and keys & sec_done_keys)
+        covered_rate = bool(normalize_redteam_rating(data.get("redteam_rating"))) or bool(keys and keys & rate_done_keys)
+        mode = finding_review_need(
+            {
+                "secondary_verified": covered_sec,
+                "redteam_rating": "info" if covered_rate else None,
+            },
+            want_secondary=do_sec,
+            want_rating=do_rate,
+        )
+        if not mode:
             continue
+        data["_review_mode"] = mode
         out.append(data)
     return out
+
+
+async def findings_pending_secondary(project_id: str) -> list[dict]:
+    """已入库但仍缺当前开关所要求复核的可见漏洞。"""
+    return await findings_pending_review(project_id)
 
 
 # ---- 意图 / 推理前沿 --------------------------------------------------------
@@ -3520,3 +3551,116 @@ async def get_graph(project_id: str, *, heal: bool = False) -> dict:
     else:
         _GRAPH_CACHE[project_id] = (time.monotonic(), out)
     return out
+
+
+async def list_library_findings(
+    *,
+    q: str = "",
+    project: str = "",
+    category: str = "",
+    severity: str = "",
+    track: str = "",
+    page: int = 1,
+    page_size: int = 30,
+) -> dict:
+    """跨项目漏洞库：非 rejected；counts 跟当前搜索同一过滤。可按赛道与集群父项名检索。"""
+    from .verify import is_visible_finding
+    from ..projects import project_track
+    from ..review.jobs import reviewing_modes
+
+    qn = str(q or "").strip().lower()
+    pn = str(project or "").strip().lower()
+    cat = str(category or "").strip().lower()
+    sev = str(severity or "").strip().lower()
+    tn = str(track or "").strip().lower()
+    if tn not in ("redteam", "ctf", "src"):
+        tn = ""
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 30), 100))
+
+    cat_rows = await db.fetchall(
+        """SELECT DISTINCT category FROM findings
+           WHERE IFNULL(verification_status, 'verified') != 'rejected'
+             AND category IS NOT NULL AND TRIM(category) != ''
+           ORDER BY category""",
+    )
+    categories = [str(r.get("category") or "").strip() for r in cat_rows if str(r.get("category") or "").strip()]
+
+    sql = """
+        SELECT f.*, p.name AS project_name, p.target AS project_target, p.kind AS project_kind,
+               p.config AS project_config, p.parent_id AS project_parent_id,
+               parent.name AS parent_name, parent.kind AS parent_kind
+        FROM findings f
+        JOIN projects p ON p.id = f.project_id
+        LEFT JOIN projects parent ON parent.id = p.parent_id
+        WHERE IFNULL(f.verification_status, 'verified') != 'rejected'
+    """
+    params: list[Any] = []
+    if qn:
+        sql += " AND (LOWER(IFNULL(f.title,'')) LIKE ? OR LOWER(f.id) LIKE ?)"
+        like = f"%{qn}%"
+        params.extend([like, like])
+    if pn:
+        sql += """ AND (
+            LOWER(IFNULL(p.name,'')) LIKE ?
+            OR LOWER(IFNULL(p.target,'')) LIKE ?
+            OR LOWER(IFNULL(parent.name,'')) LIKE ?
+            OR LOWER(IFNULL(parent.target,'')) LIKE ?
+        )"""
+        like_p = f"%{pn}%"
+        params.extend([like_p, like_p, like_p, like_p])
+    if cat:
+        sql += " AND LOWER(IFNULL(f.category,'')) = ?"
+        params.append(cat)
+    sql += " ORDER BY f.created_at DESC"
+    rows = await db.fetchall(sql, tuple(params))
+
+    matched: list[dict] = []
+    track_counts = {"all": 0, "redteam": 0, "ctf": 0, "src": 0}
+    for row in rows:
+        if not is_visible_finding(row):
+            continue
+        disp = display_finding_severity(row)
+        if sev and disp != sev:
+            continue
+        cfg = _loads(row.get("project_config")) or {}
+        ptr = project_track(row.get("project_kind"), cfg)
+        item = _serialize_finding(row)
+        item["project_id"] = row.get("project_id")
+        item["project_name"] = row.get("project_name") or ""
+        item["project_target"] = row.get("project_target") or ""
+        item["project_kind"] = row.get("project_kind") or ""
+        item["project_track"] = ptr
+        item["parent_id"] = row.get("project_parent_id") or ""
+        item["parent_name"] = row.get("parent_name") or ""
+        item["parent_kind"] = row.get("parent_kind") or ""
+        item["severity"] = disp
+        modes = reviewing_modes(str(item.get("project_id") or ""), str(item.get("id") or ""))
+        item["reviewing_secondary"] = "secondary" in modes
+        item["reviewing_rating"] = "rating" in modes
+        matched.append(item)
+        track_counts["all"] += 1
+        if ptr in track_counts:
+            track_counts[ptr] += 1
+
+    filtered = [x for x in matched if (not tn or x.get("project_track") == tn)]
+    counts = {"total": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for item in filtered:
+        counts["total"] += 1
+        disp = str(item.get("severity") or "")
+        if disp in counts:
+            counts[disp] += 1
+
+    filtered = sort_findings_by_severity(filtered)
+    total = len(filtered)
+    start = (page - 1) * page_size
+    items = filtered[start:start + page_size]
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "counts": counts,
+        "track_counts": track_counts,
+        "categories": categories,
+    }

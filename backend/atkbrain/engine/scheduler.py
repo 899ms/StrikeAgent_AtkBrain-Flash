@@ -89,20 +89,21 @@ class RunManager:
     """两道互不占槽的项目闸：
     - 红队 `redteam_sem`：红队与 SRC 同时跑的数量（默认 5）。
     - CTF `ctf_sem`：CTF / 评测子题（默认 3，上限 20）。
-    项目内 Pi 工人不设上限；顶栏只闸项目槽。
+    项目内 Pi：从者+工人默认 4，整机默认 32；顶栏 health 报真实数字。
     """
 
     def __init__(self) -> None:
         rt_limit = min(settings.max_redteam_concurrency, settings.max_redteam_concurrency_cap)
         ctf_limit = benchmark_slot_limit()
+        from ..agents.pi_runtime import pi_max_live_limit, pi_per_project_limit
         self.redteam_sem = DynamicSemaphore(max(1, rt_limit))
         self.ctf_sem = DynamicSemaphore(max(1, ctf_limit))
         # 旧名：只代表红队槽。CTF 不再走这道闸。
         self.project_sem = self.redteam_sem
         self.sem = self.redteam_sem
         self.bench_sem = self.ctf_sem
-        self.claude_per_project = 0
-        self.max_claude = 0
+        self.claude_per_project = pi_per_project_limit()
+        self.max_claude = pi_max_live_limit()
         self.handles: dict[str, RunHandle] = {}
         self.shutting_down = False
 
@@ -111,7 +112,7 @@ class RunManager:
 
     @property
     def claude_active(self) -> int:
-        """本机正在跑的 Pi 进程数（项目内工人不封顶）。"""
+        """本机正在跑的 Pi 进程数（含从者/工人/复核/一次性）。"""
         from ..agents.pi_runtime import live_pi_count
         return live_pi_count()
 
@@ -138,8 +139,9 @@ class RunManager:
         return self.handles.get(project_id)
 
     def _relink_claude_cap(self) -> None:
-        """项目内 Pi 不封顶；顶栏不再用「项目数 × 2」冒充上限。"""
-        self.max_claude = 0
+        from ..agents.pi_runtime import pi_max_live_limit, pi_per_project_limit
+        self.claude_per_project = pi_per_project_limit()
+        self.max_claude = pi_max_live_limit()
 
     async def set_concurrency(self, value: int, *, track: str = "redteam") -> int:
         """按赛道设置项目并发。track=ctf 只动 CTF 槽，红队反之。"""
@@ -169,11 +171,20 @@ class RunManager:
         return await self.set_redteam_concurrency(value)
 
     def set_claude_per_project(self, value: int) -> int:
-        """项目内 Pi 不设上限；忽略外部写入。"""
-        _ = value
-        self.claude_per_project = 0
+        from ..agents.pi_runtime import pi_per_project_limit
+        try:
+            cap = int(getattr(settings, "pi_per_project_cap", None)
+                      or getattr(settings, "claude_per_project_cap", None)
+                      or 8)
+        except (TypeError, ValueError):
+            cap = 8
+        if cap <= 0:
+            cap = 8
+        n = max(1, min(int(value or 0) or 4, cap))
+        settings.pi_per_project = n
+        settings.claude_per_project = n
         self._relink_claude_cap()
-        return self.claude_per_project
+        return pi_per_project_limit()
 
     def _drop_handle(self, project_id: str, handle: RunHandle | None = None) -> None:
         cur = self.handles.get(project_id)
@@ -405,9 +416,9 @@ class RunManager:
             },
             "claude": {
                 "active": self.claude_active,
-                "limit": 0,
-                "cap": 0,
-                "per_project": 0,
+                "limit": self.max_claude,
+                "cap": int(getattr(settings, "pi_max_live_cap", 96) or 96),
+                "per_project": self.claude_per_project,
             },
         }
 

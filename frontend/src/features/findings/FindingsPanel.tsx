@@ -3,6 +3,7 @@ import type { Finding, GraphNode, RTEvent } from "../../types";
 import { SeverityBadge, VerifyBadge, SecondaryVerifyBadge, RedteamRatingBadge } from "../../components/Badge";
 import { FindingReportModal } from "./FindingReportModal";
 import { displayFindingSeverity, isPlaceholderGraphNode, scrubCandidateRceLabel } from "../../theme";
+import { useT } from "../../i18n";
 
 export const NODE_VULN_ID_PREFIX = "node-vuln:";
 
@@ -92,17 +93,18 @@ export function latestFindingReview(events: RTEvent[]): FindingReviewState {
 }
 
 export function FindingReviewBanner({ review }: { review: FindingReviewState }) {
+  const { t } = useT();
   if (!review.running) return null;
   return (
     <div className="finding-review-banner" role="status">
       <span className="finding-review-dot" />
       <div>
-        <b>正在二次验证与红队评级</b>
-        <span className="muted"> · 专职 Pi 复核 {review.count || review.titles.length} 条已发现漏洞</span>
+        <b>{t("findings.reviewing")}</b>
+        <span className="muted">{t("findings.reviewN", { n: review.count || review.titles.length })}</span>
         {review.titles.length > 0 && (
           <ul className="finding-review-titles">
-            {review.titles.slice(0, 6).map((t) => (
-              <li key={t}>{t}</li>
+            {review.titles.slice(0, 6).map((title) => (
+              <li key={title}>{title}</li>
             ))}
           </ul>
         )}
@@ -121,6 +123,7 @@ export function FindingsPanel({
   src?: boolean;
   review?: FindingReviewState;
 }) {
+  const { t } = useT();
   const [selected, setSelected] = useState<Finding | null>(null);
   const visible = useMemo(() => collectVulns(findings, nodes, { src }), [findings, nodes, src]);
   const reviewingIds = new Set(review?.running ? review.ids : []);
@@ -131,7 +134,7 @@ export function FindingsPanel({
       <>
         {review ? <FindingReviewBanner review={review} /> : null}
         <p className="muted" style={{ fontSize: 14 }}>
-          暂无漏洞。
+          {t("findings.empty")}
         </p>
       </>
     );
@@ -171,10 +174,10 @@ export function FindingsPanel({
               </div>
               <p className="muted" style={{ fontSize: 12, margin: "8px 0 0" }}>
                 {isNodeOnlyVuln(f)
-                  ? "图上漏洞节点 · 点击查看节点详情"
+                  ? t("findings.nodeTip")
                   : reviewing
-                    ? "专职 Pi 正在二次验证并做红队评级"
-                    : "点击查看完整漏洞报告 · MD 下载"}
+                    ? t("findings.reviewTip")
+                    : t("findings.openTip")}
               </p>
             </div>
           );

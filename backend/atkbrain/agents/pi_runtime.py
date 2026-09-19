@@ -18,19 +18,103 @@ from typing import Any
 from ..config import REPO_ROOT, settings
 from ..engine.turn_close import role_wrote_turn_done
 
-_LIVE: dict[int, str] = {}
+# pid -> (project_id, role)。只在确认进程已死后 pop。
+_LIVE: dict[int, tuple[str, str]] = {}
+_RESERVED: list[tuple[str, str]] = []
+_SPAWN_COND: asyncio.Condition | None = None
 
 # 猎面留下内置 read 给 Pi 加载 SKILL.md；其余官方内置工具一律排除。
 EXCLUDE_BUILTIN_TOOLS = "bash,powershell,edit,write,grep,find,ls"
+ONESHOT_ROLES = frozenset({
+    "supervisor", "evolve", "finding-page", "report-export", "oneshot",
+})
+REVIEW_ROLE = "finding-review"
 
 EmitFn = Callable[..., Awaitable[None]]
 
 
+def pi_max_live_limit() -> int:
+    try:
+        n = int(getattr(settings, "pi_max_live", None) or 32)
+    except (TypeError, ValueError):
+        n = 32
+    try:
+        cap = int(getattr(settings, "pi_max_live_cap", None) or 96)
+    except (TypeError, ValueError):
+        cap = 96
+    if n <= 0:
+        n = 32
+    if cap <= 0:
+        cap = 96
+    return max(1, min(n, cap))
+
+
+def pi_per_project_limit() -> int:
+    raw = getattr(settings, "pi_per_project", None)
+    if raw in (None, 0, "0"):
+        raw = getattr(settings, "claude_per_project", None)
+    try:
+        n = int(raw or 4)
+    except (TypeError, ValueError):
+        n = 4
+    try:
+        cap = int(
+            getattr(settings, "pi_per_project_cap", None)
+            or getattr(settings, "claude_per_project_cap", None)
+            or 8
+        )
+    except (TypeError, ValueError):
+        cap = 8
+    if n <= 0:
+        n = 4
+    if cap <= 0:
+        cap = 8
+    return max(1, min(n, cap))
+
+
+def cap_hunt_workers(roles: list[str], *, per_project: int | None = None) -> list[str]:
+    """从者占 1 槽，工人截断到 per_project-1。"""
+    n = (per_project if per_project is not None else pi_per_project_limit()) - 1
+    if n <= 0:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in roles:
+        name = str(raw or "").strip().lower()
+        if not name or name in seen or name in ONESHOT_ROLES or name == REVIEW_ROLE:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _counts_toward_per_project(role: str) -> bool:
+    r = (role or "").strip().lower()
+    if not r or r in ONESHOT_ROLES or r == REVIEW_ROLE:
+        return False
+    return True
+
+
 def live_pi_count() -> int:
-    dead = [pid for pid in _LIVE if not _pid_alive(pid)]
-    for pid in dead:
-        _LIVE.pop(pid, None)
+    _reap_dead()
     return len(_LIVE)
+
+
+def live_pi_for_project(project_id: str, *, hunt_only: bool = False) -> int:
+    want = (project_id or "").strip()
+    if not want:
+        return 0
+    _reap_dead()
+    n = 0
+    for rec in _LIVE.values():
+        if rec[0] != want:
+            continue
+        if hunt_only and not _counts_toward_per_project(rec[1]):
+            continue
+        n += 1
+    return n
 
 
 def _pid_alive(pid: int) -> bool:
@@ -41,60 +125,274 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _kill_pid(pid: int) -> None:
+def _reap_dead() -> None:
+    dead = [pid for pid in _LIVE if not _pid_alive(pid)]
+    for pid in dead:
+        _LIVE.pop(pid, None)
+
+
+def _kill_pid(pid: int, *, sig: int = signal.SIGKILL) -> None:
     try:
-        os.killpg(pid, signal.SIGKILL)
+        os.killpg(pid, sig)
     except OSError:
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, sig)
         except OSError:
             pass
 
 
-def _proc_project_ids(pid: int) -> str:
+def _proc_env_value(pid: int, key: str) -> str:
     try:
         env = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
         return ""
-    needle = b"ATKBRAIN_PROJECT_ID="
+    needle = (key + "=").encode("utf-8")
     i = env.find(needle)
     if i < 0:
+        return ""
+    if i > 0 and env[i - 1] != 0:
+        # 避免前缀误匹配
         return ""
     rest = env[i + len(needle):]
     end = rest.find(b"\0")
     return rest[:end if end >= 0 else None].decode("utf-8", "replace").strip()
 
 
-def kill_live_for_project(project_id: str) -> int:
-    """停猎后扫掉仍活着的 Pi 进程组。interrupt/close 超时或被取消时会漏。"""
+def _proc_project_ids(pid: int) -> str:
+    return _proc_env_value(pid, "ATKBRAIN_PROJECT_ID")
+
+
+def _proc_role(pid: int) -> str:
+    return _proc_env_value(pid, "ATKBRAIN_PI_ROLE")
+
+
+def _proc_cmdline(pid: int) -> bytes:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return b""
+
+
+def _proc_ppid(pid: int) -> int:
+    try:
+        text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        if line.startswith("PPid:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return 0
+    return 0
+
+
+def _is_backend_cmd(cmd: bytes) -> bool:
+    return b"atkbrain.main" in cmd or b"atkbrain-backend" in cmd
+
+
+def _is_pi_cmdline(cmd: bytes) -> bool:
+    if not cmd or _is_backend_cmd(cmd):
+        return False
+    blob = cmd.replace(b"\0", b" ").lower()
+    if b"--mode" in blob and b"rpc" in blob:
+        return True
+    if b"pi-coding-agent" in blob:
+        return True
+    first = cmd.split(b"\0", 1)[0]
+    base = first.rsplit(b"/", 1)[-1].lower()
+    return base in (b"pi", b"pi.exe")
+
+
+def _children_map() -> dict[int, list[int]]:
+    out: dict[int, list[int]] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        ppid = _proc_ppid(pid)
+        if ppid <= 0:
+            continue
+        out.setdefault(ppid, []).append(pid)
+    return out
+
+
+def _descendants(root: int, cmap: dict[int, list[int]] | None = None) -> list[int]:
+    cmap = cmap if cmap is not None else _children_map()
+    found: list[int] = []
+    stack = list(cmap.get(root, []))
+    while stack:
+        pid = stack.pop()
+        found.append(pid)
+        stack.extend(cmap.get(pid, []))
+    return found
+
+
+def _kill_tree(root: int, *, sig: int = signal.SIGKILL) -> None:
+    kids = _descendants(root)
+    for pid in reversed(kids):
+        _kill_pid(pid, sig=sig)
+    _kill_pid(root, sig=sig)
+
+
+def _scan_pi_pids(*, project_id: str = "", role: str = "") -> set[int]:
+    want_p = (project_id or "").strip()
+    want_r = (role or "").strip()
+    if not want_p and not want_r:
+        return set()
+    found: set[int] = set()
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return found
+    cmap = _children_map()
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        cmd = _proc_cmdline(pid)
+        if _is_backend_cmd(cmd):
+            continue
+        env_p = _proc_project_ids(pid)
+        env_r = _proc_role(pid)
+        if want_p and want_r:
+            matched = env_p == want_p and env_r == want_r
+        elif want_p:
+            matched = env_p == want_p
+        else:
+            matched = env_r == want_r
+        if not matched:
+            continue
+        found.add(pid)
+        found.update(_descendants(pid, cmap))
+    return found
+
+
+def _untrack_dead(pid: int | None) -> bool:
+    if not pid:
+        return True
+    if _pid_alive(pid):
+        return False
+    _LIVE.pop(pid, None)
+    return True
+
+
+def _spawn_cond() -> asyncio.Condition:
+    global _SPAWN_COND
+    if _SPAWN_COND is None:
+        _SPAWN_COND = asyncio.Condition()
+    return _SPAWN_COND
+
+
+def _notify_spawn() -> None:
+    cond = _SPAWN_COND
+    if cond is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _wake() -> None:
+        async with cond:
+            cond.notify_all()
+
+    loop.create_task(_wake())
+
+
+def _can_spawn(project_id: str, role: str) -> bool:
+    _reap_dead()
+    if live_pi_count() + len(_RESERVED) >= pi_max_live_limit():
+        return False
+    if _counts_toward_per_project(role) and (project_id or "").strip():
+        n = live_pi_for_project(project_id, hunt_only=True)
+        n += sum(
+            1 for p, r in _RESERVED
+            if p == project_id and _counts_toward_per_project(r)
+        )
+        if n >= pi_per_project_limit():
+            return False
+    return True
+
+
+async def wait_spawn_slot(
+    *, project_id: str = "", role: str = "", timeout: float = 180.0,
+) -> None:
+    """超额排队，不静默再开。"""
+    deadline = time.monotonic() + max(1.0, float(timeout or 180.0))
+    cond = _spawn_cond()
+    async with cond:
+        while True:
+            if _can_spawn(project_id, role):
+                _RESERVED.append(((project_id or "").strip(), (role or "").strip()))
+                return
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                raise RuntimeError(
+                    f"Pi 进程闸已满（全局 {pi_max_live_limit()} / "
+                    f"项目 {pi_per_project_limit()}），放弃拉起 {role or 'pi'}"
+                )
+            try:
+                await asyncio.wait_for(cond.wait(), timeout=min(1.0, remain))
+            except TimeoutError:
+                continue
+
+
+def note_spawned(pid: int, *, project_id: str = "", role: str = "") -> None:
+    rec = ((project_id or "").strip(), (role or "").strip())
+    try:
+        _RESERVED.remove(rec)
+    except ValueError:
+        if _RESERVED:
+            _RESERVED.pop(0)
+    _LIVE[int(pid)] = rec
+    _notify_spawn()
+
+
+def note_spawn_failed(*, project_id: str = "", role: str = "") -> None:
+    rec = ((project_id or "").strip(), (role or "").strip())
+    try:
+        _RESERVED.remove(rec)
+    except ValueError:
+        if _RESERVED:
+            _RESERVED.pop(0)
+    _notify_spawn()
+
+
+def kill_live_for_project(
+    project_id: str, *, keep_roles: set[str] | frozenset[str] | None = None,
+) -> int:
+    """停猎后扫掉仍活着的 Pi 进程树。interrupt/close 超时或被取消时会漏。"""
     want = (project_id or "").strip()
     if not want:
         return 0
+    keep = {str(x).strip() for x in (keep_roles or ()) if str(x).strip()}
     targets: set[int] = set()
-    for proc_pid, owner in list(_LIVE.items()):
-        if owner == want:
-            targets.add(proc_pid)
-    try:
-        for name in os.listdir("/proc"):
-            if not name.isdigit():
-                continue
-            proc_pid = int(name)
-            if _proc_project_ids(proc_pid) != want:
-                continue
-            try:
-                cmd = Path(f"/proc/{proc_pid}/cmdline").read_bytes()
-            except OSError:
-                continue
-            if b"atkbrain.main" in cmd or b"atkbrain-backend" in cmd:
-                continue
-            targets.add(proc_pid)
-    except OSError:
-        pass
+    _reap_dead()
+    for proc_pid, rec in list(_LIVE.items()):
+        if rec[0] != want:
+            continue
+        if rec[1] in keep:
+            continue
+        targets.add(proc_pid)
+        targets.update(_descendants(proc_pid))
+    for proc_pid in _scan_pi_pids(project_id=want):
+        if keep and _proc_role(proc_pid) in keep:
+            continue
+        targets.add(proc_pid)
     n = 0
-    for proc_pid in targets:
-        _kill_pid(proc_pid)
-        _LIVE.pop(proc_pid, None)
+    for proc_pid in list(targets):
+        _kill_tree(proc_pid, sig=signal.SIGKILL)
         n += 1
+    time.sleep(0.05)
+    for proc_pid in list(targets):
+        if not _pid_alive(proc_pid):
+            _LIVE.pop(proc_pid, None)
+    _notify_spawn()
     try:
         from ..exec.runner import kill_cmds_for_project
         n += kill_cmds_for_project(want)
@@ -281,11 +579,10 @@ class PiSession:
         self._settled = asyncio.Event()
         self._prompt_ok: asyncio.Future | None = None
         self._buf = b""
-        self._prompt_file = ""
-        self._text_acc: list[str] = []
-        self._thought_acc: list[str] = []
         self._last_text = ""
         self._last_thought = ""
+        self.last_prompt_at = 0.0
+        self.idle_turns = 0
 
     def _cmd(self) -> list[str]:
         os.makedirs(self.cwd, exist_ok=True)
@@ -327,17 +624,25 @@ class PiSession:
     async def start(self) -> None:
         ensure_pi_agent_dir()
         cmd = self._cmd()
-        self.proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd,
-            env=_child_env(project_id=self.project_id or None, tools=self.tools, role=self.role),
-            start_new_session=True,
-        )
-        if self.proc.pid:
-            _LIVE[self.proc.pid] = self.project_id or self.role
+        await wait_spawn_slot(project_id=self.project_id, role=self.role)
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd,
+                env=_child_env(project_id=self.project_id or None, tools=self.tools, role=self.role),
+                start_new_session=True,
+            )
+        except Exception:
+            note_spawn_failed(project_id=self.project_id, role=self.role)
+            raise
+        if self.proc and self.proc.pid:
+            note_spawned(self.proc.pid, project_id=self.project_id, role=self.role)
+        else:
+            note_spawn_failed(project_id=self.project_id, role=self.role)
+        self._closed = False
         self._reader_task = asyncio.create_task(self._read_loop())
         asyncio.create_task(self._drain_stderr())
 
@@ -512,6 +817,8 @@ class PiSession:
         self._last_thought = ""
         self._settled = asyncio.Event()
         self._turn_closed = False
+        self.last_prompt_at = time.monotonic()
+        self.idle_turns = 0
         loop = asyncio.get_running_loop()
         self._prompt_ok = loop.create_future()
         self._req += 1
@@ -563,31 +870,39 @@ class PiSession:
                 proc.stdin.close()
             except Exception:
                 pass
+        if pid:
+            _kill_tree(pid, sig=signal.SIGTERM)
         if proc and proc.returncode is None:
-            try:
-                if pid:
-                    os.killpg(pid, signal.SIGTERM)
-            except OSError:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=4)
             except Exception:
+                if pid:
+                    _kill_tree(pid, sig=signal.SIGKILL)
+                    for extra in _scan_pi_pids(project_id=self.project_id, role=self.role):
+                        _kill_tree(extra, sig=signal.SIGKILL)
                 try:
-                    if pid:
-                        os.killpg(pid, signal.SIGKILL)
-                except OSError:
-                    try:
+                    if proc:
                         proc.kill()
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
+                try:
+                    if proc:
+                        await asyncio.wait_for(proc.wait(), timeout=1)
+                except Exception:
+                    pass
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
-        if pid:
-            _LIVE.pop(pid, None)
+        if pid and _pid_alive(pid):
+            _kill_tree(pid, sig=signal.SIGKILL)
+            await asyncio.sleep(0.08)
+        if not _untrack_dead(pid) and pid:
+            # 仍活着：留在 _LIVE，计数诚实；再按环境变量扫一轮
+            for extra in _scan_pi_pids(project_id=self.project_id, role=self.role):
+                _kill_tree(extra, sig=signal.SIGKILL)
+            await asyncio.sleep(0.05)
+            _untrack_dead(pid)
         self.proc = None
+        _notify_spawn()
 
 
 _GRAPH_TOOLS = frozenset({

@@ -593,6 +593,9 @@ async def _create_challenge_subproject(parent_id: str, ch: dict, base: str, pare
     hint = ch.get("hint") or ch.get("tip") or ch.get("prompt")
     if hint:
         cfg["hint"] = hint
+    supplied = pcfg.get("supplied_auth") if lab_src else None
+    if isinstance(supplied, dict) and supplied:
+        cfg["supplied_auth"] = supplied
     # 起容器前无 target/scope；start_challenge 后再回填
     scope = Scope(targets=[], mode="strict")
     await db.execute(

@@ -5,6 +5,7 @@ import {
 import type { Graph, GraphEdge, GraphNode } from "../../types";
 import { nodeTypeColor, graphNodeTypeLabel, graphNodeDisplayType, graphNodeDisplaySeverity, isGetshellNode, showsShellStar, severityColor, severityLabel, displayFindingSeverity, lateralColor, formatNodeDetail, scrubCandidateRceLabel } from "../../theme";
 import { popIn } from "../../anim";
+import { useT } from "../../i18n";
 
 interface SimNode extends GraphNode {
   x: number; y: number; vx?: number; vy?: number; fx?: number | null; fy?: number | null;
@@ -35,15 +36,7 @@ const TYPE_RING: Record<string, number> = {
   honeypot: 220,
 };
 
-const LEGEND_TYPES: Record<string, string> = {
-  target: "目标",
-  service: "服务",
-  danger: "危险点",
-  vuln: "漏洞",
-  credential: "凭证",
-  foothold: "立足点",
-  info: "信息",
-};
+const LEGEND_TYPE_KEYS = ["target", "service", "danger", "vuln", "credential", "foothold", "info"] as const;
 
 function graphTitle(title?: string) {
   const t = scrubCandidateRceLabel(title) || title || "";
@@ -423,6 +416,7 @@ function topologyKey(graph: Graph) {
 }
 
 export function AttackGraph({ graph, onSelect, selectedKey, onClear }: { graph: Graph; onSelect: (n: GraphNode) => void; selectedKey?: string; onClear?: () => void }) {
+  const { t } = useT();
   const wrapRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const simRef = useRef<any>(null);
@@ -895,27 +889,27 @@ export function AttackGraph({ graph, onSelect, selectedKey, onClear }: { graph: 
       style={{ height: fullscreen ? "100%" : H }}
     >
       <div className="graph-controls">
-        <button type="button" className="graph-ctrl-btn" title="重新散开布局" onClick={relayout}>
-          重布
+        <button type="button" className="graph-ctrl-btn" title={t("graph.relayoutTitle")} onClick={relayout}>
+          {t("graph.relayout")}
         </button>
-        <button type="button" className="graph-ctrl-btn" title="适配全部节点" onClick={() => { autoFitRef.current = true; fitToNodes(); }}>
-          适配
+        <button type="button" className="graph-ctrl-btn" title={t("graph.fitTitle")} onClick={() => { autoFitRef.current = true; fitToNodes(); }}>
+          {t("graph.fit")}
         </button>
         <button
           type="button"
           className="graph-ctrl-btn"
-          title={fullscreen ? "退出全屏" : "全屏显示"}
+          title={fullscreen ? t("graph.exitFull") : t("graph.fullTitle")}
           onClick={toggleFullscreen}
         >
-          {fullscreen ? "退出全屏" : "全屏"}
+          {fullscreen ? t("graph.exitFull") : t("graph.full")}
         </button>
       </div>
 
       {graph.stats?.lateral_active && (
         <div className="graph-lateral-banner">
           <span className="graph-lateral-dot" />
-          内网横向进行中
-          {graph.stats.hosts_footed ? ` · ${graph.stats.hosts_footed} 台主机` : ""}
+          {t("graph.lateralOn")}
+          {graph.stats.hosts_footed ? t("graph.lateralHosts", { n: graph.stats.hosts_footed }) : ""}
         </div>
       )}
 
@@ -1040,16 +1034,16 @@ export function AttackGraph({ graph, onSelect, selectedKey, onClear }: { graph: 
           <div className="node-popover-type">
             {graphNodeTypeLabel(selectedData)}
             {" · "}
-            {severityLabel[graphNodeDisplaySeverity(selectedData)] || graphNodeDisplaySeverity(selectedData)}
+            {severityLabel(graphNodeDisplaySeverity(selectedData)) || graphNodeDisplaySeverity(selectedData)}
             {selectedData.status ? ` · ${selectedData.status}` : ""}
             {showsShellStar(selectedData) ? " · GETSHELL / RCE" : ""}
           </div>
           <strong>{scrubCandidateRceLabel(selectedData.title) || selectedData.title}</strong>
           <div className="node-popover-key">{selectedData.key}</div>
           <div className="node-popover-meta">
-            风险 {selectedData.risk_score}
-            {formatUnix(selectedData.created_at) ? ` · 创建 ${formatUnix(selectedData.created_at)}` : ""}
-            {formatUnix(selectedData.updated_at) ? ` · 更新 ${formatUnix(selectedData.updated_at)}` : ""}
+            {t("graph.risk", { n: selectedData.risk_score })}
+            {formatUnix(selectedData.created_at) ? t("graph.created", { t: formatUnix(selectedData.created_at) }) : ""}
+            {formatUnix(selectedData.updated_at) ? t("graph.updated", { t: formatUnix(selectedData.updated_at) }) : ""}
           </div>
           {!!selectedData.tags?.length && (
             <div className="node-popover-tags">
@@ -1059,7 +1053,7 @@ export function AttackGraph({ graph, onSelect, selectedKey, onClear }: { graph: 
           {selectedDetail && <pre className="node-popover-detail">{selectedDetail}</pre>}
           {(selectedInbound.length > 0 || selectedOutbound.length > 0) && (
             <div className="node-popover-sec">
-              <div className="node-popover-sec-title">攻击链关系</div>
+              <div className="node-popover-sec-title">{t("graph.chain")}</div>
               {selectedInbound.map((e) => (
                 <div key={e.id} className="node-popover-rel">← {e.from} · {e.relation}{e.rationale ? ` · ${e.rationale}` : ""}</div>
               ))}
@@ -1070,10 +1064,10 @@ export function AttackGraph({ graph, onSelect, selectedKey, onClear }: { graph: 
           )}
           {selectedFindings.length > 0 && (
             <div className="node-popover-sec">
-              <div className="node-popover-sec-title">关联发现</div>
+              <div className="node-popover-sec-title">{t("graph.related")}</div>
               {selectedFindings.map((f) => (
                 <div key={f.id} className="node-popover-rel">
-                  [{severityLabel[displayFindingSeverity(f)] || displayFindingSeverity(f)}] {scrubCandidateRceLabel(f.title) || f.title}
+                  [{severityLabel(displayFindingSeverity(f)) || displayFindingSeverity(f)}] {scrubCandidateRceLabel(f.title) || f.title}
                   {f.description ? ` — ${f.description}` : ""}
                 </div>
               ))}
@@ -1083,21 +1077,21 @@ export function AttackGraph({ graph, onSelect, selectedKey, onClear }: { graph: 
       )}
 
       <div className="legend">
-        {Object.entries(LEGEND_TYPES).map(([k, label]) => (
+        {LEGEND_TYPE_KEYS.map((k) => (
           <span className="row" key={k}>
-            <i className="dot" style={{ background: nodeTypeColor[k] }} /> {label}
+            <i className="dot" style={{ background: nodeTypeColor[k] }} /> {t(`graph.${k}`)}
           </span>
         ))}
         <span className="row">
-          <i style={{ width: 16, height: 3, background: "var(--primary)", display: "inline-block" }} /> RCE 最优路径
+          <i style={{ width: 16, height: 3, background: "var(--primary)", display: "inline-block" }} /> {t("graph.legendRce")}
         </span>
         <span className="row">
-          <i style={{ width: 16, height: 3, background: lateralColor, display: "inline-block" }} /> 内网横向 (漏洞→新目标)
+          <i style={{ width: 16, height: 3, background: lateralColor, display: "inline-block" }} /> {t("graph.legendLateral")}
         </span>
         <span className="row">
           <i style={{
             width: 16, height: 0, borderTop: `2px dashed ${lateralColor}`, display: "inline-block", opacity: 0.85,
-          }} /> 跳板可达 (漏洞→新内网)
+          }} /> {t("graph.legendPivot")}
         </span>
         <span className="row">
           <span style={{

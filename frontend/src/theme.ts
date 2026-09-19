@@ -1,3 +1,5 @@
+import { t } from "./i18n";
+
 // 设计令牌 —— 来自 DESIGN.md（getdesign claude 模板）。UI 唯一视觉事实来源。
 export const colors = {
   primary: "#cc785c",
@@ -27,10 +29,10 @@ export const colors = {
 
 export const severityColor: Record<string, string> = {
   critical: "#c64545",
-  high: "#d4a017",
-  medium: "#8e8b82",
-  low: "#b8b3a8",
-  info: "#a09d96",
+  high: "#cc785c",
+  medium: "#d4a017",
+  low: "#5db8a6",
+  info: "#8e8b82",
 };
 
 // 攻击图节点按类型的主色：危险点暖橙 / 漏洞朱红 / GETSHELL 同色相朱红但更鲜艳
@@ -46,17 +48,22 @@ export const nodeTypeColor: Record<string, string> = {
   goal: "#f23636",
 };
 
-export const nodeTypeLabel: Record<string, string> = {
-  target: "目标",
-  info: "信息",
-  service: "服务",
-  danger: "危险点",
-  vuln: "漏洞",
-  credential: "凭证",
-  foothold: "立足点",
-  honeypot: "蜜罐",
-  goal: "GETSHELL / RCE",
+const NODE_TYPE_MSG: Record<string, string> = {
+  target: "graph.target",
+  info: "graph.info",
+  service: "graph.service",
+  danger: "graph.danger",
+  vuln: "graph.vuln",
+  credential: "graph.credential",
+  foothold: "graph.foothold",
+  honeypot: "graph.honeypot",
+  goal: "graph.goal",
 };
+
+export function nodeTypeLabel(type: string): string {
+  const key = NODE_TYPE_MSG[type];
+  return key ? t(key) : type;
+}
 
 type GraphTypeNode = {
   type?: string;
@@ -135,21 +142,26 @@ export function isFlagGoalNode(n: GraphTypeNode): boolean {
 }
 
 export function graphNodeTypeLabel(n: GraphTypeNode): string {
-  if (isFlagGoalNode(n)) return "夺旗";
+  if (isFlagGoalNode(n)) return t("graph.flag");
   // GETSHELL 与 RCE 同属一类
-  if (isGetshellNode(n)) return "GETSHELL / RCE";
-  if (n.type === "goal") return "目标成果";
-  const t = graphNodeDisplayType(n);
-  return nodeTypeLabel[t] || t || "";
+  if (isGetshellNode(n)) return t("graph.goal");
+  if (n.type === "goal") return t("graph.goalGeneric");
+  const typ = graphNodeDisplayType(n);
+  return nodeTypeLabel(typ) || typ || "";
 }
 
-export const severityLabel: Record<string, string> = {
-  info: "信息",
-  low: "低",
-  medium: "中",
-  high: "高",
-  critical: "严重",
+const SEVERITY_MSG: Record<string, string> = {
+  info: "graph.sevInfo",
+  low: "graph.sevLow",
+  medium: "graph.sevMedium",
+  high: "graph.sevHigh",
+  critical: "graph.sevCritical",
 };
+
+export function severityLabel(sev: string): string {
+  const key = SEVERITY_MSG[sev];
+  return key ? t(key) : sev;
+}
 
 const RT_RATINGS = new Set(["critical", "high", "medium", "low", "info"]);
 

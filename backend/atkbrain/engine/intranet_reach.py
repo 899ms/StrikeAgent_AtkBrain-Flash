@@ -722,7 +722,9 @@ def intent_private_hosts(intent: dict | None) -> list[str]:
     return private_hosts_from_text(blob, limit=8)
 
 
-def apply_gate_to_guard(guard: Any, graph: dict | None, *, brief: str = "") -> None:
+def apply_gate_to_guard(
+    guard: Any, graph: dict | None, *, brief: str = "", supplied_auth: Any = None,
+) -> None:
     """把图上的前置条件刷进 Guard，供 check_command 使用。"""
     if guard is None:
         return
@@ -734,8 +736,11 @@ def apply_gate_to_guard(guard: Any, graph: dict | None, *, brief: str = "") -> N
             credential_candidates_from_brief,
             graph_cred_blob,
             password_values,
+            secrets_from_supplied_auth,
         )
         blob = f"{brief or ''}\n{graph_cred_blob(graph)}"
-        guard.allowed_secrets = password_values(credential_candidates_from_brief(blob))
+        secrets = password_values(credential_candidates_from_brief(blob))
+        secrets |= secrets_from_supplied_auth(supplied_auth)
+        guard.allowed_secrets = secrets
     except Exception:
         guard.allowed_secrets = set(getattr(guard, "allowed_secrets", None) or ())

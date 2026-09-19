@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../../api";
 import { Modal } from "../../components/Modal";
+import { useT, type Locale } from "../../i18n";
 
 export type ReportExportJob = {
   id: string;
@@ -44,12 +45,16 @@ export function ReportExportControls({
   extraClass?: string;
   disabled?: boolean;
 }) {
+  const { t, locale } = useT();
   const [menu, setMenu] = useState(false);
   const [open, setOpen] = useState(false);
   const [job, setJob] = useState<ReportExportJob | null>(null);
   const [err, setErr] = useState("");
+  const [lang, setLang] = useState<Locale>(locale);
   const poll = useRef<ReturnType<typeof setInterval> | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => { setLang(locale); }, [locale]);
 
   const stopPoll = () => {
     if (poll.current) {
@@ -79,10 +84,10 @@ export function ReportExportControls({
       format: fmt,
       status: "running",
       percent: 1,
-      message: "专职导出 Pi 排队中…",
+      message: t("report.queued"),
     });
     try {
-      const j = await api.startReportExport(projectId, fmt);
+      const j = await api.startReportExport(projectId, fmt, lang);
       setJob(j);
       stopPoll();
       let misses = 0;
@@ -100,15 +105,15 @@ export function ReportExportControls({
           return true;
         } catch (e: any) {
           const msg = String(e?.message || e);
-          if (/导出任务不存在/.test(msg)) {
-            setErr("专职导出 Pi 任务已中断，请重新导出");
-            setJob((prev) => (prev ? { ...prev, status: "error", message: "专职导出 Pi 任务已中断，请重新导出" } : prev));
+          if (/导出任务不存在|Export job/i.test(msg)) {
+            setErr(t("report.jobGone"));
+            setJob((prev) => (prev ? { ...prev, status: "error", message: t("report.jobGone") } : prev));
             stopPoll();
             return false;
           }
           misses += 1;
           if (misses >= 8) {
-            setErr("正在等待专职导出 Pi…网络闪断会自动重试，请勿关闭");
+            setErr(t("report.retryNet"));
           }
           return true;
         }
@@ -150,26 +155,41 @@ export function ReportExportControls({
           onClick={() => setMenu((v) => !v)}
         >
           <DownloadIcon />
-          <span>报告导出</span>
+          <span>{t("report.export")}</span>
           <ChevronIcon />
         </button>
         {menu && (
           <div className="report-export-menu" role="menu">
-            <button type="button" role="menuitem" onClick={() => start("html")}>导出 HTML</button>
-            <button type="button" role="menuitem" onClick={() => start("pdf")}>导出 PDF</button>
+            <div className="row" style={{ gap: 6, padding: "6px 10px", alignItems: "center" }}>
+              <span className="muted" style={{ fontSize: 12 }}>{t("report.lang")}</span>
+              <button
+                type="button"
+                className={lang === "zh" ? "btn btn-primary btn-sm" : "btn btn-secondary btn-sm"}
+                onClick={(e) => { e.stopPropagation(); setLang("zh"); }}
+              >
+                {t("common.langZh")}
+              </button>
+              <button
+                type="button"
+                className={lang === "en" ? "btn btn-primary btn-sm" : "btn btn-secondary btn-sm"}
+                onClick={(e) => { e.stopPropagation(); setLang("en"); }}
+              >
+                {t("common.langEn")}
+              </button>
+            </div>
+            <button type="button" role="menuitem" onClick={() => start("html")}>{t("report.html")}</button>
+            <button type="button" role="menuitem" onClick={() => start("pdf")}>{t("report.pdf")}</button>
           </div>
         )}
       </div>
       {open && (
-        <Modal title="生成交付报告" onClose={() => { if (!running) { setOpen(false); stopPoll(); } }}>
+        <Modal title={t("report.title")} onClose={() => { if (!running) { setOpen(false); stopPoll(); } }}>
           <p className="muted" style={{ fontSize: 13, marginTop: 0 }}>
-            {isPdf
-              ? "由专职导出 Pi 撰写封面、摘要与漏洞卡片，再套入母版并渲染 PDF。与猎洞、二次验证、自进化不是同一条会话。请勿关闭。"
-              : "由专职导出 Pi 撰写封面、摘要与漏洞卡片，再套入母版后下载。与猎洞、二次验证、自进化不是同一条会话。请勿关闭。"}
+            {isPdf ? t("report.pdfHint") : t("report.htmlHint")}
           </p>
           <div className={`import-progress${failed ? " is-error" : ""}`} role="status" aria-live="polite">
             <div className="import-progress-head">
-              <strong>{failed ? "生成失败" : done ? "报告已就绪" : "正在生成"}</strong>
+              <strong>{failed ? t("report.fail") : done ? t("report.ready") : t("report.running")}</strong>
               <span className="mono">{Math.round(pct)}%</span>
             </div>
             <div className="import-progress-track">
@@ -179,15 +199,15 @@ export function ReportExportControls({
               />
             </div>
             <div className="import-progress-meta muted">
-              {err || job?.error || job?.message || "请稍候…"}
-              {done && job?.claude ? " · 专职导出 Pi 已撰写" : ""}
-              {done && job?.claude_error ? ` · 导出 Pi 未完成：${job.claude_error}` : ""}
+              {err || job?.error || job?.message || t("report.wait")}
+              {done && job?.claude ? t("report.wrote") : ""}
+              {done && job?.claude_error ? t("report.piErr", { msg: job.claude_error }) : ""}
             </div>
           </div>
           <div className="row" style={{ gap: 8, marginTop: 16 }}>
             {done && (
               <button className="btn btn-primary" type="button" onClick={openFile}>
-                下载 {isPdf ? "PDF" : "HTML"}
+                {t("report.download", { fmt: isPdf ? "PDF" : "HTML" })}
               </button>
             )}
             <button
@@ -196,7 +216,7 @@ export function ReportExportControls({
               disabled={running}
               onClick={() => { setOpen(false); stopPoll(); }}
             >
-              {running ? "生成中…" : "关闭"}
+              {running ? t("report.generating") : t("common.close")}
             </button>
           </div>
         </Modal>

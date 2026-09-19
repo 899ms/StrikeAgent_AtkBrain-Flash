@@ -168,6 +168,48 @@ CREATE INDEX IF NOT EXISTS idx_findings_project ON findings(project_id);
 CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);
 CREATE INDEX IF NOT EXISTS idx_intents_project ON intents(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_memory_fp ON memory(target_fp);
+
+CREATE TABLE IF NOT EXISTS auth_users (
+    id            TEXT PRIMARY KEY,
+    username      TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    totp_secret   TEXT,
+    totp_enabled  INTEGER NOT NULL DEFAULT 0,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    bootstrap_login_done INTEGER NOT NULL DEFAULT 0,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id          TEXT PRIMARY KEY,
+    token_hash  TEXT NOT NULL UNIQUE,
+    user_id     TEXT NOT NULL,
+    expires_at  REAL NOT NULL,
+    created_at  REAL NOT NULL,
+    last_seen   REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_challenges (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    secret      TEXT NOT NULL,
+    expires_at  REAL NOT NULL,
+    consumed    INTEGER NOT NULL DEFAULT 0,
+    extra       TEXT,
+    created_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_lockouts (
+    key         TEXT PRIMARY KEY,
+    fails       INTEGER NOT NULL DEFAULT 0,
+    window_start REAL NOT NULL,
+    locked_until REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_hash ON auth_sessions(token_hash);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_exp ON auth_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_auth_challenges_exp ON auth_challenges(expires_at);
 """
 
 
@@ -279,6 +321,16 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_findings_verification "
             "ON findings(project_id, verification_status)"
         )
+
+        cur = await self._conn.execute("PRAGMA table_info(auth_users)")
+        ucols = {row[1] for row in await cur.fetchall()}
+        await cur.close()
+        for name, definition in (
+            ("must_change_password", "INTEGER NOT NULL DEFAULT 0"),
+            ("bootstrap_login_done", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in ucols:
+                await self._conn.execute(f"ALTER TABLE auth_users ADD COLUMN {name} {definition}")
 
         # 自进化剧本改为 Claude 蒸馏；一次性清掉旧机械路线。
         await self._conn.execute(

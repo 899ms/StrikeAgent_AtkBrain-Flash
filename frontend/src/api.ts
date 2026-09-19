@@ -1,4 +1,7 @@
 import type { AppVersion, FindingDetail, Graph, Project, RTEvent } from "./types";
+import { getLocale } from "./i18n/locale";
+import { t } from "./i18n/t";
+import { appBase, withAppBase } from "./appBase";
 
 export type AssetGroupPreview = {
   primary: string;
@@ -21,6 +24,25 @@ export type AssetPreviewResult = {
   note?: string;
 };
 
+export type AuthMe = {
+  required: boolean;
+  authenticated: boolean;
+  username: string | null;
+  totp_enabled: boolean;
+  must_change_password?: boolean;
+  show_default_creds?: boolean;
+  default_username?: string | null;
+};
+
+export type LoginResult = {
+  ok: boolean;
+  username?: string;
+  totp_enabled?: boolean;
+  need_totp?: boolean;
+  pending_id?: string;
+  must_change_password?: boolean;
+};
+
 const J = { "Content-Type": "application/json" };
 
 /** API Token：优先 localStorage，其次 Vite 环境变量（ATKBRAIN_API_TOKEN 非空时后端强制校验）。 */
@@ -33,8 +55,10 @@ export function getApiToken(): string {
 }
 
 function authHeaders(): Record<string, string> {
-  const t = getApiToken();
-  return t ? { "X-API-Token": t } : {};
+  const tok = getApiToken();
+  const headers: Record<string, string> = { "X-Locale": getLocale() };
+  if (tok) headers["X-API-Token"] = tok;
+  return headers;
 }
 
 function isNetworkErr(raw: string) {
@@ -48,13 +72,34 @@ function sleep(ms: number) {
 async function j<T>(r: Response): Promise<T> {
   if (!r.ok) {
     let msg = r.statusText;
+    let retryAfter = 0;
+    let code = "";
     try {
       const b = await r.json();
       msg = b.detail || msg;
+      retryAfter = Number(b.retry_after || 0);
+      code = String(b.code || "");
     } catch {}
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg)) as Error & { status?: number; retryAfter?: number; code?: string };
+    err.status = r.status;
+    if (retryAfter) err.retryAfter = retryAfter;
+    if (code) err.code = code;
+    throw err;
   }
   return r.json();
+}
+
+function maybeLoginRedirect(r: Response, input: RequestInfo | URL) {
+  if (r.status !== 401) return;
+  if (typeof window === "undefined") return;
+  const here = window.location.pathname.replace(appBase(), "") || "/";
+  if (here === "/login" || here.endsWith("/login")) return;
+  const path = typeof input === "string" ? input : input instanceof URL ? input.pathname : "";
+  if (String(path).includes("/api/auth")) return;
+  const copy = r.clone();
+  copy.json().then((b: any) => {
+    if (b?.detail === "login-required") window.location.assign(withAppBase("/login"));
+  }).catch(() => {});
 }
 
 /** fetch 包装：GET 遇瞬时断连自动重试；把 Failed to fetch 转成可读错误。 */
@@ -64,28 +109,88 @@ async function req<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> 
   const retryable = method === "GET" || method === "HEAD";
   let lastRaw = "";
   const attempts = retryable ? 4 : 1;
+  const url = typeof input === "string" ? withAppBase(input) : input;
   for (let i = 0; i < attempts; i++) {
     try {
-      const r = await fetch(input, { ...init, headers });
+      const r = await fetch(url, { credentials: "include", ...init, headers });
+      maybeLoginRedirect(r, url);
       return await j<T>(r);
     } catch (e: any) {
       lastRaw = String(e?.message || e || "");
       if (!isNetworkErr(lastRaw) || i === attempts - 1) {
         if (isNetworkErr(lastRaw)) {
-          throw new Error("无法连接后端（Failed to fetch）。请确认 StrikeAgent_AtkBrain-Flash 后端已运行，并刷新页面后重试。");
+          throw new Error(t("errors.backend"));
         }
         throw e instanceof Error ? e : new Error(lastRaw);
       }
       await sleep(400 * 2 ** i);
     }
   }
-  throw new Error(lastRaw || "请求失败");
+  throw new Error(lastRaw || t("errors.request"));
 }
 
 export const api = {
   health: () => req<any>("/api/health"),
+  authMe: () => req<AuthMe>("/api/auth/me"),
+  authPubkey: () => req<{ alg: string; pem: string; ticket?: string }>("/api/auth/pubkey"),
+  authLogin: (body: Record<string, unknown>) =>
+    req<LoginResult>("/api/auth/login", { method: "POST", headers: J, body: JSON.stringify(body) }),
+  authLogout: () => req<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
+  totpSetup: () => req<{ otpauth_url: string; secret: string; setup_id: string }>("/api/auth/totp/setup"),
+  totpConfirm: (setup_id: string, code: string) =>
+    req<{ ok: boolean; totp_enabled: boolean }>("/api/auth/totp/confirm", {
+      method: "POST",
+      headers: J,
+      body: JSON.stringify({ setup_id, code }),
+    }),
+  authPassword: (body: { ticket: string; new_cipher: string; old_cipher?: string }) =>
+    req<{ ok: boolean; must_change_password: boolean }>("/api/auth/password", {
+      method: "POST",
+      headers: J,
+      body: JSON.stringify(body),
+    }),
   settings: () => req<any>("/api/settings"),
+  setReviewFlags: (body: { secondary_verify?: boolean; redteam_rating?: boolean }) =>
+    req<{ review: { secondary_verify: boolean; redteam_rating: boolean } }>("/api/settings/review", {
+      method: "POST",
+      headers: J,
+      body: JSON.stringify(body),
+    }),
+  setHuntClocks: (body: Record<string, number>) =>
+    req<{ hunt_clocks: Record<string, number>; hard_stop: Record<string, { label?: string; conditions?: string[] }> }>(
+      "/api/settings/hunt-clocks",
+      { method: "POST", headers: J, body: JSON.stringify(body) },
+    ),
+  listFindings: (params?: { q?: string; project?: string; category?: string; severity?: string; track?: string; page?: number; page_size?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.q) sp.set("q", params.q);
+    if (params?.project) sp.set("project", params.project);
+    if (params?.category) sp.set("category", params.category);
+    if (params?.severity) sp.set("severity", params.severity);
+    if (params?.track) sp.set("track", params.track);
+    if (params?.page) sp.set("page", String(params.page));
+    if (params?.page_size) sp.set("page_size", String(params.page_size));
+    const qs = sp.toString();
+    return req<any>(`/api/findings${qs ? `?${qs}` : ""}`);
+  },
+  reviewFinding: (pid: string, fid: string, mode: "secondary" | "rating") =>
+    req<any>(`/api/projects/${pid}/findings/${fid}/review`, {
+      method: "POST",
+      headers: J,
+      body: JSON.stringify({ mode }),
+    }),
+  reviewJob: (jobId: string) => req<any>(`/api/review-jobs/${encodeURIComponent(jobId)}`),
   version: (refresh = false) => req<AppVersion>(`/api/version${refresh ? "?refresh=true" : ""}`),
+  applyVersion: () =>
+    req<{
+      ok: boolean;
+      started?: boolean;
+      already_latest?: boolean;
+      tag?: string;
+      target?: string;
+      local?: string;
+      latest?: string;
+    }>("/api/version/apply", { method: "POST", headers: J }),
   setConcurrency: (value: number, track: "redteam" | "ctf" = "redteam") =>
     req<any>("/api/settings/concurrency", { method: "POST", headers: J, body: JSON.stringify({ value, track }) }),
   proxyStatus: () => req<any>("/api/proxy/status"),
@@ -104,6 +209,12 @@ export const api = {
 
   listProjects: () => req<Project[]>("/api/projects"),
   getProject: (id: string) => req<Project>(`/api/projects/${id}`),
+  setOutputLang: (id: string, lang: string) =>
+    req<{ ok: boolean; output_lang: string }>(`/api/projects/${id}/output_lang`, {
+      method: "PATCH",
+      headers: J,
+      body: JSON.stringify({ output_lang: lang }),
+    }),
   createProject: (body: any) =>
     req<Project>("/api/projects", { method: "POST", headers: J, body: JSON.stringify(body) }),
   deleteProject: (id: string) => req<any>(`/api/projects/${id}`, { method: "DELETE" }),
@@ -134,27 +245,17 @@ export const api = {
   runs: (id: string) => req<any[]>(`/api/projects/${id}/runs`),
   projectMemory: (id: string) => req<{ episodes: any[]; playbook?: any[] }>(`/api/projects/${id}/memory`),
 
-  reportUrl: (id: string, format: string) => {
-    const t = getApiToken();
-    const base = `/api/projects/${id}/report?format=${format}`;
-    return t ? `${base}&token=${encodeURIComponent(t)}` : base;
-  },
-  startReportExport: (id: string, format: string) =>
-    req<any>(`/api/projects/${id}/report/export?format=${encodeURIComponent(format)}`, { method: "POST" }),
+  reportUrl: (id: string, format: string) => withAppBase(`/api/projects/${id}/report?format=${format}`),
+  startReportExport: (id: string, format: string, lang?: string) =>
+    req<any>(`/api/projects/${id}/report/export?format=${encodeURIComponent(format)}&lang=${encodeURIComponent(lang || getLocale())}`, { method: "POST" }),
   reportExportStatus: (id: string, jobId: string) =>
     req<any>(`/api/projects/${id}/report/export/${encodeURIComponent(jobId)}`),
-  reportExportFileUrl: (id: string, jobId: string) => {
-    const t = getApiToken();
-    const base = `/api/projects/${id}/report/export/${encodeURIComponent(jobId)}/file`;
-    return t ? `${base}?token=${encodeURIComponent(t)}` : base;
-  },
+  reportExportFileUrl: (id: string, jobId: string) =>
+    withAppBase(`/api/projects/${id}/report/export/${encodeURIComponent(jobId)}/file`),
   getFinding: (id: string, fid: string) =>
     req<FindingDetail>(`/api/projects/${id}/findings/${fid}`),
-  findingReportUrl: (id: string, fid: string) => {
-    const t = getApiToken();
-    const base = `/api/projects/${id}/findings/${fid}/report?format=md`;
-    return t ? `${base}&token=${encodeURIComponent(t)}` : base;
-  },
+  findingReportUrl: (id: string, fid: string, lang?: string) =>
+    withAppBase(`/api/projects/${id}/findings/${fid}/report?format=md&lang=${encodeURIComponent(lang || getLocale())}`),
   poc: (id: string, fid: string) => req<{ curl: string; python: string }>(`/api/projects/${id}/findings/${fid}/poc`),
 
   // 集群（Phase 2）

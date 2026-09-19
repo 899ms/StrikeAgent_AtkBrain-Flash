@@ -420,7 +420,7 @@ async def _run_runtime_review(
             f"御主运行时审查：本猎已约 {int(elapsed_sec // 60)} 分钟、第 {turn} 轮。"
             f"由你判断是否续跑。\n"
         ) + (text or "")
-        rr = await consult_runtime_review(text)
+        rr = await consult_runtime_review(text, project_id=project_id)
         diag = str((rr or {}).get("diagnosis") or "")
         plan = str((rr or {}).get("next_plan") or "")
         cont = bool((rr or {}).get("continue", True))
@@ -1648,6 +1648,22 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                     break
             steering_msgs = list(manager.drain_steering(project_id))
             human_steers = list(steering_msgs)
+            if human_steers:
+                try:
+                    from ..agents.brief_creds import merge_steering_supplied_auth, normalize_supplied_auth
+                    cfg = dict(project.get("config") or {})
+                    merged = merge_steering_supplied_auth(cfg.get("supplied_auth"), human_steers)
+                    if merged and merged != normalize_supplied_auth(cfg.get("supplied_auth")):
+                        cfg["supplied_auth"] = merged
+                        project = {**project, "config": cfg}
+                        from ..projects import update_config as _persist_cfg
+                        await _persist_cfg(project_id, cfg)
+                        try:
+                            _apply_bound_project(agent, project, scope)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             ehost = str(target or project.get("target") or "").split(":")[0]
             if ehost and not await _entry_reachable(project, ehost):
                 live_shell = False
@@ -1783,7 +1799,10 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
                 pass
             try:
                 from ..engine.intranet_reach import apply_gate_to_guard
-                apply_gate_to_guard(agent.guard, graph, brief=brief)
+                apply_gate_to_guard(
+                    agent.guard, graph, brief=brief,
+                    supplied_auth=(project.get("config") or {}).get("supplied_auth"),
+                )
                 agent.guard.workspace_dir = getattr(agent, "workspace_dir", "") or agent.ctx.workspace_dir
             except Exception:
                 pass
@@ -2614,12 +2633,20 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
             await _save_hunt(completed_turn)
             from .advisor_schedule import stall_pause_due
             from ..objective import objective_allows_flag, objective_is_src
-            stall_limit = int(getattr(settings, "loop_stall_limit", 10) or 0)
+            stall_limit = int(getattr(settings, "loop_stall_limit_redteam", 0)
+                              or getattr(settings, "loop_stall_limit", 10) or 0)
             if uses_ctf_hunt_clocks(objective):
                 try:
                     stall_limit = int(getattr(settings, "loop_stall_limit_flag", 0) or 0)
                 except (TypeError, ValueError):
                     stall_limit = 0
+            elif objective_is_src(objective):
+                try:
+                    stall_limit = int(
+                        getattr(settings, "loop_stall_limit_src", stall_limit) or stall_limit
+                    )
+                except (TypeError, ValueError):
+                    pass
             elif objective == "flag":
                 stall_limit = int(
                     getattr(settings, "loop_stall_limit_flag", stall_limit) or stall_limit

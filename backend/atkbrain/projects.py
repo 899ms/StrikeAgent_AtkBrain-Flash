@@ -210,6 +210,13 @@ def _backfill_track(kind: str, cfg: dict) -> dict:
     return {**cfg, "track": "redteam"}
 
 
+def project_track(kind: str | None, config: dict | None = None) -> str:
+    """项目赛道：redteam | ctf | src。缺字段时按 objective / kind 回填。"""
+    cfg = _backfill_track(kind or "single", dict(config or {}))
+    t = str(cfg.get("track") or "redteam").lower()
+    return t if t in ("redteam", "ctf", "src") else "redteam"
+
+
 def _serialize(row: dict) -> dict:
     kind = row["kind"]
     cfg = _loads(row["config"]) or {}

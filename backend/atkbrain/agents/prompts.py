@@ -245,7 +245,7 @@ SYSTEM_PROMPT_TMPL = """你是 StrikeAgent_AtkBrain-Flash 的主智能体（从�
 {brief_block}
 # 双层协同
 你是从者：计划、汇总、短验证；局面必须守住，御主方案是参考假说。长侦察/爆破/利用由调度并发拉起的角色会话执行。
-- 本回合调度会按御主方案并发拉起角色工人（无上限）：{subagent_list}。你不要再开子进程。
+- 本回合调度会按御主方案并发拉起角色工人（项目内有闸）：{subagent_list}。你不要再开子进程。
   HTTP 活体本回合必须有 `web-exploit` 工人打洞；禁止只用从者 curl 代替测→证。
 {recon_block}
 - 局面相关或建议的多条 **彼此独立** 的 Intent：同一回合并行工人；有前后依赖的再按顺序。
@@ -392,7 +392,16 @@ def build_brief(project: dict | None, graph: dict | None = None) -> str:
     vhosts = _project_vhosts(project)
     ports = _project_ports(project)
     machine_note = len(vhosts) > 1 or bool(vhosts and ports)
-    if not desc and not hint and not entry_url and not machine_note:
+    from .brief_creds import (
+        credential_candidates_from_brief,
+        format_supplied_auth_brief,
+        graph_cred_blob,
+        normalize_supplied_auth,
+    )
+    from ..objective import objective_is_src
+    supplied = normalize_supplied_auth(cfg.get("supplied_auth"))
+    supplied_block = format_supplied_auth_brief(supplied, src=objective_is_src(_obj or cfg.get("track")))
+    if not desc and not hint and not entry_url and not machine_note and not supplied_block:
         return ""
     meta: list[str] = []
     if cfg.get("flag_count") and (_obj is None or objective_allows_flag(_obj)):
@@ -402,7 +411,6 @@ def build_brief(project: dict | None, graph: dict | None = None) -> str:
     if cfg.get("total_score"):
         meta.append(f"总分={cfg.get('total_score')}")
     meta_line = "（" + "、".join(meta) + "）" if meta else ""
-    from .brief_creds import credential_candidates_from_brief, graph_cred_blob
     parts: list[str] = []
     if desc:
         parts.append(f"{desc}{meta_line}")
@@ -431,10 +439,12 @@ def build_brief(project: dict | None, graph: dict | None = None) -> str:
         )
     extra = graph_cred_blob(graph)
     cands = credential_candidates_from_brief(
-        "\n".join(x for x in (desc, hint, extra) if x)
+        "\n".join(x for x in (desc, hint, extra, supplied_block) if x)
     )
     if cands:
         parts.append("题面已出现的账密（禁止合成、禁止扩字典）：" + "；".join(cands[:8]))
+    if supplied_block:
+        parts.append(supplied_block)
     pending = [
         f for f in ((graph or {}).get("findings") or [])
         if isinstance(f, dict) and not f.get("secondary_verified")
@@ -478,6 +488,7 @@ def _brief_block(brief: str) -> str:
 
 def build_system_prompt(
     scope: Scope, workspace: str, objective: str = "getshell", brief: str = "",
+    output_lang: str | None = None,
 ) -> str:
     if scope.targets:
         tdesc = "、".join(scope.targets)
@@ -516,13 +527,15 @@ def build_system_prompt(
     subagent_list = "、".join(f"`{k}`" for k in agents)
     tool_list = ", ".join(tool_names(obj))
     frags = _flag_fragments(obj)
-    return SYSTEM_PROMPT_TMPL.format(
+    text = SYSTEM_PROMPT_TMPL.format(
         scope_desc=scope_desc, tool_list=tool_list, workspace=workspace,
         goal_block=_GOAL_BLOCKS[obj], goal_tool_hint=_GOAL_TOOL_HINTS[obj],
         subagent_list=subagent_list or "（无）", brief_block=_brief_block(brief),
         kali_kit=KIT_SKILL_HINT,
         **frags,
     )
+    from ..i18n.prompts import with_output_lang
+    return with_output_lang(text, output_lang)
 
 
 def builtin_fs_tools(objective: str = "getshell") -> list[str]:
@@ -551,49 +564,111 @@ def default_fanout_roles(objective: str = "getshell") -> list[str]:
 
 FINDING_REVIEW_ROLE = "finding-review"
 
-_FINDING_REVIEW_SYSTEM = (
-    "你是本项目专职的漏洞二次验证与红队评级员，不是猎洞工人，也不写漏洞页长文。"
+_FINDING_REVIEW_COMMON = (
+    "你不是猎洞工人，也不写漏洞页长文。"
     "不要扫目录、不要开新意图、不要 report_shell / report_flag、不要再开子进程。"
-    "只处理清单里未二次验证或缺红队评级的已入库漏洞。"
     "禁止新建漏洞条目：report_finding 必须带清单里的 finding_id 和原来的 node_key；"
     "禁止换 node_key/标题把同一 CVE 或同一上传接口再报一条。"
+    "不要写 report_summary/report_impact/report_rating/report_repro/report_fix，页面另有撰稿补。"
+    "版本命中或仅白名单文件写不是 RCE：未打成命令执行则不要评 high/critical，也不要报 rce。"
+    "任意文件读写默认中危，不要压成低危；不要把一般 SQLi/存储 XSS/越权进后台抬成高危。"
+    "四级表不是白名单：对不上条目的已入库洞也要按清单任务处理，就近中危或低危，不要标 info 丢掉。"
+    "命令用 run_cmd，Web 用 http_request。"
+)
+
+_FINDING_REVIEW_BOTH = (
+    "你是本项目专职的漏洞二次验证与红队评级员。"
+    + _FINDING_REVIEW_COMMON
+    + "只处理清单里未二次验证或缺红队评级的已入库漏洞。"
     "对每一条先独立再打一遍（换观测通道 / 重放 PoC / 对照预期回显），不能只把首次 evidence 再贴一遍；"
     "打完同一轮 report_finding：必须带原来的 finding_id（有则必填）和 node_key，"
     "secondary_verified=true、redteam_rating（critical|high|medium|low|info）、"
     "redteam_rating_rationale（至少 40 字，写清怎么打、看到什么、为何按四级表是这个级）。"
-    "不要写 report_summary/report_impact/report_rating/report_repro/report_fix，页面另有撰稿补。"
     "二次打不出同样危害也要收口：仍标 secondary_verified=true，评级降为 info 或 low。"
-    "版本命中或仅白名单文件写不是 RCE：未打成命令执行则不要评 high/critical，也不要报 rce。"
-    "任意文件读写默认中危，不要压成低危；不要把一般 SQLi/存储 XSS/越权进后台抬成高危。"
-    "四级表不是白名单：对不上条目的已入库洞也要复核并评级，就近中危或低危，不要标 info 丢掉。"
-    "命令用 run_cmd，Web 用 http_request。"
+    "\n" + RATING_RUBRIC
+)
+
+_FINDING_REVIEW_SECONDARY = (
+    "你是本项目专职的漏洞二次验证员，本回合只做二次验证，不要给红队评级。"
+    + _FINDING_REVIEW_COMMON
+    + "只处理清单里尚未二次验证的已入库漏洞。"
+    "对每一条独立再打一遍（换观测通道 / 重放 PoC / 对照预期回显），不能只把首次 evidence 再贴一遍；"
+    "打完 report_finding：必须带原来的 finding_id 和 node_key，secondary_verified=true，"
+    "redteam_rating_rationale 至少 40 字写清怎么打、看到什么。不要填 redteam_rating。"
+    "二次打不出同样危害也要收口：仍标 secondary_verified=true。"
+)
+
+_FINDING_REVIEW_RATING = (
+    "你是本项目专职的红队评级员，本回合只做红队评级，不要去做二次验证动手。"
+    + _FINDING_REVIEW_COMMON
+    + "只处理清单里还没有合法 redteam_rating 的已入库漏洞。"
+    "根据已有 evidence/PoC/二次验证叙述按四级表对号入座；"
+    "report_finding 必须带原来的 finding_id 和 node_key，"
+    "redteam_rating（critical|high|medium|low|info）与 redteam_rating_rationale（至少 40 字，写清为何是这个级）。"
+    "不要改 secondary_verified。未打成命令执行不要把 RCE 评严重/高危。"
     "\n" + RATING_RUBRIC
 )
 
 
-def finding_review_system_prompt(workspace_dir: str, objective: str = "getshell") -> str:
+def finding_review_system_prompt(
+    workspace_dir: str, objective: str = "getshell", output_lang: str | None = None,
+    mode: str = "both",
+) -> str:
     _ = objective
-    return (
-        f"{_FINDING_REVIEW_SYSTEM}\n"
+    m = str(mode or "both").strip().lower()
+    if m == "secondary":
+        body = _FINDING_REVIEW_SECONDARY
+    elif m == "rating":
+        body = _FINDING_REVIEW_RATING
+    else:
+        body = _FINDING_REVIEW_BOTH
+    text = (
+        f"{body}\n"
         f"工作目录：{workspace_dir}\n"
         "可用工具：run_cmd, http_request, report_finding, note。"
     )
+    from ..i18n.prompts import with_output_lang
+    return with_output_lang(text, output_lang)
 
 
-def build_finding_review_instruction(findings: list[dict]) -> str:
-    lines = [
-        "本回合只二次验证下列已入库漏洞（未二次验证或缺红队评级）。",
-        "逐条动手后用 report_finding 回写同一条：必须带下面的 finding_id，不要新建标题或换 node_key。",
-        "同一 CVE / 同一上传接口禁止再报一条。红队评级按四级表对号入座，禁止抬级或压级。",
-        "未打成命令执行不要把 RCE 评严重/高危，也不要标 rce；任意文件操作默认中危。",
-        "回写时必须带齐二次验证与红队评级。不要写漏洞页五段，页面另补。",
-        "",
-    ]
+def build_finding_review_instruction(findings: list[dict], mode: str | None = None) -> str:
+    modes = {str(f.get("_review_mode") or mode or "both") for f in findings}
+    global_mode = str(mode or "").strip().lower()
+    if not global_mode:
+        global_mode = "both" if len(modes) != 1 else next(iter(modes))
+    if global_mode == "secondary":
+        head = [
+            "本回合只二次验证下列已入库漏洞。",
+            "逐条动手后用 report_finding 回写同一条：必须带下面的 finding_id，不要新建标题或换 node_key。",
+            "回写 secondary_verified=true，理由至少 40 字写清怎么再打的。不要填红队评级。不要写漏洞页五段。",
+        ]
+    elif global_mode == "rating":
+        head = [
+            "本回合只给下列已入库漏洞做红队评级。",
+            "逐条用 report_finding 回写同一条：必须带下面的 finding_id，不要新建标题或换 node_key。",
+            "回写 redteam_rating 与至少 40 字理由。不要改二次验证。不要写漏洞页五段。",
+        ]
+    else:
+        head = [
+            "本回合处理下列已入库漏洞：按每条任务做二次验证、红队评级，或两件事一起做。",
+            "逐条动手后用 report_finding 回写同一条：必须带下面的 finding_id，不要新建标题或换 node_key。",
+            "同一 CVE / 同一上传接口禁止再报一条。红队评级按四级表对号入座，禁止抬级或压级。",
+            "未打成命令执行不要把 RCE 评严重/高危，也不要标 rce；任意文件操作默认中危。",
+            "不要写漏洞页五段，页面另补。",
+        ]
+    lines = head + [""]
     for i, f in enumerate(findings[:12], 1):
+        item_mode = str(f.get("_review_mode") or global_mode or "both")
         lines.append(f"### {i}. {f.get('title') or '(无标题)'}")
         lines.append(f"- finding_id: `{f.get('id') or ''}`")
         lines.append(f"- node_key: `{f.get('node_key') or ''}`")
         lines.append(f"- severity/category: {f.get('severity') or ''} / {f.get('category') or ''}")
+        if item_mode == "secondary":
+            lines.append("- 本条任务：只做二次验证。secondary_verified=true + 理由≥40字。不要填红队评级。")
+        elif item_mode == "rating":
+            lines.append("- 本条任务：只做红队评级。redteam_rating + 理由≥40字。不要改二次验证。")
+        else:
+            lines.append("- 本条任务：二次验证与红队评级同一轮写齐。")
         ev = str(f.get("evidence") or "").strip()
         if ev:
             lines.append(f"- 首次 evidence: {ev[:500]}")

@@ -262,7 +262,7 @@ class YakMcpClient:
             self.last_error = f"拉起 yak mcp 失败：{e}"[:200]
             return None
         self._spawned_url = url
-        deadline = time.monotonic() + 12.0
+        deadline = time.monotonic() + 45.0
         while time.monotonic() < deadline:
             await asyncio.sleep(0.35)
             if await self._initialize(url):
@@ -302,6 +302,9 @@ class YakMcpClient:
                 return bool(self.session_id)
             if not spawn:
                 return False
+            if self._spawned and self._spawned.returncode is None:
+                self._ensured_at = time.monotonic()
+                return bool(self.session_id)
             fallback = int(getattr(settings, "yakit_mcp_port", None) or DEFAULT_MCP_PORT)
             spawned = await self._spawn_mcp(port=fallback, enable_all=True)
             self._full_attempted = True

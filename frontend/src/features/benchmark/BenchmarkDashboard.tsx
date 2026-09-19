@@ -7,17 +7,37 @@ import { BatchSelectionBar } from "../../components/BatchSelectionBar";
 import { PaginationBar, pageItems, readPageSize } from "../../components/PaginationBar";
 import { colors } from "../../theme";
 import { ReportExportControls } from "../report/ExportReport";
+import { t, useT } from "../../i18n";
 
 const statusColor: Record<string, string> = {
   running: colors.success, queued: colors.warning, completed: colors.primary, idle: colors.mutedSoft, error: colors.error, stopped: colors.muted,
 };
-const statusLabel: Record<string, string> = {
-  running: "运行中", queued: "排队中", completed: "已完成", idle: "空闲", error: "失败", stopped: "已停止",
-};
 
-const STATUS_FILTER: Record<string, string> = {
-  all: "全部", running: "进行中", completed: "已完成", idle: "未完成", stopped: "已暂停", error: "失败",
-};
+function statusText(key: string): string {
+  const map: Record<string, string> = {
+    running: t("status.running"),
+    queued: t("status.queued"),
+    completed: t("status.completed"),
+    idle: t("status.idle"),
+    error: t("status.error"),
+    stopped: t("status.stopped"),
+  };
+  return map[key] || key;
+}
+
+const STATUS_FILTER_KEYS = ["all", "running", "completed", "idle", "stopped", "error"] as const;
+
+function statusFilterText(key: string): string {
+  const map: Record<string, string> = {
+    all: t("projects.statusAll"),
+    running: t("projects.statusRunning"),
+    completed: t("projects.statusCompleted"),
+    idle: t("projects.statusIdle"),
+    stopped: t("projects.statusStopped"),
+    error: t("projects.statusError"),
+  };
+  return map[key] || key;
+}
 
 function filterStatusOf(c: Board["challenges"][number]): string {
   if (c.is_completed || c.status === "completed") return "completed";
@@ -43,6 +63,7 @@ interface Board {
 }
 
 export function BenchmarkDashboard({ project }: { project: Project }) {
+  const { t: tr } = useT();
   const [board, setBoard] = useState<Board | null>(null);
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
@@ -58,8 +79,8 @@ export function BenchmarkDashboard({ project }: { project: Project }) {
   const load = () => api.scoreboard(project.id).then(setBoard).catch(() => {});
   useEffect(() => {
     load();
-    const t = setInterval(load, 12000);
-    return () => clearInterval(t);
+    const tmr = setInterval(load, 12000);
+    return () => clearInterval(tmr);
   }, [project.id]);
 
   const chs = board?.challenges || [];
@@ -88,7 +109,7 @@ export function BenchmarkDashboard({ project }: { project: Project }) {
   const doImport = async () => {
     setBusy("import"); setErr("");
     try { await api.bmImport(project.id); await load(); }
-    catch (e: any) { setErr(e.message || "拉题失败（检查 base_url/token/VPN）"); }
+    catch (e: any) { setErr(e.message || tr("bench.importFailed")); }
     finally { setBusy(""); }
   };
   const startAll = async () => {
@@ -96,7 +117,7 @@ export function BenchmarkDashboard({ project }: { project: Project }) {
     try {
       await api.startAll(project.id, false);
       await load();
-    } catch (e: any) { setErr(e.message || "批量启动失败"); }
+    } catch (e: any) { setErr(e.message || tr("cluster.batchStartFailed")); }
     finally { setBusy(""); }
   };
 
@@ -104,13 +125,13 @@ export function BenchmarkDashboard({ project }: { project: Project }) {
     const idle = chs.filter((c) => !c.is_completed && c.status !== "running");
     if (!idle.length) {
       setErr(chs.length > 0 && completed === chs.length
-        ? (labSrc ? "没有可启动的未完成资产" : "全部题目已通关")
-        : (labSrc ? "没有可启动的未完成资产（都在运行中）" : "没有可启动的未完成题目（都在运行中或已通关）"));
+        ? (labSrc ? tr("bench.noUnfinishedAssets") : tr("bench.allCleared"))
+        : (labSrc ? tr("bench.noUnfinishedAssetsBusy") : tr("bench.noUnfinishedChallenges")));
       return;
     }
     const tip = labSrc
-      ? `将按资产编号顺序续跑未完成项（同时最多 3 个，做完或让槽后再开下一个，不会一次排队几十个）。已有攻击图会保留。确认？`
-      : `将按题号顺序续跑未通关题（同时最多 3 道，每题至少做一轮；0 分题啃一段时间才会把槽让给后面还没开过的题）。已有攻击图会保留。已满分的 ${completed} 道不会动。确认？`;
+      ? tr("bench.confirmUnfinishedSrc")
+      : tr("bench.confirmUnfinishedCtf", { n: completed });
     if (!window.confirm(tip)) return;
     setBusy("unfinished");
     setErr("");
@@ -123,73 +144,73 @@ export function BenchmarkDashboard({ project }: { project: Project }) {
         }
       }
       await load();
-    } catch (e: any) { setErr(e.message || "批量启动未完成题目失败"); }
+    } catch (e: any) { setErr(e.message || tr("bench.startUnfinishedFailed")); }
     finally { setBusy(""); }
   };
 
   const stopAll = async () => {
     if (!liveCount) return;
-    if (!window.confirm(`将暂停当前 ${liveCount} 道运行中/排队的${labSrc ? "资产" : "题"}。攻击图保留，稍后可点「启动未完成」续跑。确认？`)) return;
+    if (!window.confirm(tr("bench.confirmStopAll", { n: liveCount, noun: labSrc ? tr("bench.nounAsset") : tr("bench.nounChallenge") }))) return;
     setBusy("stop"); setErr("");
     try { await api.stopAll(project.id); await load(); }
-    catch (e: any) { setErr(e.message || "批量暂停失败"); }
+    catch (e: any) { setErr(e.message || tr("cluster.batchStopFailed")); }
     finally { setBusy(""); }
   };
 
   const runSelected = async () => {
-    if (!selectedCount || !window.confirm(`将运行选中的 ${selectedCount} 道题。平台同时最多 3 道，其余排队；已有攻击图会保留。是否继续？`)) return;
+    if (!selectedCount || !window.confirm(tr("bench.confirmRunSel", { n: selectedCount }))) return;
     setBusy("sel-start"); setErr("");
     try { await api.batchStartProjects(selectedIds); setSelectedIds([]); await load(); }
-    catch (e: any) { setErr(e.message || "批量运行失败"); }
+    catch (e: any) { setErr(e.message || tr("cluster.runFailed")); }
     finally { setBusy(""); }
   };
   const pauseSelected = async () => {
-    if (!selectedCount || !window.confirm(`将暂停选中的 ${selectedCount} 道题。正在执行的 Agent 会停止，攻击图保留，稍后可续跑。是否继续？`)) return;
+    if (!selectedCount || !window.confirm(tr("bench.confirmPauseSel", { n: selectedCount }))) return;
     setBusy("sel-stop"); setErr("");
     try { await api.batchStopProjects(selectedIds); setSelectedIds([]); await load(); }
-    catch (e: any) { setErr(e.message || "批量暂停失败"); }
+    catch (e: any) { setErr(e.message || tr("cluster.batchStopFailed")); }
     finally { setBusy(""); }
   };
   const deleteSelected = async () => {
-    if (!selectedCount || !window.confirm(`将永久删除选中的 ${selectedCount} 道题及其攻击图、发现、报告和运行记录。已提交的 flag 会计分牌仍在，此操作不可撤销。是否继续？`)) return;
+    if (!selectedCount || !window.confirm(tr("bench.confirmDeleteSel", { n: selectedCount }))) return;
     setBusy("sel-del"); setErr("");
     try { await api.batchDeleteProjects(selectedIds); setSelectedIds([]); await load(); }
-    catch (e: any) { setErr(e.message || "批量删除失败"); }
+    catch (e: any) { setErr(e.message || tr("cluster.deleteFailed")); }
     finally { setBusy(""); }
   };
 
   return (
     <div className="container" style={{ paddingTop: 24, paddingBottom: 40 }}>
-      <Link to="/" className="muted" style={{ fontSize: 13 }}>&larr; 返回项目列表</Link>
+      <Link to="/" className="muted" style={{ fontSize: 13 }}>&larr; {tr("project.backList")}</Link>
       <div className="spread" style={{ margin: "10px 0 18px", alignItems: "flex-start" }}>
         <div>
           <div className="row" style={{ gap: 10 }}>
             <h1 style={{ fontSize: 34 }}>{project.name}</h1>
-            <Badge>{labSrc ? "SRC 集群" : "CTF 评测"}</Badge>
-            <Badge coral>{labSrc ? "厂商清单挖洞" : "FLAG 赛道"}</Badge>
+            <Badge>{labSrc ? tr("projects.srcCluster") : tr("projects.ctfBench")}</Badge>
+            <Badge coral>{labSrc ? tr("bench.srcMenu") : tr("bench.flagTrack")}</Badge>
           </div>
           <div className="row" style={{ gap: 12, marginTop: 6 }}>
-            <span className="mono muted" style={{ fontSize: 13 }}>{bm.base_url || "未配置 base_url"}</span>
-            <span className="muted" style={{ fontSize: 13 }}>{labSrc ? "资产" : "题目"} {chs.length} · 完成 {completed} · 运行中 {runningCount}/{slotLimit}{queuedCount ? ` · 排队 ${queuedCount}` : ""}</span>
+            <span className="mono muted" style={{ fontSize: 13 }}>{bm.base_url || tr("bench.noBaseUrl")}</span>
+            <span className="muted" style={{ fontSize: 13 }}>{tr("bench.meta", { kind: labSrc ? tr("bench.colAsset") : tr("bench.colChallenge"), n: chs.length, done: completed, run: runningCount, cap: slotLimit })}{queuedCount ? tr("cluster.queued", { n: queuedCount }) : ""}</span>
           </div>
         </div>
         <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
           <ReportExportControls projectId={project.id} disabled={!!busy} />
-          <button className="btn btn-secondary" disabled={!!busy} onClick={doImport}>{busy === "import" ? "拉题中…" : "拉取题目"}</button>
+          <button className="btn btn-secondary" disabled={!!busy} onClick={doImport}>{busy === "import" ? tr("bench.importing") : tr("bench.import")}</button>
           {chs.length > 0 && (
             <button
               className="btn btn-primary"
               disabled={!!busy || envClosed || unfinishedIdle === 0}
               onClick={startUnfinished}
-              title={envClosed ? "评测环境已到期" : undefined}
+              title={envClosed ? tr("bench.envExpired") : undefined}
             >
-              {busy === "unfinished" ? "启动中…" : unfinishedIdle > 0 ? `启动未完成（${unfinishedIdle}）` : "启动未完成"}
+              {busy === "unfinished" ? tr("bench.starting") : unfinishedIdle > 0 ? tr("bench.startUnfinishedN", { n: unfinishedIdle }) : tr("bench.startUnfinished")}
             </button>
           )}
-          {chs.length > 0 && <button className="btn btn-ghost" disabled={!!busy || envClosed} onClick={startAll} title={envClosed ? "评测环境已到期" : undefined}>{busy === "start" ? "启动中…" : "全部启动"}</button>}
+          {chs.length > 0 && <button className="btn btn-ghost" disabled={!!busy || envClosed} onClick={startAll} title={envClosed ? tr("bench.envExpired") : undefined}>{busy === "start" ? tr("bench.starting") : tr("cluster.startAll")}</button>}
           {chs.length > 0 && (
             <button className="btn btn-secondary" disabled={!!busy || liveCount === 0} onClick={stopAll}>
-              {busy === "stop" ? "暂停中…" : "全部暂停"}
+              {busy === "stop" ? tr("bench.pausing") : tr("cluster.stopAll")}
             </button>
           )}
         </div>
@@ -199,44 +220,44 @@ export function BenchmarkDashboard({ project }: { project: Project }) {
       {envClosed && (
         <div className="import-progress is-error" style={{ marginBottom: 16 }}>
           <div className="import-progress-head">
-            <strong>评测环境已到期关停</strong>
-            <span className="muted">{String((project.config as any)?.env_closed_reason || "平台任务结束或不可达")}</span>
+            <strong>{tr("bench.envClosedTitle")}</strong>
+            <span className="muted">{String((project.config as any)?.env_closed_reason || tr("bench.envClosedDefault"))}</span>
           </div>
-          <p className="muted" style={{ margin: "8px 0 0", fontSize: 13 }}>已停止测试、验证与自动补位，避免对着失效靶机空转。平台恢复后可再启动。</p>
+          <p className="muted" style={{ margin: "8px 0 0", fontSize: 13 }}>{tr("bench.envClosedHint")}</p>
         </div>
       )}
 
       {labSrc ? (
         <div className="card-cream" style={{ marginBottom: 20, padding: 18 }}>
           <div className="row" style={{ gap: 28, alignItems: "baseline" }}>
-            <div className="stack"><span className="serif" style={{ fontSize: 34, color: colors.primary }}>{chs.length}</span><span className="muted" style={{ fontSize: 12 }}>评测资产（胶水拉起）</span></div>
-            <div className="stack"><span className="serif" style={{ fontSize: 28 }}>{completed}/{chs.length}</span><span className="muted" style={{ fontSize: 12 }}>已完成</span></div>
+            <div className="stack"><span className="serif" style={{ fontSize: 34, color: colors.primary }}>{chs.length}</span><span className="muted" style={{ fontSize: 12 }}>{tr("bench.srcAssets")}</span></div>
+            <div className="stack"><span className="serif" style={{ fontSize: 28 }}>{completed}/{chs.length}</span><span className="muted" style={{ fontSize: 12 }}>{tr("projects.statusCompleted")}</span></div>
           </div>
-          <p className="muted" style={{ fontSize: 12, marginTop: 10 }}>按真实 SRC 挖厂商清单类型，不夺旗、不走公网代理池。需先连靶场 VPN。</p>
+          <p className="muted" style={{ fontSize: 12, marginTop: 10 }}>{tr("bench.srcHint")}</p>
         </div>
       ) : (
         <div className="card-cream" style={{ marginBottom: 20, padding: 18 }}>
           <div className="row" style={{ gap: 28, alignItems: "baseline" }}>
-            <div className="stack"><span className="serif" style={{ fontSize: 34, color: colors.primary }}>{board?.cumulative_score ?? 0}</span><span className="muted" style={{ fontSize: 12 }}>累计得分</span></div>
-            <div className="stack"><span className="serif" style={{ fontSize: 28 }}>{board?.correct_flags ?? 0}/{board?.total_flags ?? 0}</span><span className="muted" style={{ fontSize: 12 }}>已夺 flag / 总数</span></div>
-            <div className="stack"><span className="serif" style={{ fontSize: 28 }}>{completed}/{chs.length}</span><span className="muted" style={{ fontSize: 12 }}>已通关题目</span></div>
+            <div className="stack"><span className="serif" style={{ fontSize: 34, color: colors.primary }}>{board?.cumulative_score ?? 0}</span><span className="muted" style={{ fontSize: 12 }}>{tr("bench.score")}</span></div>
+            <div className="stack"><span className="serif" style={{ fontSize: 28 }}>{board?.correct_flags ?? 0}/{board?.total_flags ?? 0}</span><span className="muted" style={{ fontSize: 12 }}>{tr("bench.flags")}</span></div>
+            <div className="stack"><span className="serif" style={{ fontSize: 28 }}>{completed}/{chs.length}</span><span className="muted" style={{ fontSize: 12 }}>{tr("bench.cleared")}</span></div>
           </div>
         </div>
       )}
 
-      <h3 style={{ marginBottom: 12 }}>{labSrc ? "资产（每题 = 一个 SRC 子项目，评测只负责起容器）" : "题目（每题 = 一个 flag 赛道子项目）"}</h3>
+      <h3 style={{ marginBottom: 12 }}>{labSrc ? tr("bench.listSrc") : tr("bench.listCtf")}</h3>
       {chs.length > 0 && (
         <div className="status-filters">
-          {Object.entries(STATUS_FILTER).map(([key, label]) => (
+          {STATUS_FILTER_KEYS.map((key) => (
             <button key={key} className={statusFilter === key ? "active" : ""} onClick={() => setStatusFilter(key)}>
-              {label} <b>{key === "all" ? chs.length : chs.filter((c) => filterStatusOf(c) === key).length}</b>
+              {statusFilterText(key)} <b>{key === "all" ? chs.length : chs.filter((c) => filterStatusOf(c) === key).length}</b>
             </button>
           ))}
         </div>
       )}
       <BatchSelectionBar
         count={selectedCount}
-        noun="题目"
+        noun={tr("bench.nounChallenges")}
         busy={!!busy}
         onRun={runSelected}
         onPause={pauseSelected}
@@ -245,12 +266,10 @@ export function BenchmarkDashboard({ project }: { project: Project }) {
       />
       {chs.length === 0 ? (
         <div className="card-cream" style={{ textAlign: "center", padding: 48 }}>
-          <p className="muted">{labSrc
-            ? "尚无资产。点击「拉取题目」从评测平台拉起容器（胶水），再按 SRC 挖。需 base_url/token 且靶场 VPN 已连。"
-            : "尚无题目。点击「拉取题目」从评测平台拉题并按题自动创建子项目（需 base_url/token 且靶场 VPN 已连）。"}</p>
+          <p className="muted">{labSrc ? tr("bench.emptySrc") : tr("bench.emptyCtf")}</p>
         </div>
       ) : visible.length === 0 ? (
-        <div className="empty-list">没有符合当前筛选条件的题目。</div>
+        <div className="empty-list">{tr("bench.emptyFilter")}</div>
       ) : (
         <ChallengesTable
           challenges={paged}
@@ -284,23 +303,24 @@ function ChallengesTable({
   onToggleAll: () => void;
   labSrc?: boolean;
 }) {
+  const { t: tr } = useT();
   const nav = useNavigate();
   return (
     <div className="project-table-wrap">
       <table className="project-table">
-        <thead><tr><th><input type="checkbox" checked={allSelected} onChange={onToggleAll} aria-label="全选题目" /></th><th>状态</th><th>{labSrc ? "资产" : "题目"}</th><th>难度</th>{labSrc ? null : <><th>Flag</th><th>得分</th><th>完成度</th></>}<th>攻击状态</th></tr></thead>
+        <thead><tr><th><input type="checkbox" checked={allSelected} onChange={onToggleAll} aria-label={tr("bench.selectAll")} /></th><th>{tr("cluster.colStatus")}</th><th>{labSrc ? tr("bench.colAsset") : tr("bench.colChallenge")}</th><th>{tr("bench.colDiff")}</th>{labSrc ? null : <><th>{tr("bench.colFlag")}</th><th>{tr("bench.colScore")}</th><th>{tr("bench.colPct")}</th></>}<th>{tr("bench.colAttack")}</th></tr></thead>
         <tbody>
           {challenges.map((c) => {
             const pct = c.flag_count ? Math.round((c.correct_flag_count / c.flag_count) * 100) : 0;
             const flagCell = `${c.correct_flag_count}/${c.flag_count || 1}${c.total_score ? ` · ${c.score}/${c.total_score}` : c.score ? ` · ${c.score}` : ""}`;
             return (
               <tr key={c.subproject_id} className={selectedIds.includes(c.subproject_id) ? "selected" : ""} onClick={() => nav(`/project/${c.subproject_id}`)}>
-                <td onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={selectedIds.includes(c.subproject_id)} onChange={() => onToggle(c.subproject_id)} aria-label={`选择 ${c.unique_code || c.name}`} /></td>
-                <td><span className="row" style={{ gap: 7 }}><span className="pulse-dot" style={{ background: statusColor[c.status] || colors.muted }} />{statusLabel[c.status] || c.status}</span></td>
+                <td onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={selectedIds.includes(c.subproject_id)} onChange={() => onToggle(c.subproject_id)} aria-label={tr("cluster.selectOne", { name: c.unique_code || c.name })} /></td>
+                <td><span className="row" style={{ gap: 7 }}><span className="pulse-dot" style={{ background: statusColor[c.status] || colors.muted }} />{statusText(c.status) || c.status}</span></td>
                 <td><b>{c.unique_code || c.name}</b></td>
                 <td>{c.difficulty || "—"}</td>
                 {labSrc ? null : <><td>{flagCell}</td><td>{c.score}{c.total_score ? ` / ${c.total_score}` : ""}</td><td>{pct}%</td></>}
-                <td>{c.is_completed ? <Badge coral>已完成</Badge> : c.lateral_active ? <span className="badge">横向</span> : "—"}</td>
+                <td>{c.is_completed ? <Badge coral>{tr("status.completed")}</Badge> : c.lateral_active ? <span className="badge">{tr("cluster.lateral")}</span> : "—"}</td>
               </tr>
             );
           })}

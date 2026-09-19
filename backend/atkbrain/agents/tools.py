@@ -1000,6 +1000,7 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
                 situation=bool(getattr(ctx, "hop_auth_situation", False)),
                 workspace_dir=ctx.workspace_dir,
                 hop_host=str(getattr(ctx, "hop_auth_host", "") or ""),
+                allowed_secrets=set(getattr(ctx.guard, "allowed_secrets", None) or ()),
             )
             if hop_note:
                 body = body + "\n" + hop_note
@@ -1090,6 +1091,7 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
                 situation=bool(getattr(ctx, "hop_auth_situation", False)),
                 workspace_dir=ctx.workspace_dir,
                 hop_host=str(getattr(ctx, "hop_auth_host", "") or ""),
+                allowed_secrets=set(getattr(ctx.guard, "allowed_secrets", None) or ()),
             )
             if hop_note:
                 body = body + "\n" + hop_note
@@ -1236,11 +1238,10 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
     @tool(
         "report_finding",
         "上报一个漏洞。必须先验证真实性：evidence 或可复现 PoC 缺一不可，否则记为未验证。"
-        "二次验证与红队评级必须同一轮完成：独立再打一遍（换通道/重放 PoC/对照预期）后，"
-        "同时给 secondary_verified=true、redteam_rating、redteam_rating_rationale"
-        "以及漏洞页五段 report_summary/report_impact/report_rating/report_repro/report_fix"
-        "（简介、对本项目的危害、红队评级、实际走过的复现、针对本条的修复；禁止模板套话）。"
-        "只做其中一项会拒绝。"
+        "二次验证与红队评级可以分开写：首次上报两者都不填；只交二次则 secondary_verified=true 加至少 40 字怎么再打的；"
+        "只交评级则 redteam_rating 加至少 40 字为何这个级；两者都交则三者齐全。"
+        "漏洞页五段 report_summary/report_impact/report_rating/report_repro/report_fix 由专职撰稿补，复核员不要写。"
+        "五段人可见文字必须跟系统提示末尾的 OUTPUT_LANG / 输出语言契约一致。"
         "同一 CVE 或同一利用接口已有条目则回写（带 finding_id 或沿用原 node_key），"
         "禁止换标题/node_key 再造一条。"
         "redteam_rating 按四级表（严重/高危/中危/低危）对号入座，禁止抬级或压级。"
@@ -1261,16 +1262,16 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
                 "cvss": {"type": "number"},
                 "secondary_verified": {
                     "type": "boolean",
-                    "description": "二次验证是否已与红队评级同一轮做完。仅首次观测则 false，且不要只填评级",
+                    "description": "二次验证是否已完成。仅首次观测则 false。只做二次验证时为 true，并写理由；不要为了过门去填评级",
                 },
                 "redteam_rating": {
                     "type": "string",
                     "enum": ["critical", "high", "medium", "low", "info"],
-                    "description": "红队侧可利用评级，必须与 secondary_verified 一起给。按四级表：critical严重 / high高危 / medium中危 / low低危，禁止跳级或压级",
+                    "description": "红队侧可利用评级。只做评级或两件事一起做时填写。按四级表：critical严重 / high高危 / medium中危 / low低危，禁止跳级或压级",
                 },
                 "redteam_rating_rationale": {
                     "type": "string",
-                    "description": "须同时阐述二次验证过程（换通道/重放/对照）和评级理由，写入报告",
+                    "description": "二次怎么打和/或为何是这个级，按本轮任务写，至少 40 字",
                 },
                 "report_summary": {
                     "type": "string",
@@ -1363,22 +1364,31 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
             report_fix=args.get("report_fix"),
         )
         row = await gstore.add_finding(ctx.project_id, f, run_id=ctx.run_id)
-        if isinstance(row, dict) and not row.get("secondary_verified"):
-            wake = getattr(ctx, "wake_finding_review", None)
-            if callable(wake):
+        if isinstance(row, dict):
+            from ..graph.model import normalize_redteam_rating as _nrt
+            from ..review.flags import get_review_flags
+            flags = get_review_flags()
+            need_auto = (
+                (flags["secondary_verify"] and not row.get("secondary_verified"))
+                or (flags["redteam_rating"] and not _nrt(row.get("redteam_rating")))
+            )
+            if need_auto:
+                wake = getattr(ctx, "wake_finding_review", None)
+                if callable(wake):
+                    try:
+                        wake()
+                    except Exception:
+                        pass
+            page_ok = bool(row.get("secondary_verified")) or not flags["secondary_verify"]
+            if page_ok:
                 try:
-                    wake()
+                    from ..projects import get_project as _gp_page
+                    from ..report.pi_finding_page import ensure_pi_page, has_pi_page
+                    if not has_pi_page(row):
+                        proj = await _gp_page(ctx.project_id)
+                        row = await ensure_pi_page(ctx.project_id, row, project=proj)
                 except Exception:
                     pass
-        if isinstance(row, dict) and row.get("secondary_verified"):
-            try:
-                from ..projects import get_project as _gp_page
-                from ..report.pi_finding_page import ensure_pi_page, has_pi_page
-                if not has_pi_page(row):
-                    proj = await _gp_page(ctx.project_id)
-                    row = await ensure_pi_page(ctx.project_id, row, project=proj)
-            except Exception:
-                pass
         nk = str(args.get("node_key") or "").strip()
         obj = normalize_objective(ctx.objective)
         src_clue = obj == SRC and (

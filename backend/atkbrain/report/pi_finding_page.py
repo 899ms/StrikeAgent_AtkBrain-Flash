@@ -17,6 +17,14 @@ PAGE_KEYS = ("report_summary", "report_impact", "report_rating", "report_repro",
 
 PENDING_COPY = "专职复核 Pi 完成二次验证与红队评级后撰写本段，不使用模板套话。"
 
+
+def _page_system(project: dict | None) -> str:
+    from ..i18n.locale import config_output_lang
+    from ..i18n.prompts import with_output_lang
+    cfg = (project or {}).get("config") if isinstance(project, dict) else {}
+    return with_output_lang(PI_PAGE_SYSTEM, config_output_lang(cfg))
+
+
 PI_PAGE_SYSTEM = """你是 StrikeAgent_AtkBrain-Flash 的漏洞页撰稿人，只服务已经二次验证过的这一条洞。
 
 你不是猎洞工人，也不套类别模板。五个板块都必须根据事实包里「这一次打到了什么」来写，写给安全工程师看。
@@ -166,14 +174,14 @@ async def compose_pi_page(finding: dict, *, project: dict | None = None) -> dict
     )
     wait = float(getattr(settings, "report_timeout_sec", 90) or 90)
     blob = await query_text(
-        system_prompt=PI_PAGE_SYSTEM,
+        system_prompt=_page_system(project),
         user_prompt=prompt,
         cwd=str(settings.data_dir),
         timeout=max(20.0, wait),
         tools=False,
         model=model,
         role="finding-page",
-        project_id=str(finding.get("project_id") or ""),
+        project_id=str(finding.get("project_id") or (project or {}).get("id") or ""),
     )
     return parse_pi_page(blob)
 
@@ -184,13 +192,15 @@ async def ensure_pi_page(
     *,
     project: dict | None = None,
 ) -> dict:
-    """已二次验证则保证有 Pi 撰写的五板块；未验证不编模板。"""
+    """二次完成才写五段；二次开关关掉时，有评级或首次入库即可写页。"""
     out = dict(finding or {})
     fid = str(out.get("id") or "")
     if has_pi_page(out):
         return out
     if not out.get("secondary_verified"):
-        return out
+        from ..review.flags import get_review_flags
+        if get_review_flags()["secondary_verify"]:
+            return out
     if not fid:
         return out
     async with _lock_for(fid):
@@ -214,12 +224,15 @@ async def ensure_pi_page(
 
 
 async def fill_missing_pi_pages(project_id: str, *, project: dict | None = None) -> int:
-    """收口复核会话：给已评级但还没写页的洞补撰写。"""
-    rows = await db.fetchall(
-        """SELECT * FROM findings WHERE project_id=? AND secondary_verified=1
-           AND (report_summary IS NULL OR TRIM(report_summary)='')""",
-        (project_id,),
-    )
+    """收口复核会话：给已达到写页门槛但还没写页的洞补撰写。"""
+    from ..review.flags import get_review_flags
+    if get_review_flags()["secondary_verify"]:
+        sql = """SELECT * FROM findings WHERE project_id=? AND secondary_verified=1
+                 AND (report_summary IS NULL OR TRIM(report_summary)='')"""
+    else:
+        sql = """SELECT * FROM findings WHERE project_id=?
+                 AND (report_summary IS NULL OR TRIM(report_summary)='')"""
+    rows = await db.fetchall(sql, (project_id,))
     n = 0
     for row in rows or []:
         data = dict(row)

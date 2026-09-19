@@ -9,6 +9,7 @@ from .yakit import (
     engine_cert_stale,
     parse_echo_ip,
     resolve_egress,
+    root_pem_from_chain_text,
     yakit,
 )
 
@@ -29,6 +30,17 @@ class ParseEchoIpTests(unittest.TestCase):
 
     def test_rejects_empty(self) -> None:
         self.assertIsNone(parse_echo_ip(200, " \n"))
+
+
+class LiveMitmCaTests(unittest.TestCase):
+    def test_root_is_last_pem(self) -> None:
+        leaf = "-----BEGIN CERTIFICATE-----\nLEAF\n-----END CERTIFICATE-----\n"
+        root = "-----BEGIN CERTIFICATE-----\nROOT\n-----END CERTIFICATE-----\n"
+        got = root_pem_from_chain_text(leaf + root)
+        self.assertEqual(got.strip(), root.strip())
+
+    def test_single_pem_is_not_root(self) -> None:
+        self.assertIsNone(root_pem_from_chain_text("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n"))
 
 
 class EngineCertStaleTests(unittest.TestCase):

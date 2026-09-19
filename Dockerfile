@@ -109,6 +109,6 @@ RUN chmod 0755 /opt/atkbrain/docker-entrypoint.sh \
 EXPOSE 2333
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:2333/api/health || exit 1
+    CMD python3 -m atkbrain.healthcheck
 
 ENTRYPOINT ["/opt/atkbrain/docker-entrypoint.sh"]

@@ -145,22 +145,24 @@ _ENUM_SRC = (
 )
 
 
-def supervisor_system_prompt(objective: str | None = None) -> str:
+def supervisor_system_prompt(objective: str | None = None, *, output_lang: object = None) -> str:
     from ..objective import objective_allows_flag, objective_is_src
+    from ..i18n.prompts import with_output_lang
     if objective_allows_flag(objective):
         extra = _ENUM_CTF
     elif objective_is_src(objective):
         extra = _ENUM_SRC
         text = SUPERVISOR_SYSTEM.replace(_ENUM_SHARED, extra)
-        return (
+        return with_output_lang(
             text.replace(_RT_GOAL_LINE, _SRC_GOAL_LINE)
             .replace(_RT_TARGET_LINE, _SRC_TARGET_LINE)
             .replace(_RT_BIND_CLOSE, _SRC_BIND_CLOSE)
-            .replace(_RT_CHAIN_MUST, _SRC_CHAIN_MUST)
+            .replace(_RT_CHAIN_MUST, _SRC_CHAIN_MUST),
+            output_lang,
         )
     else:
         extra = _ENUM_REDTEAM
-    return SUPERVISOR_SYSTEM.replace(_ENUM_SHARED, extra)
+    return with_output_lang(SUPERVISOR_SYSTEM.replace(_ENUM_SHARED, extra), output_lang)
 
 SUPERVISOR_RUNTIME_SYSTEM = """你是 StrikeAgent_AtkBrain-Flash 的御主，不是执行层。
 本轮是运行时审查：CTF 单题已跑过一段时间，由你判断这一猎是否还值得继续。不要写某题 payload。循环不会按轮次硬停，停或续跑只看你的 continue。
@@ -484,6 +486,7 @@ def is_oneshot_prompt_config_error(exc: BaseException | str) -> bool:
 
 async def consult_supervisor(
     brief: str, *, timeout: float | None = None, system_prompt: str | None = None,
+    project_id: str = "",
 ) -> SupervisorPlan:
     """一次性、无工具的 Pi 查询。空回复可按从者同一套握手重试。"""
     wait = float(timeout if timeout is not None else getattr(settings, "supervisor_timeout_sec", 360) or 360)
@@ -500,6 +503,7 @@ async def consult_supervisor(
                 tools=False,
                 model=model,
                 role="supervisor",
+                project_id=project_id or "",
             )
             if blob:
                 return parse_supervisor_plan(blob)
@@ -530,6 +534,7 @@ async def await_supervisor_plan(
     timeout: float | None = None,
     on_wait: Callable[[int, str, float], Awaitable[None]] | None = None,
     consult: Callable[..., Awaitable[SupervisorPlan]] | None = None,
+    project_id: str = "",
 ) -> SupervisorPlan:
     """问御主模型给出可用方案。总墙钟内原简报再问，不压短。
 
@@ -539,7 +544,11 @@ async def await_supervisor_plan(
     """
     import time as _time
 
-    ask = consult or consult_supervisor
+    ask = consult
+    if ask is None:
+        async def _default_consult(current: str, timeout: float | None = None, **_kw):
+            return await consult_supervisor(current, timeout=timeout, project_id=project_id)
+        ask = _default_consult
     total = float(timeout if timeout is not None else getattr(settings, "supervisor_timeout_sec", 360) or 360)
     max_attempts = int(getattr(settings, "supervisor_consult_max_attempts", 0) or 0)
     base = float(getattr(settings, "supervisor_consult_retry_base_sec", 4.0) or 0)
@@ -581,11 +590,14 @@ async def await_supervisor_plan(
             await asyncio.sleep(delay)
 
 
-async def consult_runtime_review(brief: str, *, timeout: float | None = None) -> dict:
+async def consult_runtime_review(
+    brief: str, *, timeout: float | None = None, project_id: str = "",
+) -> dict:
     """CTF 御主运行时审查。失败/空输出默认续跑。"""
     try:
         plan = await consult_supervisor(
             brief, timeout=timeout, system_prompt=SUPERVISOR_RUNTIME_SYSTEM,
+            project_id=project_id,
         )
         return parse_runtime_review(plan.raw_text or "")
     except Exception:

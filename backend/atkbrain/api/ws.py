@@ -5,7 +5,6 @@ import asyncio
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from ..config import settings
 from ..engine.scheduler import manager
 from ..events import bus, emit
 from ..graph import store as gstore
@@ -13,27 +12,20 @@ from ..graph import store as gstore
 ws_router = APIRouter()
 
 
-def _ws_token_ok(ws: WebSocket) -> bool:
-    """ATKBRAIN_API_TOKEN 非空时校验 query ?token= 或 Sec-WebSocket-Protocol / 头。"""
-    expected = (settings.api_token or "").strip()
-    if not expected:
-        return True
-    q = (ws.query_params.get("token") or "").strip()
-    if q == expected:
-        return True
-    hdr = (ws.headers.get("x-api-token") or "").strip()
-    if hdr == expected:
-        return True
-    auth = (ws.headers.get("authorization") or "").strip()
-    if auth.lower().startswith("bearer ") and auth[7:].strip() == expected:
-        return True
-    return False
+async def _ws_token_ok(ws: WebSocket) -> bool:
+    from ..auth.gate import auth_ok
+    return await auth_ok(ws)
 
 
 @ws_router.websocket("/api/projects/{pid}/ws")
 async def project_ws(ws: WebSocket, pid: str):
-    if not _ws_token_ok(ws):
+    if not await _ws_token_ok(ws):
         await ws.close(code=4401)
+        return
+    from ..auth.gate import session_from_request, session_must_change
+    sess = await session_from_request(ws)
+    if session_must_change(sess):
+        await ws.close(code=4403)
         return
     await ws.accept()
     q = bus.subscribe(pid)

@@ -3,15 +3,19 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ..i18n.locale import get_locale, normalize_locale
+from ..i18n.strings import msg
 from ..config import settings
 from ..db import db, _loads
 from ..engine.scheduler import manager
 from ..graph import store as gstore
 from ..project_status import displayed_status, hunt_hard_stop_info
-from ..app_version import check_latest, local_version
+from ..app_version import check_latest, local_version, normalize_ver
+from ..upgrade import live_hunt_ids, start_upgrade
 from ..projects import (
     assert_safe_project_target,
     create_benchmark_project,
@@ -51,12 +55,12 @@ async def _load_reportable_finding(pid: str, fid: str) -> tuple[dict, dict | Non
     """加载 finding + 关联节点；rejected / 不存在则 404。"""
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     row = await db.fetchone("SELECT * FROM findings WHERE id=? AND project_id=?", (fid, pid))
     if not row:
-        raise HTTPException(404, "发现不存在")
+        raise HTTPException(404, msg("finding_missing"))
     if not is_reportable_finding(row):
-        raise HTTPException(404, "已驳回的漏洞不提供完整报告")
+        raise HTTPException(404, msg("finding_rejected"))
     related = None
     related_edges: list[dict] = []
     if row["node_key"]:
@@ -102,6 +106,14 @@ class CreateProjectReq(BaseModel):
     objective: str = "getshell"          # 目标类型：redteam(旧值 getshell) | flag | src
     base_url: str | None = None          # benchmark 平台基址
     token: str | None = None             # BENCHMARK_TOKEN
+    auth_user: str | None = None         # 授权测试账号（红队/蓝队）；不与评测 token 混用
+    auth_password: str | None = None
+    auth_token: str | None = None        # Bearer / JWT / API key / Cookie 原文
+    output_lang: str | None = None       # zh | en；猎面人可见输出语言
+
+
+class OutputLangReq(BaseModel):
+    output_lang: str = "zh"
 
 
 class PreviewAssetsReq(BaseModel):
@@ -147,6 +159,30 @@ class ProxyPoolReq(BaseModel):
     custom_text: str = ""
 
 
+class ReviewFlagsReq(BaseModel):
+    secondary_verify: bool | None = None
+    redteam_rating: bool | None = None
+
+
+class HuntClocksReq(BaseModel):
+    loop_max_turns: int | None = None
+    loop_max_turns_src: int | None = None
+    loop_max_turns_redteam: int | None = None
+    src_runtime_hard_stop_sec: int | None = None
+    redteam_runtime_hard_stop_sec: int | None = None
+    runtime_hard_stop_sec: int | None = None
+    runtime_hard_stop_pass2_sec: int | None = None
+    runtime_hard_stop_pass3_sec: int | None = None
+    runtime_hard_stop_pass_step_sec: int | None = None
+    graph_idle_empty_plans: int | None = None
+    loop_stall_limit_redteam: int | None = None
+    loop_stall_limit_src: int | None = None
+
+
+class FindingReviewReq(BaseModel):
+    mode: str
+
+
 def _proxy_snap() -> dict:
     from ..proxy.pool import pool
     snap = pool.snapshot()
@@ -176,11 +212,18 @@ async def _set_benchmark_autopilot(pid: str, enabled: bool) -> None:
 
 
 @router.get("/health")
-async def health():
+async def health(request: Request):
     import shutil
     import subprocess
 
     from ..agents.pi_runtime import pi_bin
+    from ..auth.entry import is_loopback_peer, peer_host
+    from ..auth.gate import auth_ok
+
+    if not await auth_ok(request):
+        if is_loopback_peer(peer_host(request)):
+            return {"ok": True}
+        raise HTTPException(401, "login-required")
 
     bin_path = shutil.which(pi_bin()) or shutil.which("pi")
     try:
@@ -215,6 +258,47 @@ async def get_version(refresh: bool = False):
     return check_latest(force=bool(refresh))
 
 
+@router.post("/version/apply")
+async def apply_version(request: Request):
+    from ..auth.gate import origin_ok
+
+    if not origin_ok(request):
+        raise HTTPException(status_code=403, detail="origin")
+    payload = check_latest(force=True)
+    if payload.get("status") != "update_available":
+        return {**payload, "ok": True, "started": False, "already_latest": True}
+    live = live_hunt_ids()
+    if live:
+        return JSONResponse(
+            {
+                "detail": "hunts-live",
+                "code": "hunts_live",
+                "running": live,
+                "ok": False,
+                "started": False,
+            },
+            status_code=409,
+        )
+    tag = str(payload.get("latest_tag") or payload.get("latest") or "").strip()
+    if not tag:
+        raise HTTPException(status_code=400, detail="no-release-tag")
+    try:
+        log_path = start_upgrade(tag)
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="upgrade-script-missing")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="illegal-tag")
+    return {
+        **payload,
+        "ok": True,
+        "started": True,
+        "already_latest": False,
+        "tag": tag,
+        "target": normalize_ver(tag),
+        "log": str(log_path),
+    }
+
+
 @router.get("/settings")
 async def get_settings():
     yakit_snap: dict = {}
@@ -237,10 +321,43 @@ async def get_settings():
                 "redteam": hunt_hard_stop_info("redteam"),
                 "flag": hunt_hard_stop_info("flag"),
             },
+            "hunt_clocks": _hunt_clocks(),
             "yakit_mitm_host": getattr(settings, "yakit_mitm_host", "127.0.0.1"),
             "yakit_mitm_port": int(getattr(settings, "yakit_mitm_port", 8084) or 8084),
             "yakit_mcp_url": getattr(settings, "yakit_mcp_url", "http://127.0.0.1:11432/mcp"),
             "yakit_mitm_ctf": bool(getattr(settings, "yakit_mitm_ctf", False)),
+        },
+        "review": _review_flags(),
+    }
+
+
+def _review_flags() -> dict:
+    from ..review.flags import get_review_flags
+    return get_review_flags()
+
+
+def _hunt_clocks() -> dict:
+    from ..engine.hunt_clock_settings import get_hunt_clocks
+    return get_hunt_clocks()
+
+
+@router.post("/settings/review")
+async def set_review_flags(req: ReviewFlagsReq):
+    from ..review.flags import set_review_flags as _set
+    flags = _set(secondary_verify=req.secondary_verify, redteam_rating=req.redteam_rating)
+    return {"review": flags}
+
+
+@router.post("/settings/hunt-clocks")
+async def set_hunt_clocks(req: HuntClocksReq):
+    from ..engine.hunt_clock_settings import set_hunt_clocks as _set
+    clocks = _set(req.model_dump(exclude_none=True))
+    return {
+        "hunt_clocks": clocks,
+        "hard_stop": {
+            "src": hunt_hard_stop_info("src"),
+            "redteam": hunt_hard_stop_info("redteam"),
+            "flag": hunt_hard_stop_info("flag"),
         },
     }
 
@@ -345,6 +462,7 @@ def _slim_list_config(cfg: dict | None) -> dict:
         "env_closed": bool(c.get("env_closed")) or None,
         "env_closed_reason": c.get("env_closed_reason"),
         "vhosts": c.get("vhosts") if isinstance(c.get("vhosts"), list) else None,
+        "output_lang": c.get("output_lang") or None,
     }
     if isinstance(c.get("benchmark"), dict):
         out["benchmark"] = {"base_url": (c.get("benchmark") or {}).get("base_url")}
@@ -442,9 +560,19 @@ async def api_create_project(req: CreateProjectReq):
     cfg: dict = {
         "track": track,
         "objective": objective,
+        "output_lang": normalize_locale(req.output_lang or get_locale()),
     }
     if req.model:
         cfg["model"] = req.model
+    if track in ("redteam", "src"):
+        from ..agents.brief_creds import normalize_supplied_auth
+        supplied = normalize_supplied_auth({
+            "user": req.auth_user,
+            "password": req.auth_password,
+            "token": req.auth_token,
+        })
+        if supplied:
+            cfg["supplied_auth"] = supplied
     try:
         if req.kind == "cluster" and track == "ctf" and req.base_url and req.token:
             cfg["track"] = "ctf"
@@ -501,7 +629,7 @@ async def api_preview_assets(req: PreviewAssetsReq):
 async def api_get_project(pid: str):
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     # 评测/集群父项目不跑攻击图
     if p["kind"] in ("benchmark", "cluster"):
         cfg = dict(p.get("config") or {})
@@ -582,17 +710,28 @@ async def api_batch_start_projects(req: BatchRunReq):
 @router.delete("/projects/{pid}")
 async def api_delete_project(pid: str):
     if not await get_project(pid):
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     stopped = await _stop_project_tree(pid)
     await delete_project(pid)
     return {"ok": True, "stopped": stopped}
+
+
+@router.patch("/projects/{pid}/output_lang")
+async def api_set_output_lang(pid: str, req: OutputLangReq):
+    p = await get_project(pid)
+    if not p:
+        raise HTTPException(404, msg("project_missing"))
+    cfg = dict(p.get("config") or {})
+    cfg["output_lang"] = normalize_locale(req.output_lang)
+    await update_config(pid, cfg)
+    return {"ok": True, "output_lang": cfg["output_lang"]}
 
 
 @router.post("/projects/{pid}/start")
 async def api_start(pid: str, confirm_restart: bool = Query(False)):
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     if p["kind"] in ("cluster", "benchmark"):
         raise HTTPException(400, "父项目不直接运行；请对其子项目单独或批量启动。")
     refuse = await bmk.gate_start_against_closed_env(p)
@@ -621,7 +760,7 @@ async def api_stop(pid: str):
 async def api_rename_project(pid: str, req: RenameProjectReq):
     """修改项目名称（集群会同步子项目「集群名 · host」前缀）。"""
     if not await get_project(pid):
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     try:
         return await rename_project(pid, req.name)
     except ValueError as e:
@@ -697,22 +836,23 @@ async def api_runs(pid: str):
 
 
 @router.get("/projects/{pid}/report")
-async def api_report(pid: str, format: str = Query("html")):
+async def api_report(pid: str, format: str = Query("html"), lang: str | None = Query(None)):
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     fmt = (format or "html").lower()
+    loc = normalize_locale(lang or get_locale())
     if fmt == "md":
-        raise HTTPException(status_code=410, detail="项目总报告请改用 HTML 或 PDF 导出")
+        raise HTTPException(status_code=410, detail=msg("md_gone"))
     from ..report.pdf_print import html_to_pdf
     from ..report.slots import assemble_deliverable, cache_stem, facts_digest
     data = await report_gen.build_report_data(pid)
     digest = facts_digest(data)
-    cached = settings.reports_dir / f"{cache_stem(pid, digest)}.html"
+    cached = settings.reports_dir / f"{cache_stem(pid, digest, loc)}.html"
     if cached.exists() and cached.stat().st_size > 200:
         html = cached.read_text(encoding="utf-8")
     else:
-        html = assemble_deliverable(data)
+        html = assemble_deliverable(data, lang=loc)
         settings.reports_dir.mkdir(parents=True, exist_ok=True)
         cached.write_text(html, encoding="utf-8")
     if fmt == "html":
@@ -724,20 +864,23 @@ async def api_report(pid: str, format: str = Query("html")):
             raise HTTPException(503, str(e))
         return Response(pdf, media_type="application/pdf",
                         headers={"Content-Disposition": f'attachment; filename="report-{pid}.pdf"'})
-    raise HTTPException(400, "format 仅支持 html|pdf")
+    raise HTTPException(400, msg("format_html_pdf"))
 
 
 @router.post("/projects/{pid}/report/export")
-async def api_report_export_start(pid: str, format: str = Query("html")):
+async def api_report_export_start(
+    pid: str, format: str = Query("html"), lang: str | None = Query(None),
+):
     """启动母版填槽报告任务，返回进度可轮询的 job。"""
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     fmt = (format or "html").lower()
+    loc = normalize_locale(lang or get_locale())
     if fmt == "md":
-        raise HTTPException(status_code=410, detail="项目总报告请改用 HTML 或 PDF 导出")
+        raise HTTPException(status_code=410, detail=msg("md_gone"))
     try:
-        return await report_export.start_export_job(pid, format, force=True)
+        return await report_export.start_export_job(pid, format, force=True, lang=loc)
     except report_export.ProjectReportMdGone as e:
         raise HTTPException(status_code=410, detail=str(e))
     except ValueError as e:
@@ -748,7 +891,7 @@ async def api_report_export_start(pid: str, format: str = Query("html")):
 async def api_report_export_status(pid: str, jid: str):
     job = report_export.get_export_job(pid, jid)
     if not job:
-        raise HTTPException(404, "导出任务不存在")
+        raise HTTPException(404, msg("export_missing"))
     return job
 
 
@@ -756,12 +899,12 @@ async def api_report_export_status(pid: str, jid: str):
 async def api_report_export_file(pid: str, jid: str):
     job = report_export.get_export_job(pid, jid)
     if not job:
-        raise HTTPException(404, "导出任务不存在")
+        raise HTTPException(404, msg("export_missing"))
     if job["status"] != "done":
-        raise HTTPException(409, job.get("message") or "报告尚未生成完成")
+        raise HTTPException(409, job.get("message") or msg("export_not_ready"))
     path = report_export.export_file_path(jid, pid)
     if not path or not path.exists():
-        raise HTTPException(404, "报告文件不存在")
+        raise HTTPException(404, msg("export_file_missing"))
     fmt = job.get("format") or "html"
     media = {
         "html": "text/html; charset=utf-8",
@@ -781,7 +924,7 @@ async def api_report_export_file(pid: str, jid: str):
 async def api_triage(pid: str):
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     if p["kind"] != "cluster":
         raise HTTPException(400, "仅集群项目支持存活快筛与子项目划分")
     return await cluster_mod.triage_cluster(pid)
@@ -792,7 +935,7 @@ async def api_refold_machines(pid: str):
     """按同 FQDN / 同 DNS IP 折叠 idle/error 子项目。不自动开跑。"""
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     if p["kind"] != "cluster":
         raise HTTPException(400, "仅集群项目支持按同机折叠")
     result = await cluster_mod.refold_cluster_by_machine(pid)
@@ -829,7 +972,7 @@ async def api_add_cluster_assets(pid: str, req: AddClusterAssetsReq):
     """集群内新增资产：写入资产列表、按 host 补建子项目，默认立即启动新子项目。"""
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     if p["kind"] != "cluster":
         raise HTTPException(400, "仅集群项目支持追加资产")
     result = await cluster_mod.add_assets_to_cluster(pid, req.assets or [])
@@ -847,7 +990,7 @@ async def api_import_progress(pid: str):
     """集群批量导入进度（创建/追加资产时轮询）。"""
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     return await cluster_mod.import_progress_for(pid)
 
 
@@ -856,7 +999,7 @@ async def api_import_pause(pid: str):
     """暂停集群导入：不再新建子项目，已建的保持原状。"""
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     if p["kind"] != "cluster":
         raise HTTPException(400, "仅集群项目支持暂停导入")
     return await cluster_mod.pause_cluster_import(pid)
@@ -867,7 +1010,7 @@ async def api_import_resume(pid: str):
     """继续导入：补建尚未划分子项目的主机。"""
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     if p["kind"] != "cluster":
         raise HTTPException(400, "仅集群项目支持继续导入")
     return cluster_mod.resume_cluster_import(pid, auto_start=True)
@@ -885,7 +1028,7 @@ async def api_start_all(
     """
     parent = await get_project(pid)
     if not parent:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     if parent["kind"] not in ("cluster", "benchmark"):
         raise HTTPException(400, "仅集群/评测项目支持全部启动")
     refuse = await bmk.gate_start_against_closed_env(parent)
@@ -945,7 +1088,7 @@ async def api_stop_all(pid: str):
     """批量暂停运行中/排队的子项目。"""
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     if p["kind"] not in ("cluster", "benchmark"):
         raise HTTPException(400, "仅集群/评测项目支持全部暂停")
     await _set_benchmark_autopilot(pid, False)
@@ -966,7 +1109,7 @@ async def api_stop_all(pid: str):
 async def api_bm_import(pid: str):
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     if p["kind"] != "benchmark":
         raise HTTPException(400, "非 benchmark 项目")
     try:
@@ -979,7 +1122,7 @@ async def api_bm_import(pid: str):
 async def api_bm_scoreboard(pid: str):
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     return await bmk.scoreboard(pid)
 
 
@@ -1005,7 +1148,7 @@ async def api_project_memory(pid: str):
     """返回项目 episode 与匹配的跨局剧本。"""
     p = await get_project(pid)
     if not p:
-        raise HTTPException(404, "项目不存在")
+        raise HTTPException(404, msg("project_missing"))
     episodes = await db.fetchall(
         """SELECT * FROM memory WHERE project_id=? AND kind='episode'
            ORDER BY created_at DESC LIMIT 20""",
@@ -1030,12 +1173,60 @@ async def api_memory(limit: int = Query(100)):
     return [_serialize_memory(r) for r in rows]
 
 
+@router.get("/findings")
+async def api_library_findings(
+    q: str = "",
+    project: str = "",
+    category: str = "",
+    severity: str = "",
+    track: str = "",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+):
+    return await gstore.list_library_findings(
+        q=q, project=project, category=category, severity=severity, track=track,
+        page=page, page_size=page_size,
+    )
+
+
+@router.get("/review-jobs/{job_id}")
+async def api_review_job(job_id: str):
+    from ..review.jobs import snapshot
+    job = snapshot(job_id)
+    if not job:
+        raise HTTPException(404, msg("review_job_missing"))
+    return job
+
+
+@router.post("/projects/{pid}/findings/{fid}/review")
+async def api_finding_review(pid: str, fid: str, req: FindingReviewReq):
+    from ..graph.verify import is_visible_finding
+    from ..review.jobs import ReviewBusy, start_manual
+
+    mode = str(req.mode or "").strip().lower()
+    if mode not in ("secondary", "rating"):
+        raise HTTPException(400, msg("review_mode"))
+    p = await get_project(pid)
+    if not p:
+        raise HTTPException(404, msg("project_missing"))
+    row = await db.fetchone("SELECT * FROM findings WHERE id=? AND project_id=?", (fid, pid))
+    if not row or not is_visible_finding(row):
+        raise HTTPException(404, msg("finding_missing"))
+    finding = gstore._serialize_finding(row)
+    finding["project_id"] = pid
+    try:
+        return start_manual(p, finding, mode)
+    except ReviewBusy as e:
+        raise HTTPException(409, str(e) or msg("review_busy"))
+
+
 @router.get("/projects/{pid}/findings/{fid}")
 async def api_finding_detail(pid: str, fid: str):
     """单漏洞全量详情（不截断），供漏洞弹层。非 rejected 均可查看。"""
     finding, p, _related = await _load_reportable_finding(pid, fid)
-    if finding.get("secondary_verified"):
-        from ..report.pi_finding_page import ensure_pi_page, has_pi_page
+    from ..review.flags import get_review_flags
+    from ..report.pi_finding_page import ensure_pi_page, has_pi_page
+    if finding.get("secondary_verified") or not get_review_flags()["secondary_verify"]:
         if not has_pi_page(finding):
             finding = await ensure_pi_page(pid, finding, project=p)
             finding, p, _related = await _load_reportable_finding(pid, fid)
@@ -1047,19 +1238,21 @@ async def api_finding_detail(pid: str, fid: str):
 
 
 @router.get("/projects/{pid}/findings/{fid}/report")
-async def api_finding_report(pid: str, fid: str, format: str = Query("md")):
+async def api_finding_report(pid: str, fid: str, format: str = Query("md"), lang: str | None = Query(None)):
     """单漏洞报告下载。目前仅支持 Markdown。"""
     if format != "md":
-        raise HTTPException(400, "format 仅支持 md")
+        raise HTTPException(400, msg("format_md"))
+    loc = normalize_locale(lang or get_locale())
     finding, p, _related = await _load_reportable_finding(pid, fid)
-    if finding.get("secondary_verified"):
-        from ..report.pi_finding_page import ensure_pi_page, has_pi_page
+    from ..review.flags import get_review_flags
+    from ..report.pi_finding_page import ensure_pi_page, has_pi_page
+    if finding.get("secondary_verified") or not get_review_flags()["secondary_verify"]:
         if not has_pi_page(finding):
             finding = await ensure_pi_page(pid, finding, project=p)
             finding, p, _related = await _load_reportable_finding(pid, fid)
     target = _project_http_target(p)
     poc = poc_for_finding(finding, target)
-    body = render_finding_markdown(p, finding, poc=poc)
+    body = render_finding_markdown(p, finding, poc=poc, lang=loc)
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in fid)[:48]
     return Response(
         body,
@@ -1073,7 +1266,7 @@ async def api_poc(pid: str, fid: str):
     p = await get_project(pid)
     row = await db.fetchone("SELECT * FROM findings WHERE id=? AND project_id=?", (fid, pid))
     if not row:
-        raise HTTPException(404, "发现不存在")
+        raise HTTPException(404, msg("finding_missing"))
     finding = {
         "category": row["category"], "title": row["title"], "evidence": row["evidence"],
         "poc_curl": row["poc_curl"], "poc_python": row["poc_python"],

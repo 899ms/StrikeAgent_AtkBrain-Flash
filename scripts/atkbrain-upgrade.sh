@@ -1,7 +1,8 @@
-#!/usr/bin/env bash
-# 把本机源码升到指定 GitHub tag，然后重启前后端 systemd。
-# 用法: scripts/atkbrain-upgrade.sh <tag>
-# 不碰 backend/data、*.env、node_modules。不改 git config、不 force push。
+"""把本机源码升到指定 GitHub tag，然后按部署方式重启。
+
+用法: scripts/atkbrain-upgrade.sh <tag>
+不碰 backend/data、*.env、node_modules。不改 git config、不 force push。
+"""
 set -euo pipefail
 
 TAG="${1:-}"
@@ -15,7 +16,12 @@ SLUG="${SLUG%.git}"
 LOG_DIR="$REPO/backend/data/logs"
 mkdir -p "$LOG_DIR"
 
-echo "[*] $(date -Iseconds) upgrade → $TAG  repo=$REPO slug=$SLUG"
+IN_DOCKER=0
+if [[ -f /.dockerenv ]]; then
+  IN_DOCKER=1
+fi
+
+echo "[*] $(date -Iseconds) upgrade → $TAG  repo=$REPO slug=$SLUG docker=$IN_DOCKER"
 
 hash_of() {
   if [[ -f "$1" ]]; then sha256sum "$1" | awk '{print $1}'; else echo ""; fi
@@ -74,15 +80,50 @@ REQ_AFTER="$(hash_of "$REPO/backend/requirements.txt")"
 LOCK_AFTER="$(hash_of "$REPO/frontend/package-lock.json")"
 PKG_AFTER="$(hash_of "$REPO/frontend/package.json")"
 
+pip_install() {
+  if [[ -x /opt/atkbrain/venv/bin/pip ]]; then
+    /opt/atkbrain/venv/bin/pip install -r "$REPO/backend/requirements.txt"
+  else
+    /usr/bin/python3 -m pip install -r "$REPO/backend/requirements.txt"
+  fi
+}
+
 if [[ -n "$REQ_AFTER" && "$REQ_AFTER" != "$REQ_BEFORE" ]]; then
   echo "[*] requirements.txt 有变，pip install"
-  /usr/bin/python3 -m pip install -r "$REPO/backend/requirements.txt"
+  pip_install
 fi
 if [[ ("$LOCK_AFTER" != "$LOCK_BEFORE" || "$PKG_AFTER" != "$PKG_BEFORE") && -d "$REPO/frontend" ]]; then
   echo "[*] frontend 依赖有变，npm install"
   (cd "$REPO/frontend" && npm install)
 fi
 
-echo "[*] 重启 systemd"
-systemctl restart atkbrain-flash-backend.service atkbrain-flash-frontend.service
+if [[ "$IN_DOCKER" -eq 1 ]]; then
+  if [[ -f "$REPO/frontend/package.json" ]]; then
+    echo "[*] 容器内编前端"
+    (cd "$REPO/frontend" && npm install && npx vite build)
+  fi
+  echo "[*] 重启控制台进程"
+  sleep 1
+  if [[ -n "${ATKBRAIN_UPGRADE_PID:-}" ]]; then
+    kill -TERM "${ATKBRAIN_UPGRADE_PID}" 2>/dev/null || true
+  fi
+  pkill -f 'python.*atkbrain.main' || true
+  echo "[*] upgrade done $(date -Iseconds)"
+  exit 0
+fi
+
+if systemctl cat atkbrain-flash-backend.service >/dev/null 2>&1; then
+  echo "[*] 重启 systemd"
+  systemctl restart atkbrain-flash-backend.service atkbrain-flash-frontend.service
+elif [[ -f "$REPO/compose.yaml" ]] && command -v docker >/dev/null 2>&1; then
+  echo "[*] docker compose 重建镜像"
+  extra=()
+  if [[ -f "$REPO/deploy/compose.build.yaml" ]]; then
+    extra=(-f "$REPO/deploy/compose.build.yaml")
+  fi
+  docker compose -f "$REPO/compose.yaml" "${extra[@]}" up -d --build
+else
+  echo "error: 没有 systemd unit，也没有 docker compose" >&2
+  exit 1
+fi
 echo "[*] upgrade done $(date -Iseconds)"

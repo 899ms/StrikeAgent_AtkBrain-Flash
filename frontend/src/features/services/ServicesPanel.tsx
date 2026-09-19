@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import type { Finding, Graph, GraphNode } from "../../types";
 import { SeverityBadge } from "../../components/Badge";
 import { nodeTypeColor } from "../../theme";
+import { useT } from "../../i18n";
 
 /** 从攻击图提取已发现的服务节点（可选附带指纹类 info） */
 export function filterDiscoveredServices(nodes: GraphNode[]): GraphNode[] {
@@ -38,6 +39,7 @@ export function ServicesPanel({
   graph: Graph;
   onSelect: (n: GraphNode) => void;
 }) {
+  const { t } = useT();
   const services = useMemo(() => filterDiscoveredServices(graph.nodes), [graph.nodes]);
   const findingsByKey = useMemo(() => {
     const m = new Map<string, Finding[]>();
@@ -53,7 +55,7 @@ export function ServicesPanel({
   if (!services.length) {
     return (
       <p className="muted" style={{ fontSize: 14, padding: 4 }}>
-        尚未发现服务节点。Agent 识别到开放端口/协议后会出现在此（攻击图中的 service）。
+        {t("services.emptyHint")}
       </p>
     );
   }
@@ -61,14 +63,14 @@ export function ServicesPanel({
   return (
     <div className="scroll-y" style={{ maxHeight: 520 }}>
       <div className="spread" style={{ marginBottom: 10, padding: "0 2px" }}>
-        <span className="muted" style={{ fontSize: 12 }}>开放端口 / 协议 / 指纹</span>
-        <span className="badge">{services.length} 个服务</span>
+        <span className="muted" style={{ fontSize: 12 }}>{t("services.header")}</span>
+        <span className="badge">{t("services.count", { n: services.length })}</span>
       </div>
       {services.map((n) => {
         const related = findingsByKey.get(n.key) || [];
         const snippet = detailText(n.detail).replace(/\s+/g, " ").trim().slice(0, 140);
         const tags = n.tags || [];
-        const tagSet = new Set(tags.map((t) => t.toLowerCase()));
+        const tagSet = new Set(tags.map((x) => x.toLowerCase()));
         const uaSplit = tagSet.has("ua_split") || tagSet.has("ua-split");
         const uaMobile = tagSet.has("ua:mobile") || tagSet.has("ua-mobile") || tagSet.has("mobile");
         const uaDesktop = tagSet.has("ua:desktop") || tagSet.has("ua-desktop") || tagSet.has("desktop");
@@ -93,17 +95,17 @@ export function ServicesPanel({
                 </span>
                 {uaSplit && (
                   <span className="badge badge-pill" style={{ fontSize: 11, background: "rgba(212,160,23,0.2)", color: "#8a6a00" }}>
-                    UA分流
+                    {t("services.uaSplit")}
                   </span>
                 )}
                 {uaMobile && (
                   <span className="badge badge-pill" style={{ fontSize: 11, background: "rgba(91,141,239,0.18)", color: "#2a5bb8" }}>
-                    移动端
+                    {t("services.uaMobile")}
                   </span>
                 )}
                 {uaDesktop && !uaMobile && (
                   <span className="badge badge-pill" style={{ fontSize: 11, background: "rgba(0,0,0,0.06)", color: "var(--muted)" }}>
-                    PC端
+                    {t("services.uaDesktop")}
                   </span>
                 )}
                 {n.status && (
@@ -114,15 +116,15 @@ export function ServicesPanel({
               </div>
               {related.length > 0 && (
                 <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>
-                  {related.length} 关联发现
+                  {t("services.related", { n: related.length })}
                 </span>
               )}
             </div>
             <div className="mono muted" style={{ fontSize: 12, marginTop: 6 }}>{n.key}</div>
             {n.tags?.length > 0 && (
               <div className="row" style={{ gap: 6, flexWrap: "wrap", marginTop: 8 }}>
-                {n.tags.slice(0, 8).map((t) => (
-                  <span key={t} className="badge badge-pill" style={{ fontSize: 11 }}>{t}</span>
+                {n.tags.slice(0, 8).map((tag) => (
+                  <span key={tag} className="badge badge-pill" style={{ fontSize: 11 }}>{tag}</span>
                 ))}
               </div>
             )}

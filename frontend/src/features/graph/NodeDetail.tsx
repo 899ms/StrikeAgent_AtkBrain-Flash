@@ -1,6 +1,7 @@
 import type { Graph, GraphNode } from "../../types";
 import { SeverityBadge } from "../../components/Badge";
 import { displayFindingSeverity, formatNodeDetail, graphNodeDisplaySeverity, graphNodeDisplayType, graphNodeTypeLabel, nodeTypeColor, showsShellStar, scrubCandidateRceLabel } from "../../theme";
+import { useT } from "../../i18n";
 
 function formatUnix(ts?: number) {
   if (!ts) return "";
@@ -10,7 +11,8 @@ function formatUnix(ts?: number) {
 }
 
 export function NodeDetail({ node, graph }: { node: GraphNode | null; graph: Graph }) {
-  if (!node) return <p className="muted" style={{ fontSize: 14 }}>点击攻击图中的节点查看详情。</p>;
+  const { t } = useT();
+  if (!node) return <p className="muted" style={{ fontSize: 14 }}>{t("node.clickHint")}</p>;
   const inbound = graph.edges.filter((e) => e.to === node.key);
   const outbound = graph.edges.filter((e) => e.from === node.key);
   const related = graph.findings.filter((f) => f.node_key === node.key);
@@ -28,13 +30,13 @@ export function NodeDetail({ node, graph }: { node: GraphNode | null; graph: Gra
       <h3 style={{ marginBottom: 4 }}>{scrubCandidateRceLabel(node.title) || node.title}</h3>
       <div className="mono muted" style={{ fontSize: 12, marginBottom: 6, wordBreak: "break-all" }}>{node.key}</div>
       <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
-        风险 {node.risk_score}
-        {formatUnix(node.created_at) ? ` · 创建 ${formatUnix(node.created_at)}` : ""}
-        {formatUnix(node.updated_at) ? ` · 更新 ${formatUnix(node.updated_at)}` : ""}
+        {t("graph.risk", { n: node.risk_score })}
+        {formatUnix(node.created_at) ? t("graph.created", { t: formatUnix(node.created_at) }) : ""}
+        {formatUnix(node.updated_at) ? t("graph.updated", { t: formatUnix(node.updated_at) }) : ""}
       </div>
       {node.tags?.length > 0 && (
         <div className="row" style={{ gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
-          {node.tags.map((t) => <span key={t} className="badge badge-pill" style={{ fontSize: 11 }}>{t}</span>)}
+          {node.tags.map((tag) => <span key={tag} className="badge badge-pill" style={{ fontSize: 11 }}>{tag}</span>)}
         </div>
       )}
       {detail && (
@@ -44,7 +46,7 @@ export function NodeDetail({ node, graph }: { node: GraphNode | null; graph: Gra
       )}
       {(inbound.length > 0 || outbound.length > 0) && (
         <div style={{ marginTop: 12 }}>
-          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>攻击链关系</div>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>{t("graph.chain")}</div>
           {inbound.map((e) => (
             <div key={e.id} style={{ fontSize: 13, wordBreak: "break-all" }}>
               ← <span className="kbd">{e.from}</span> <span className="muted">{e.relation}{e.rationale ? ` · ${e.rationale}` : ""} (w={e.weight})</span>
@@ -59,7 +61,7 @@ export function NodeDetail({ node, graph }: { node: GraphNode | null; graph: Gra
       )}
       {related.length > 0 && (
         <div style={{ marginTop: 12 }}>
-          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>关联发现</div>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>{t("graph.related")}</div>
           {related.map((f) => (
             <div key={f.id} style={{ fontSize: 13 }}>
               <SeverityBadge severity={displayFindingSeverity(f)} /> {scrubCandidateRceLabel(f.title) || f.title}

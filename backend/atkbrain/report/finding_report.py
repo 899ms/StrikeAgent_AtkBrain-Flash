@@ -76,14 +76,26 @@ def serialize_finding_full(row: Any, *, related_node: dict | None = None,
     return out
 
 
-def _verify_label(st: str | None) -> str:
+def _verify_label(st: str | None, lang: str | None = None) -> str:
+    from ..i18n.locale import normalize_locale
+    from ..i18n.report_labels import lab
     s = (st or "verified").lower()
-    return {
-        "verified": "已验证",
-        "pending": "未验证 / 待复核",
-        "flaky": "不稳定（曾复现）",
-        "rejected": "已驳回",
-    }.get(s, s)
+    loc = normalize_locale(lang)
+    extra = {
+        "zh": {
+            "verified": "已验证",
+            "pending": "未验证 / 待复核",
+            "flaky": "不稳定（曾复现）",
+            "rejected": "已驳回",
+        },
+        "en": {
+            "verified": "Verified",
+            "pending": "Unverified / pending",
+            "flaky": "Flaky (previously reproduced)",
+            "rejected": "Rejected",
+        },
+    }
+    return extra.get(loc, extra["zh"]).get(s) or lab("intel", loc) or s
 
 
 def prepare_finding_report(finding: dict, *, poc: dict | None = None) -> dict:
@@ -145,8 +157,29 @@ def render_finding_markdown(
     *,
     poc: dict | None = None,
     heading: str = "#",
+    lang: str | None = None,
 ) -> str:
     """单漏洞 Markdown：简介、危害、红队评级、手动复现、修复方式。"""
+    from ..i18n.locale import normalize_locale
+    loc = normalize_locale(lang)
+    heads = {
+        "zh": {
+            "cat": "类别", "status": "验证状态", "id": "漏洞 ID",
+            "summary": "漏洞简介", "impact": "危害", "rating": "红队评级",
+            "repro": "手动复现", "fix": "修复方式", "uncat": "未分类",
+            "empty": "_未采集_",
+            "no_poc": "_未采集可执行 PoC（无真实 poc_curl / poc_python）。_",
+            "no_synth": "_系统拒绝为高危项合成假利用脚本。_",
+        },
+        "en": {
+            "cat": "Category", "status": "Verification", "id": "Finding ID",
+            "summary": "Summary", "impact": "Impact", "rating": "Red-team rating",
+            "repro": "Manual reproduction", "fix": "Remediation", "uncat": "Uncategorized",
+            "empty": "_Not collected_",
+            "no_poc": "_No executable PoC collected (no real poc_curl / poc_python)._",
+            "no_synth": "_The system refused to synthesize an exploit script for a high/critical item._",
+        },
+    }[loc]
     p = project or {}
     target = p.get("target") or ""
     poc = poc or poc_for_finding(finding, target if isinstance(target, str) else "")
@@ -159,27 +192,27 @@ def render_finding_markdown(
     lines = [
         f"{heading} [{sev}] {title}",
         "",
-        f"- 类别：`{cat or '未分类'}`",
-        f"- 验证状态：**{_verify_label(vs)}**",
-        f"- 漏洞 ID：`{finding.get('id', '')}`",
+        f"- {heads['cat']}: `{cat or heads['uncat']}`",
+        f"- {heads['status']}: **{_verify_label(vs, loc)}**",
+        f"- {heads['id']}: `{finding.get('id', '')}`",
         "",
-        f"{h2} 漏洞简介",
+        f"{h2} {heads['summary']}",
         "",
     ]
-    lines += _md_block(finding.get("description") or finding.get("title"))
-    lines += [f"{h2} 危害", ""]
-    lines += _md_block(finding.get("impact_detail") or finding.get("impact"))
-    lines += [f"{h2} 红队评级", ""]
-    lines += _md_block(finding.get("secondary_review") or redteam_rating_block(finding))
-    lines += [f"{h2} 手动复现", ""]
+    lines += _md_block(finding.get("description") or finding.get("title"), heads["empty"])
+    lines += [f"{h2} {heads['impact']}", ""]
+    lines += _md_block(finding.get("impact_detail") or finding.get("impact"), heads["empty"])
+    lines += [f"{h2} {heads['rating']}", ""]
+    lines += _md_block(finding.get("secondary_review") or redteam_rating_block(finding), heads["empty"])
+    lines += [f"{h2} {heads['repro']}", ""]
     repro = (finding.get("manual_repro") or "").strip()
     if repro:
-        lines += _md_block(repro)
+        lines += _md_block(repro, heads["empty"])
     else:
         for s in finding.get("manual_steps") or []:
             lines.append(s)
         if not finding.get("manual_steps"):
-            lines += _md_block("")
+            lines += _md_block("", heads["empty"])
     curl = real_poc_text(poc.get("curl") or finding.get("poc_curl"))
     py = real_poc_text(poc.get("python") or finding.get("poc_python"))
     raw_curl = (poc.get("curl") or finding.get("poc_curl") or "").strip()
@@ -189,11 +222,11 @@ def render_finding_markdown(
     if py:
         lines += ["```python", py, "```", ""]
     if not curl and not py:
-        lines += ["_未采集可执行 PoC（无真实 poc_curl / poc_python）。_", ""]
+        lines += [heads["no_poc"], ""]
         if raw_curl or raw_py:
-            lines.append("_系统拒绝为高危项合成假利用脚本。_")
-    lines += [f"{h2} 修复方式", ""]
-    lines += _md_block(finding.get("remediation") or finding.get("report_fix"))
+            lines.append(heads["no_synth"])
+    lines += [f"{h2} {heads['fix']}", ""]
+    lines += _md_block(finding.get("remediation") or finding.get("report_fix"), heads["empty"])
     return "\n".join(lines)
 
 

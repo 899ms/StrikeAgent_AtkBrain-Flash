@@ -1,0 +1,16 @@
+# Docker Desktop / 非 Linux：没有 host 网络时叠加这一份，把端口映出来。
+#   docker compose -f compose.yaml -f deploy/compose.build.yaml -f deploy/compose.bridge.yaml up -d --build --wait
+#
+# 容器内 127.0.0.1 不再是宿主机。本机代理、本机靶场请写 host.docker.internal。
+# Yakit MITM / nmap 内网口径弱于 Linux host 网络，Kali 上请不要用这份。
+
+services:
+  atkbrain:
+    network_mode: bridge
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "2333:2333"
+      - "2334:2334"
+      - "11433:11433"
+      - "8084-8107:8084-8107"

@@ -8,26 +8,26 @@ import { fadeInUp } from "../anim";
 import { PaginationBar, pageItems, readPageSize } from "../components/PaginationBar";
 import { colors } from "../theme";
 import { listStatusOf } from "../projectStatus";
+import { useT } from "../i18n";
+import { getLocale, type Locale } from "../i18n/locale";
 
 function trackOf(p: Project): "redteam" | "ctf" | "src" {
-  const t = (p.config as any)?.track;
+  const tr = (p.config as any)?.track;
   const obj = (p.config as any)?.objective;
-  if (t === "src" || obj === "src") return "src";
-  if (t === "ctf") return "ctf";
+  if (tr === "src" || obj === "src") return "src";
+  if (tr === "ctf") return "ctf";
   if (p.kind === "benchmark") return "ctf";
   if (obj === "flag") return "ctf";
   return "redteam";
 }
 
-function trackLabel(p: Project): string {
-  return { redteam: "红队", ctf: "CTF", src: "SRC" }[trackOf(p)];
-}
-
 type BatchAction = "start" | "stop" | "delete";
-const STATUS_LABEL: Record<string, string> = { all: "全部", running: "进行中", completed: "已完成", idle: "未完成", stopped: "已暂停", error: "失败" };
 function statusOf(p: Project) { return listStatusOf(p); }
 
+const STATUS_KEYS = ["all", "running", "completed", "idle", "stopped", "error"] as const;
+
 export function ProjectsPage() {
+  const { t } = useT();
   const [projects, setProjects] = useState<Project[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
@@ -40,7 +40,7 @@ export function ProjectsPage() {
   const [params, setParams] = useSearchParams();
   const heroRef = useRef<HTMLDivElement>(null);
   const load = () => api.listProjects().then(setProjects).catch(() => {});
-  useEffect(() => { load(); const t = setInterval(load, 15000); return () => clearInterval(t); }, []);
+  useEffect(() => { load(); const tmr = setInterval(load, 15000); return () => clearInterval(tmr); }, []);
   useEffect(() => { if (heroRef.current) fadeInUp(heroRef.current.children); }, []);
   useEffect(() => { if (params.get("create") === "1") { setShowCreate(true); setParams({}, { replace: true }); } }, [params, setParams]);
   useEffect(() => { const alive = new Set(projects.map((p) => p.id)); setSelected((old) => new Set([...old].filter((id) => alive.has(id)))); }, [projects]);
@@ -64,14 +64,22 @@ export function ProjectsPage() {
     const ids = [...selected]; if (!pendingAction || !ids.length) return;
     setBusy(true);
     try { if (pendingAction === "delete") await api.batchDeleteProjects(ids); if (pendingAction === "start") await api.batchStartProjects(ids); if (pendingAction === "stop") await api.batchStopProjects(ids); setSelected(new Set()); await load(); }
-    catch (e: any) { alert(e?.message || "批量操作失败"); } finally { setBusy(false); setPendingAction(null); }
+    catch (e: any) { alert(e?.message || t("projects.batchFailed")); } finally { setBusy(false); setPendingAction(null); }
   };
+  const statusFilterLabel = (key: string) => ({
+    all: t("projects.statusAll"),
+    running: t("projects.statusRunning"),
+    completed: t("projects.statusCompleted"),
+    idle: t("projects.statusIdle"),
+    stopped: t("projects.statusStopped"),
+    error: t("projects.statusError"),
+  } as Record<string, string>)[key] || key;
   return <div className="page-container projects-page">
-    <div ref={heroRef} className="spread" style={{ alignItems: "flex-end", marginBottom: 26 }}><div><p className="eyebrow">PROJECTS</p><h1>审计列表</h1><p className="muted" style={{ marginTop: 8 }}>管理所有授权渗透任务与集群。</p></div><button className="btn btn-primary" onClick={() => setShowCreate(true)}>+ 新建项目</button></div>
-    <section className="project-list-toolbar"><input className="input project-search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索项目名称或目标" /><Filter value={kind} onChange={setKind} options={[["all", "全部形态"], ["single", "单个项目"], ["cluster", "集群"]]} /><Filter value={track} onChange={setTrack} options={[["all", "全部赛道"], ["ctf", "CTF"], ["redteam", "红队"], ["src", "SRC"]]} /></section>
-    <div className="status-filters">{Object.entries(STATUS_LABEL).map(([key, label]) => <button key={key} className={status === key ? "active" : ""} onClick={() => setStatus(key)}>{label} <b>{key === "all" ? projects.length : projects.filter((p) => statusOf(p) === key).length}</b></button>)}</div>
-    <div className="batch-toolbar"><span className="muted">已选 {selected.size}/{visible.length}</span><button className="btn btn-secondary btn-sm" onClick={selectAll} disabled={!visible.length || busy}>全选筛选结果</button><button className="btn btn-secondary btn-sm" onClick={() => setSelected(new Set())} disabled={!selected.size || busy}>取消选择</button><div style={{ flex: 1 }} /><button className="btn btn-primary btn-sm" onClick={() => setPendingAction("start")} disabled={!selected.size || busy}>批量开始</button><button className="btn btn-secondary btn-sm" onClick={() => setPendingAction("stop")} disabled={!selected.size || busy}>批量暂停</button><button className="btn btn-danger btn-sm" onClick={() => setPendingAction("delete")} disabled={!selected.size || busy}>批量删除</button></div>
-    <div className="project-table-wrap"><table className="project-table"><thead><tr><th><input type="checkbox" checked={pageAllSelected} onChange={togglePage} /></th><th>项目名称</th><th>形态 / 赛道</th><th>状态</th><th>节点</th><th>服务</th><th>高危</th><th>严重</th><th>更新时间</th></tr></thead><tbody>{paged.map((p) => <ProjectRow key={p.id} p={p} selected={selected.has(p.id)} onToggle={() => toggle(p.id)} onRename={() => setRename(p)} />)}</tbody></table>{!visible.length && <div className="empty-list">没有符合当前筛选条件的项目。</div>}</div>
+    <div ref={heroRef} className="spread" style={{ alignItems: "flex-end", marginBottom: 26 }}><div><p className="eyebrow">PROJECTS</p><h1>{t("projects.title")}</h1><p className="muted" style={{ marginTop: 8 }}>{t("projects.subtitle")}</p></div><button className="btn btn-primary" onClick={() => setShowCreate(true)}>+ {t("shell.newProject")}</button></div>
+    <section className="project-list-toolbar"><input className="input project-search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t("projects.search")} /><Filter value={kind} onChange={setKind} options={[["all", t("projects.kindAll")], ["single", t("projects.kindSingle")], ["cluster", t("projects.kindCluster")]]} /><Filter value={track} onChange={setTrack} options={[["all", t("projects.trackAll")], ["ctf", "CTF"], ["redteam", t("projects.trackRed")], ["src", t("projects.trackSrc")]]} /></section>
+    <div className="status-filters">{STATUS_KEYS.map((key) => <button key={key} className={status === key ? "active" : ""} onClick={() => setStatus(key)}>{statusFilterLabel(key)} <b>{key === "all" ? projects.length : projects.filter((p) => statusOf(p) === key).length}</b></button>)}</div>
+    <div className="batch-toolbar"><span className="muted">{t("projects.selected", { n: selected.size, total: visible.length })}</span><button className="btn btn-secondary btn-sm" onClick={selectAll} disabled={!visible.length || busy}>{t("projects.selectFiltered")}</button><button className="btn btn-secondary btn-sm" onClick={() => setSelected(new Set())} disabled={!selected.size || busy}>{t("projects.clearSelect")}</button><div style={{ flex: 1 }} /><button className="btn btn-primary btn-sm" onClick={() => setPendingAction("start")} disabled={!selected.size || busy}>{t("projects.batchStart")}</button><button className="btn btn-secondary btn-sm" onClick={() => setPendingAction("stop")} disabled={!selected.size || busy}>{t("projects.batchStop")}</button><button className="btn btn-danger btn-sm" onClick={() => setPendingAction("delete")} disabled={!selected.size || busy}>{t("projects.batchDelete")}</button></div>
+    <div className="project-table-wrap"><table className="project-table"><thead><tr><th><input type="checkbox" checked={pageAllSelected} onChange={togglePage} /></th><th>{t("projects.colName")}</th><th>{t("projects.colKind")}</th><th>{t("projects.colStatus")}</th><th>{t("projects.colNodes")}</th><th>{t("projects.colServices")}</th><th>{t("projects.colHigh")}</th><th>{t("projects.colCritical")}</th><th>{t("projects.colUpdated")}</th></tr></thead><tbody>{paged.map((p) => <ProjectRow key={p.id} p={p} selected={selected.has(p.id)} onToggle={() => toggle(p.id)} onRename={() => setRename(p)} />)}</tbody></table>{!visible.length && <div className="empty-list">{t("projects.empty")}</div>}</div>
     {visible.length > 0 && <PaginationBar total={visible.length} page={curPage} pageSize={pageSize} onPage={setPage} onPageSize={setPageSize} />}
     {showCreate && <CreateModal onClose={() => setShowCreate(false)} onCreated={load} />}
     {rename && <RenameDialog project={rename} onClose={() => setRename(null)} onSaved={() => { setRename(null); load(); }} />}
@@ -81,29 +89,51 @@ export function ProjectsPage() {
 
 function Filter({ value, onChange, options }: { value: string; onChange: (v: string) => void; options: [string, string][] }) { return <select className="select compact-filter" value={value} onChange={(e) => onChange(e.target.value)}>{options.map(([v, label]) => <option key={v} value={v}>{label}</option>)}</select>; }
 function ProjectRow({ p, selected, onToggle, onRename }: { p: Project; selected: boolean; onToggle: () => void; onRename: () => void }) {
+  const { t } = useT();
   const nav = useNavigate(); const s: any = p.stats || {}; const color: Record<string, string> = { running: colors.success, completed: colors.primary, idle: colors.mutedSoft, error: colors.error, stopped: colors.muted };
-  return <tr className={selected ? "selected" : ""} onClick={() => nav(`/project/${p.id}`)}><td onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={selected} onChange={onToggle} /></td><td><strong>{p.name}</strong><span className="table-sub mono">{p.target || (p.kind === "benchmark" ? (trackOf(p) === "src" ? "SRC 评测胶水" : "CTF 评测") : "多资产集群")}</span></td><td><span className="badge badge-pill">{p.kind === "single" ? "单项目" : p.kind === "benchmark" ? (trackOf(p) === "src" ? "SRC 集群" : "CTF 集群") : "集群"}</span><span className="table-sub">{trackLabel(p)}</span></td><td><span className="row" style={{ gap: 6 }}><span className="pulse-dot" style={{ background: color[statusOf(p)] || colors.muted }} />{STATUS_LABEL[statusOf(p)] || statusOf(p)}</span></td><td>{s.nodes || 0}</td><td>{s.services || 0}</td><td>{s.high || 0}</td><td className={s.critical ? "danger-number" : ""}>{s.critical || 0}</td><td><span className="table-sub">{new Date((p.updated_at || p.created_at) * 1000).toLocaleString()}</span><button className="row-rename" onClick={(e) => { e.stopPropagation(); onRename(); }}>编辑</button></td></tr>;
+  const track = trackOf(p);
+  const trackText = track === "redteam" ? t("projects.trackRed") : track === "ctf" ? "CTF" : t("projects.trackSrc");
+  const kindText = p.kind === "single" ? t("projects.single") : p.kind === "benchmark" ? (track === "src" ? t("projects.srcCluster") : t("projects.ctfCluster")) : t("projects.cluster");
+  const subText = p.target || (p.kind === "benchmark" ? (track === "src" ? t("projects.srcGlue") : t("projects.ctfBench")) : t("projects.multiAsset"));
+  const listStatus = statusOf(p);
+  const listStatusText = ({
+    all: t("projects.statusAll"),
+    running: t("projects.statusRunning"),
+    completed: t("projects.statusCompleted"),
+    idle: t("projects.statusIdle"),
+    stopped: t("projects.statusStopped"),
+    error: t("projects.statusError"),
+    queued: t("status.queued"),
+  } as Record<string, string>)[listStatus] || listStatus;
+  return <tr className={selected ? "selected" : ""} onClick={() => nav(`/project/${p.id}`)}><td onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={selected} onChange={onToggle} /></td><td><strong>{p.name}</strong><span className="table-sub mono">{subText}</span></td><td><span className="badge badge-pill">{kindText}</span><span className="table-sub">{trackText}</span></td><td><span className="row" style={{ gap: 6 }}><span className="pulse-dot" style={{ background: color[listStatus] || colors.muted }} />{listStatusText}</span></td><td>{s.nodes || 0}</td><td>{s.services || 0}</td><td>{s.high || 0}</td><td className={s.critical ? "danger-number" : ""}>{s.critical || 0}</td><td><span className="table-sub">{new Date((p.updated_at || p.created_at) * 1000).toLocaleString()}</span><button className="row-rename" onClick={(e) => { e.stopPropagation(); onRename(); }}>{t("common.edit")}</button></td></tr>;
 }
 function BatchConfirm({ action, count, projects, onClose, onConfirm, busy }: { action: BatchAction; count: number; projects: Project[]; onClose: () => void; onConfirm: () => void; busy: boolean }) {
-  const label = { start: "启动", stop: "暂停", delete: "删除" }[action]; const running = projects.filter((p) => statusOf(p) === "running" || statusOf(p) === "queued").length;
-  return <Modal title={`确认批量${label}`} onClose={onClose}><p>将对 <b>{count}</b> 个项目执行“{label}”。</p><div className="confirm-impact">运行中项目：<b>{running}</b>　集群：<b>{projects.filter((p) => p.kind !== "single").length}</b></div><p className="muted">{action === "delete" ? "删除会级联删除子项目、攻击图、发现与运行记录，且不可恢复。" : action === "stop" ? "暂停会中断正在执行的 Agent 会话；当前轮次不会继续。" : "启动会占用并发槽位。"}</p><div className="row" style={{ justifyContent: "flex-end", marginTop: 22 }}><button className="btn btn-secondary" onClick={onClose} disabled={busy}>取消</button><button className={`btn ${action === "delete" ? "btn-danger" : "btn-primary"}`} onClick={onConfirm} disabled={busy}>{busy ? "处理中…" : `确认${label}`}</button></div></Modal>;
+  const { t } = useT();
+  const label = { start: t("common.start"), stop: t("common.pause"), delete: t("common.delete") }[action]; const running = projects.filter((p) => statusOf(p) === "running" || statusOf(p) === "queued").length;
+  return <Modal title={t("projects.confirmBatch", { action: label })} onClose={onClose}><p>{t("projects.confirmBatchBody", { n: count, action: label })}</p><div className="confirm-impact">{t("projects.confirmImpact", { running, clusters: projects.filter((p) => p.kind !== "single").length })}</div><p className="muted">{action === "delete" ? t("projects.deleteWarn") : action === "stop" ? t("projects.stopWarn") : t("projects.startWarn")}</p><div className="row" style={{ justifyContent: "flex-end", marginTop: 22 }}><button className="btn btn-secondary" onClick={onClose} disabled={busy}>{t("common.cancel")}</button><button className={`btn ${action === "delete" ? "btn-danger" : "btn-primary"}`} onClick={onConfirm} disabled={busy}>{busy ? t("common.processing") : t("projects.confirmAction", { action: label })}</button></div></Modal>;
 }
 function RenameDialog({ project, onClose, onSaved }: { project: Project; onClose: () => void; onSaved: () => void }) {
+  const { t } = useT();
   const [name, setName] = useState(project.name); const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
-  const save = async () => { if (!name.trim()) return setErr("名称不能为空"); setBusy(true); try { await api.renameProject(project.id, name.trim()); onSaved(); } catch (e: any) { setErr(e?.message || "改名失败"); } finally { setBusy(false); } };
-  return <Modal title="重命名项目" onClose={onClose}><p className="muted">{project.kind === "single" ? "新名称会显示在项目列表和报告中。" : "集群改名会同步更新子项目的显示前缀，不影响攻击数据。"}</p><input className="input" autoFocus value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save()} />{err && <p className="error-text">{err}</p>}<div className="row" style={{ justifyContent: "flex-end", marginTop: 20 }}><button className="btn btn-secondary" onClick={onClose}>取消</button><button className="btn btn-primary" onClick={save} disabled={busy}>{busy ? "保存中…" : "保存名称"}</button></div></Modal>;
+  const save = async () => { if (!name.trim()) return setErr(t("projects.nameRequired")); setBusy(true); try { await api.renameProject(project.id, name.trim()); onSaved(); } catch (e: any) { setErr(e?.message || t("projects.renameFailed")); } finally { setBusy(false); } };
+  return <Modal title={t("projects.renameTitle")} onClose={onClose}><p className="muted">{project.kind === "single" ? t("projects.renameSingle") : t("projects.renameCluster")}</p><input className="input" autoFocus value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save()} />{err && <p className="error-text">{err}</p>}<div className="row" style={{ justifyContent: "flex-end", marginTop: 20 }}><button className="btn btn-secondary" onClick={onClose}>{t("common.cancel")}</button><button className="btn btn-primary" onClick={save} disabled={busy}>{busy ? t("common.saving") : t("projects.saveName")}</button></div></Modal>;
 }
 
 function CreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const { t, locale } = useT();
   const nav = useNavigate();
   const [kind, setKind] = useState<"single" | "cluster">("single");
   const [track, setTrack] = useState<"redteam" | "ctf" | "src">("redteam");
+  const [outputLang, setOutputLang] = useState<Locale>(() => getLocale());
   const [name, setName] = useState("");
   const [target, setTarget] = useState("");
   const [ports, setPorts] = useState("");
   const [assets, setAssets] = useState("");
   const [baseUrl, setBaseUrl] = useState("https://tsecbench.zc.tencent.com");
   const [token, setToken] = useState("");
+  const [authUser, setAuthUser] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authToken, setAuthToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [createdId, setCreatedId] = useState<string | null>(null);
@@ -112,9 +142,11 @@ function CreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
   const [hardStops, setHardStops] = useState<Record<string, { label?: string; conditions?: string[] }>>({});
   const importPoll = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  useEffect(() => { setOutputLang(locale); }, [locale]);
+
   useEffect(() => {
     api.settings().then((s) => setHardStops(s?.defaults?.hard_stop || {})).catch(() => {});
-  }, []);
+  }, [locale]);
 
   const enterProject = (id: string) => {
     if (importPoll.current) clearTimeout(importPoll.current);
@@ -135,7 +167,7 @@ function CreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
         if (isImportRunning(p)) {
           importPoll.current = setTimeout(tick, 400);
         } else if (p.phase === "error") {
-          setErr(p.message || "导入失败");
+          setErr(p.message || t("projects.importFailed"));
         } else if (isImportPaused(p)) {
           setBusy(false);
         } else if (p.phase === "done") {
@@ -156,38 +188,43 @@ function CreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
     setBusy(true); setErr("");
     try {
       const clusterBenchmark = kind === "cluster" && track === "ctf";
-      const body: any = { kind: clusterBenchmark ? "benchmark" : kind, name, track };
+      const body: any = { kind: clusterBenchmark ? "benchmark" : kind, name, track, output_lang: outputLang };
       if (kind === "single") {
         body.target = target.trim();
-        if (!body.target) throw new Error("请填写目标");
+        if (!body.target) throw new Error(t("projects.needTarget"));
         if (ports.trim()) body.ports = ports.split(/[,\s]+/).filter(Boolean).map(Number);
         body.allow_subdomains = false;
       } else if (clusterBenchmark) {
-        if (!baseUrl.trim() || !token.trim()) throw new Error("请填写 BENCHMARK_BASE_URL 与 BENCHMARK_TOKEN");
+        if (!baseUrl.trim() || !token.trim()) throw new Error(t("projects.needBench"));
         body.base_url = baseUrl.trim();
         body.token = token.trim();
       } else {
         const lines = assets.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-        if (!lines.length) throw new Error("请填写资产列表");
+        if (!lines.length) throw new Error(t("projects.needAssets"));
         body.assets = [assets];
         setImportProgress({
           phase: "merge",
           done: 0,
           total: lines.length,
-          message: track === "src" ? "正在按产品域合并…" : "正在按同机合并…",
+          message: track === "src" ? t("projects.mergingZone") : t("projects.mergingHost"),
         });
+      }
+      if (track !== "ctf") {
+        if (authUser.trim()) body.auth_user = authUser.trim();
+        if (authPassword) body.auth_password = authPassword;
+        if (authToken.trim()) body.auth_token = authToken.trim();
       }
       const p: any = await api.createProject(body);
       if (kind === "cluster" && !clusterBenchmark && (p.importing || p.import_progress)) {
         setCreatedId(p.id);
-        setImportProgress(p.import_progress || { phase: "spawn", done: 0, total: 0, message: "正在导入…" });
+        setImportProgress(p.import_progress || { phase: "spawn", done: 0, total: 0, message: t("projects.importing") });
         return;
       }
       onCreated();
       onClose();
       nav(`/project/${p.id}`);
     } catch (e: any) {
-      setErr(e.message || "创建失败");
+      setErr(e.message || t("projects.createFailed"));
     } finally {
       setBusy(false);
     }
@@ -199,66 +236,72 @@ function CreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
   };
 
   return (
-    <Modal title="新建渗透项目" onClose={handleClose}>
+    <Modal title={t("projects.createTitle")} onClose={handleClose}>
       <div className="field">
-        <span>项目形态</span>
+        <span>{t("projects.shape")}</span>
         <div className="row" style={{ gap: 8, marginTop: 4, flexWrap: "wrap" }}>
-          <button className={`btn ${kind === "single" ? "btn-primary" : "btn-secondary"}`} onClick={() => setKind("single")}>单目标</button>
-          <button className={`btn ${kind === "cluster" ? "btn-primary" : "btn-secondary"}`} onClick={() => setKind("cluster")}>集群（批量资产）</button>
+          <button className={`btn ${kind === "single" ? "btn-primary" : "btn-secondary"}`} onClick={() => setKind("single")}>{t("projects.singleTarget")}</button>
+          <button className={`btn ${kind === "cluster" ? "btn-primary" : "btn-secondary"}`} onClick={() => setKind("cluster")}>{t("projects.clusterAssets")}</button>
         </div>
       </div>
 
       <div className="field" style={{ marginTop: 12 }}>
-        <span>赛道</span>
+        <span>{t("projects.track")}</span>
         <div className="row" style={{ gap: 8, marginTop: 4, flexWrap: "wrap" }}>
-          <button type="button" className={`btn btn-sm ${track === "redteam" ? "btn-primary" : "btn-secondary"}`} onClick={() => setTrack("redteam")}>红队（getshell）</button>
-          <button type="button" className={`btn btn-sm ${track === "ctf" ? "btn-primary" : "btn-secondary"}`} onClick={() => setTrack("ctf")}>CTF（flag）</button>
-          <button type="button" className={`btn btn-sm ${track === "src" ? "btn-primary" : "btn-secondary"}`} onClick={() => setTrack("src")}>SRC（厂商清单挖洞）</button>
+          <button type="button" className={`btn btn-sm ${track === "redteam" ? "btn-primary" : "btn-secondary"}`} onClick={() => setTrack("redteam")}>{t("projects.trackRedBtn")}</button>
+          <button type="button" className={`btn btn-sm ${track === "ctf" ? "btn-primary" : "btn-secondary"}`} onClick={() => setTrack("ctf")}>{t("projects.trackCtfBtn")}</button>
+          <button type="button" className={`btn btn-sm ${track === "src" ? "btn-primary" : "btn-secondary"}`} onClick={() => setTrack("src")}>{t("projects.trackSrcBtn")}</button>
         </div>
         <span style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, display: "block", lineHeight: 1.55 }}>
-          {track === "redteam" && "红队：拿到服务器 shell 即完成本项目。"}
-          {track === "ctf" && (kind === "cluster" ? "集群 CTF = 靶场评测：填 base_url + token，拉题按题自建 flag 子项目并跑分。" : "单目标 CTF：夺齐 flag（及分数，若有）即满分收工。")}
-          {track === "src" && (kind === "cluster"
-            ? "集群 SRC：贴厂商资产列表挖已验证高危/严重。不夺旗、不以 getshell 收工。"
-            : "SRC：按厂商清单挖已验证高危/严重，不停在第一条。不夺旗、不以 getshell 收工。")}
+          {track === "redteam" && t("projects.hintRed")}
+          {track === "ctf" && (kind === "cluster" ? t("projects.hintCtfCluster") : t("projects.hintCtfSingle"))}
+          {track === "src" && (kind === "cluster" ? t("projects.hintSrcCluster") : t("projects.hintSrcSingle"))}
           {" "}
-          {(track === "ctf" ? hardStops.flag : hardStops[track])?.label
-            || (track === "src" ? "硬停：墙钟满 6 小时，记失败。已验证高危/严重不停工。不限轮次。"
-              : track === "redteam" ? "硬停：墙钟满 12 小时，记失败。拿到 shell 提前收工。不限轮次。"
-              : "")}
+          {(track === "ctf" ? hardStops.flag : hardStops[track])?.label || ""}
           {((track === "ctf" ? hardStops.flag : hardStops[track])?.conditions || []).map((c) => (
             <div key={c}>· {c}</div>
           ))}
         </span>
       </div>
 
+      <div className="field" style={{ marginTop: 12 }}>
+        <span>{t("common.outputLang")}</span>
+        <div className="row" style={{ gap: 8, marginTop: 4, flexWrap: "wrap" }}>
+          <button type="button" className={`btn btn-sm ${outputLang === "zh" ? "btn-primary" : "btn-secondary"}`} onClick={() => setOutputLang("zh")}>{t("common.langZh")}</button>
+          <button type="button" className={`btn btn-sm ${outputLang === "en" ? "btn-primary" : "btn-secondary"}`} onClick={() => setOutputLang("en")}>{t("common.langEn")}</button>
+        </div>
+        <span style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, display: "block", lineHeight: 1.55 }}>
+          {t("common.outputLangHint")}
+        </span>
+      </div>
+
       <label className="field" style={{ marginTop: 12 }}>
-        <span>项目名称</span>
-        <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder={kind === "single" ? "可留空，默认用目标" : "项目名称（必填）"} />
+        <span>{t("projects.name")}</span>
+        <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder={kind === "single" ? t("projects.namePhSingle") : t("projects.namePhCluster")} />
       </label>
 
       {kind === "single" && (
         <>
           <label className="field">
-            <span>目标（域名或 IP，可带端口如 host:8787）</span>
-            <input className="input" value={target} onChange={(e) => setTarget(e.target.value)} placeholder="192.168.236.1:8787 或 example.com" />
+            <span>{t("projects.target")}</span>
+            <input className="input" value={target} onChange={(e) => setTarget(e.target.value)} placeholder="192.168.236.1:8787 or example.com" />
           </label>
           <label className="field">
-            <span>指定端口（可选，逗号分隔；留空=该主机全端口在边界内）</span>
+            <span>{t("projects.ports")}</span>
             <input className="input" value={ports} onChange={(e) => setPorts(e.target.value)} placeholder="80,443,8787" />
           </label>
           <span style={{ fontSize: 12, color: "var(--muted)", marginBottom: 14, display: "block" }}>
-            边界按域名/IP 唯一身份（同主机任意端口合法）；子域与第三方域默认不纳入，除非内网跳板授权横向。
+            {t("projects.scopeHint")}
           </span>
         </>
       )}
 
       {kind === "cluster" && track !== "ctf" && (
         <div className="field">
-          <span>资产列表（CSV/TXT 内容，逐行或逗号分隔 IP/域名）</span>
+          <span>{t("projects.assets")}</span>
           <div className="row" style={{ gap: 10, margin: "6px 0 8px", flexWrap: "wrap", alignItems: "center" }}>
             <label className="btn btn-secondary btn-sm" style={{ cursor: "pointer" }}>
-              选择文件
+              {t("projects.pickFile")}
               <input
                 type="file"
                 accept=".txt,.csv,.list,text/plain"
@@ -273,7 +316,7 @@ function CreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
               />
             </label>
             <span className="muted" style={{ fontSize: 12 }}>
-              {track === "src" ? "SRC 按产品域自动收组（如 *.bbs.ztgame.com 一组）" : "红队按同机（FQDN / 源站 IP）自动合并"}
+              {track === "src" ? t("projects.mergeSrc") : t("projects.mergeRed")}
             </span>
           </div>
           <textarea
@@ -284,7 +327,7 @@ function CreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
             placeholder={"10.0.0.5\nexample.com\n10.0.0.6:8080"}
           />
           <span style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, display: "block" }}>
-            点击创建后自动合并并显示进度。丢掉 host 等表头；同主机多端口仍一台。导入时还会按源站 IP 再并{track === "src" ? "（仅同产品域）" : ""}。
+            {t("projects.mergeHint")}{track === "src" ? t("projects.mergeHintSrc") : ""}.
           </span>
         </div>
       )}
@@ -292,29 +335,50 @@ function CreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
       {kind === "cluster" && track === "ctf" && (
         <>
           <label className="field">
-            <span>BENCHMARK_BASE_URL（评测平台 API 基址）</span>
+            <span>{t("projects.benchUrl")}</span>
             <input className="input" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://tsecbench.zc.tencent.com" />
           </label>
           <label className="field">
-            <span>BENCHMARK_TOKEN（跑分任务下发）</span>
+            <span>{t("projects.benchToken")}</span>
             <input className="input" value={token} onChange={(e) => setToken(e.target.value)} placeholder="a1b2c3d4-..." />
           </label>
           <span style={{ fontSize: 12, color: "var(--muted)", marginBottom: 14, display: "block" }}>
-            创建后进入评测页，点「拉取题目」按题自动建 flag 子项目。需先连靶场 VPN。
+            {t("projects.benchHint")}
           </span>
         </>
+      )}
+
+      {track !== "ctf" && (
+        <div className="field" style={{ marginTop: 12 }}>
+          <span>{t("projects.authTitle")}</span>
+          <label className="field" style={{ marginTop: 8 }}>
+            <span>{t("projects.authUser")}</span>
+            <input className="input" autoComplete="off" value={authUser} onChange={(e) => setAuthUser(e.target.value)} placeholder="admin" />
+          </label>
+          <label className="field">
+            <span>{t("projects.authPassword")}</span>
+            <input className="input" type="password" autoComplete="new-password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} />
+          </label>
+          <label className="field">
+            <span>{t("projects.authToken")}</span>
+            <input className="input" autoComplete="off" value={authToken} onChange={(e) => setAuthToken(e.target.value)} placeholder="Bearer eyJ... or Cookie: session=..." />
+          </label>
+          <span style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, display: "block", lineHeight: 1.55 }}>
+            {t("projects.authHint")}
+          </span>
+        </div>
       )}
 
       {err && <div style={{ color: "var(--error)", marginBottom: 12, fontSize: 14 }}>{err}</div>}
       {(busy || importProgress) && kind === "cluster" && track !== "ctf" && (
         <ImportProgressBar
-          progress={importProgress || { phase: "spawn", done: 0, total: 0, message: "正在创建集群…" }}
+          progress={importProgress || { phase: "spawn", done: 0, total: 0, message: t("projects.creatingCluster") }}
           onPause={createdId ? async () => {
             try {
               const p = await api.pauseImport(createdId);
               setImportProgress(p);
             } catch (e: any) {
-              setErr(e.message || "暂停导入失败");
+              setErr(e.message || t("projects.pauseImportFailed"));
             }
           } : undefined}
           onResume={createdId ? async () => {
@@ -324,18 +388,18 @@ function CreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
               setBusy(true);
               setImportKick((n) => n + 1);
             } catch (e: any) {
-              setErr(e.message || "继续导入失败");
+              setErr(e.message || t("projects.resumeImportFailed"));
             }
           } : undefined}
         />
       )}
       <div className="row" style={{ justifyContent: "flex-end", gap: 10 }}>
-        <button className="btn btn-secondary" onClick={handleClose} disabled={busy}>取消</button>
+        <button className="btn btn-secondary" onClick={handleClose} disabled={busy}>{t("common.cancel")}</button>
         {createdId ? (
-          <button className="btn btn-primary" onClick={() => enterProject(createdId)}>进入项目查看</button>
+          <button className="btn btn-primary" onClick={() => enterProject(createdId)}>{t("projects.enterProject")}</button>
         ) : (
           <button className="btn btn-primary" disabled={busy} onClick={submit}>
-            {busy ? "导入中…" : "创建并进入"}
+            {busy ? t("projects.importingBtn") : t("projects.createEnter")}
           </button>
         )}
       </div>

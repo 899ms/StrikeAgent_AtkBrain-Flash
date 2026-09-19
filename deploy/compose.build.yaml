@@ -1,0 +1,14 @@
+# 源码构建 overlay。仓库根目录执行：
+#   docker compose -f compose.yaml -f deploy/compose.build.yaml up -d --build --wait
+#
+# 路径相对第一份 compose 文件（仓库根），不要在 deploy/ 里单独 compose up。
+
+services:
+  atkbrain:
+    build:
+      context: .
+      dockerfile: Dockerfile.console
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-docker.m.daocloud.io/library/node:20-bookworm-slim}
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim-bookworm}
+    image: strikeagent-atkbrain-flash:console

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# StrikeAgent_AtkBrain-Flash 前端常驻管理：经 systemd 拉起 Vite，崩溃自动重启。
+# StrikeAgent_AtkBrain-Flash 控制台 :2334 反代到后端 :2333（安全入口生效）。
 # 用法: scripts/atkbrain-frontend.sh {install|start|stop|restart|status|logs|uninstall}
 set -euo pipefail
 
@@ -19,6 +19,7 @@ cmd_install() {
   command -v npm >/dev/null || die "找不到 npm"
   [[ -f "$UNIT_SRC" ]] || die "找不到 unit: $UNIT_SRC"
   [[ -d "$REPO/frontend/node_modules" ]] || die "先在 frontend/ 执行 npm install"
+  (cd "$REPO/frontend" && npm run build)
   mkdir -p "$LOG_DIR"
   retire_legacy_units
   kill_stray_frontend
@@ -29,7 +30,7 @@ cmd_install() {
   systemctl restart atkbrain-flash-frontend.service
   sleep 1
   cmd_status
-  echo "[*] 已安装并启动。之后请用本脚本 restart，勿在 Cursor shell 里前台跑 npm run dev"
+  echo "[*] 已安装并启动。浏览器请用 python -m atkbrain.panel 打印的带入口 URL，勿在 Cursor shell 里前台跑 npm run dev"
 }
 
 cmd_start() {
@@ -64,7 +65,7 @@ cmd_status() {
   systemctl --no-pager --full status atkbrain-flash-frontend.service || true
   echo "---"
   code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:2334/ 2>/dev/null || echo 000)"
-  echo "vite: HTTP $code (2334)"
+  echo "console: HTTP $code (2334 → 2333；无入口显示产品介绍页)"
 }
 
 cmd_logs() {

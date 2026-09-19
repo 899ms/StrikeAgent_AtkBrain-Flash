@@ -13,9 +13,11 @@ from fastapi.staticfiles import StaticFiles
 
 from .api.routes import router as api_router
 from .api.ws import ws_router
+from .auth.routes import router as auth_router
 from .config import REPO_ROOT, settings
 from .db import db, now
 from .app_version import local_version
+from .i18n.locale import locale_from_request, set_locale
 
 
 def _raise_nofile_limit() -> None:
@@ -31,17 +33,6 @@ def _raise_nofile_limit() -> None:
             print(f"[startup] RLIMIT_NOFILE {soft} → {want} (hard={hard})")
     except Exception as e:
         print(f"[startup] 提升 RLIMIT_NOFILE 失败：{e}")
-
-
-def _extract_api_token(request: Request) -> str:
-    """从 X-API-Token / Authorization: Bearer / ?token= 取令牌。"""
-    h = (request.headers.get("x-api-token") or "").strip()
-    if h:
-        return h
-    auth = (request.headers.get("authorization") or "").strip()
-    if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return (request.query_params.get("token") or "").strip()
 
 
 async def _benchmark_autopilot_loop():
@@ -76,7 +67,17 @@ async def lifespan(app: FastAPI):
         ensure_pi_agent_dir()
     except Exception as e:
         print(f"[startup] 写入 Pi 配置失败：{e}")
+    try:
+        from .engine.hunt_clock_settings import apply_hunt_clocks_to_settings
+        apply_hunt_clocks_to_settings()
+    except Exception as e:
+        print(f"[startup] 猎面撞墙钟读取失败：{e}")
     await db.connect()
+    try:
+        from .auth.bootstrap import bootstrap_admin
+        await bootstrap_admin()
+    except Exception as e:
+        print(f"[startup] 管理员引导失败：{e}")
     # 崩溃/重启后：runs 表孤儿行无法继续，先收口。项目 status=running 先记下来再续跑，
     # 不要一上来全部改 idle，否则 systemd 重启会把进行中的猎丢掉。
     db_running = [
@@ -102,6 +103,13 @@ async def lifespan(app: FastAPI):
         print(f"[startup] 图空转/硬停改记失败跳过：{e}")
     if (settings.api_token or "").strip():
         print("[startup] API Token 鉴权已启用（ATKBRAIN_API_TOKEN 非空；不打印令牌）")
+    try:
+        from .auth.entry import load_or_create_entry, public_console_url
+        load_or_create_entry()
+        print(f"[startup] 控制台 {public_console_url()}")
+        print("[startup] 忘入口或首登后口令：python -m atkbrain.panel")
+    except Exception as e:
+        print(f"[startup] 安全入口打印失败：{e}")
     try:
         from .agents.brief_creds import CREDS_MODE
         print(f"[startup] creds_mode={CREDS_MODE}（只摘录已出现账密，不合成厂商默认口令）")
@@ -156,11 +164,19 @@ async def lifespan(app: FastAPI):
     await db.close()
 
 
-app = FastAPI(title="StrikeAgent_AtkBrain-Flash", version=local_version(), lifespan=lifespan)
+app = FastAPI(
+    title="StrikeAgent_AtkBrain-Flash",
+    version=local_version(),
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
+_cors = [x.strip() for x in str(getattr(settings, "cors_origins", "") or "").split(",") if x.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors or ["http://127.0.0.1:2334", "http://localhost:2334"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -168,53 +184,126 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def api_token_middleware(request: Request, call_next):
-    """ATKBRAIN_API_TOKEN 非空时强制鉴权；放行 /api/health 与非 /api 静态资源。"""
-    expected = (settings.api_token or "").strip()
-    if not expected:
-        return await call_next(request)
-    path = request.url.path or ""
-    if path in ("/api/health", "/api/version") or not path.startswith("/api"):
-        return await call_next(request)
-    # WebSocket 升级由 ws 端点自行校验，避免中间件吞掉 upgrade
-    if (request.headers.get("upgrade") or "").lower() == "websocket":
-        return await call_next(request)
-    got = _extract_api_token(request)
-    if got != expected:
-        return JSONResponse({"detail": "Unauthorized：需要有效 API Token"}, status_code=401)
+async def locale_middleware(request: Request, call_next):
+    set_locale(locale_from_request(request))
     return await call_next(request)
 
 
+@app.middleware("http")
+async def api_auth_middleware(request: Request, call_next):
+    """会话 Cookie 或 API Token。auth 公开接口精确白名单。"""
+    set_locale(locale_from_request(request))
+    path = request.url.path or ""
+    if (request.headers.get("upgrade") or "").lower() == "websocket":
+        return await call_next(request)
+    from .auth.bootstrap import env_no_auth, login_required
+    from .auth.cookies import apply_session_cookie
+    from .auth.entry import is_loopback_peer, peer_host
+    from .auth.gate import (
+        api_token_ok,
+        auth_public_path,
+        must_change_path_allowed,
+        session_from_request,
+        session_must_change,
+    )
+    loopback = is_loopback_peer(peer_host(request))
+    if path == "/api/health" and loopback:
+        return await call_next(request)
+    if auth_public_path(path) or not path.startswith("/api"):
+        return await call_next(request)
+    if env_no_auth():
+        return await call_next(request)
+    sess = await session_from_request(request)
+    if sess:
+        if session_must_change(sess) and not must_change_path_allowed(path):
+            return JSONResponse({"detail": "password-change-required"}, status_code=403)
+        response = await call_next(request)
+        row = sess.get("session") or {}
+        try:
+            exp = float(row.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            exp = 0.0
+        apply_session_cookie(
+            response,
+            str(sess.get("token") or ""),
+            request,
+            expires_at=exp or None,
+        )
+        return response
+    if await api_token_ok(request):
+        return await call_next(request)
+    if not await login_required():
+        expected = (settings.api_token or "").strip()
+        if not expected:
+            return await call_next(request)
+        return JSONResponse({"detail": "Unauthorized：需要有效 API Token"}, status_code=401)
+    return JSONResponse({"detail": "login-required"}, status_code=401)
+
+
+app.include_router(auth_router)
 app.include_router(api_router)
 app.include_router(ws_router)
 
+from .auth.entry import SecurityEntryMiddleware, entry_prefix
+
+# 最外层：无入口则本机展示产品介绍页（含 docs / assets / api）。
+app.add_middleware(SecurityEntryMiddleware)
+
 # 生产：若前端已构建，则托管静态资源
 _FRONT_DIST = os.path.join(str(REPO_ROOT), "frontend", "dist")
+
+
+def _inject_index_html() -> str:
+    raw = open(os.path.join(_FRONT_DIST, "index.html"), encoding="utf-8").read()
+    prefix = entry_prefix()
+    base = prefix or ""
+    snippet = (
+        f'<base href="{base}/">'
+        f'<script>window.__ATKBRAIN_BASE__="{base}";</script>'
+        if base else
+        '<script>window.__ATKBRAIN_BASE__="";</script>'
+    )
+    if "<head>" in raw:
+        return raw.replace("<head>", "<head>" + snippet, 1)
+    return snippet + raw
+
+
+def _spa_index():
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(
+        _inject_index_html(),
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
+
+
 if os.path.isdir(_FRONT_DIST):
     app.mount("/assets", StaticFiles(directory=os.path.join(_FRONT_DIST, "assets")), name="assets")
 
     @app.get("/")
     async def _index():
-        # index.html 不缓存：后端/前端更新后浏览器总能拿到最新版（避免缓存旧版导致“列表混乱/点错项目”）。
-        return FileResponse(os.path.join(_FRONT_DIST, "index.html"),
-                            headers={"Cache-Control": "no-cache, must-revalidate"})
+        return _spa_index()
 
     @app.get("/{full_path:path}")
     async def _spa(full_path: str):
-        # SPA 回退（非 /api 路径都回 index.html）
         target = os.path.join(_FRONT_DIST, full_path)
         if os.path.isfile(target):
-            return FileResponse(target)  # 带哈希的静态资源可长期缓存
-        return FileResponse(os.path.join(_FRONT_DIST, "index.html"),
-                            headers={"Cache-Control": "no-cache, must-revalidate"})
+            return FileResponse(target)
+        return _spa_index()
 else:
     @app.get("/")
     async def _root():
-        return {"service": "StrikeAgent_AtkBrain-Flash", "docs": "/docs", "hint": "前端开发模式请运行 frontend (vite)"}
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse("", headers={"Cache-Control": "no-store"})
 
 
 def main() -> None:
-    uvicorn.run("atkbrain.main:app", host=settings.host, port=settings.port, reload=False)
+    uvicorn.run(
+        "atkbrain.main:app",
+        host=settings.host,
+        port=settings.port,
+        reload=False,
+        server_header=False,
+    )
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """ProjectAgent：每个项目独立的 Pi 猎面。
 
 - 从者与角色工人都是全新 Pi RPC：每轮不续接旧对话，局面只靠攻击图/简报。
-- 项目内工人无上限；Python 按御主方案并发拉起，不再走 Task。
+- 项目内从者+工人有闸（默认 4）；Python 按御主方案并发拉起，截断到闸门内。
 - 图工具经 HTTP /agent-tools 由 Pi 扩展调用。
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from ..objective import objective_allows_flag, objective_is_src
 from ..scope import Scope
 from .context import AgentContext
 from .mcp_http import register_project_mcp, unregister_project_mcp
-from .pi_runtime import PiSession
+from .pi_runtime import PiSession, cap_hunt_workers, kill_live_for_project
 from .project_skills import skill_abs_paths
 from .prompts import (
     build_brief,
@@ -30,6 +30,7 @@ from .prompts import (
     FINDING_REVIEW_ROLE,
 )
 from .tools import tool_names
+from ..i18n.locale import config_output_lang
 
 _DEAD_CLI_RE = re.compile(
     r"Cannot write to terminated process|terminated process|exit code:\s*-?11|"
@@ -74,8 +75,10 @@ class ProjectAgent:
         )
         self._sessions: list[PiSession] = []
         self._pi_pool: dict[str, PiSession] = {}
+        self._pi_locks: dict[str, asyncio.Lock] = {}
         self._review_wake = asyncio.Event()
         self._review_lock = asyncio.Lock()
+        self._owns_mcp = True
         self._review_task: asyncio.Task | None = None
         self._page_task: asyncio.Task | None = None
         self._stopped = False
@@ -119,20 +122,27 @@ class ProjectAgent:
         except OSError:
             return []
 
+    def _output_lang(self) -> str:
+        proj = getattr(self.ctx, "project", None) or self.project or {}
+        return config_output_lang(proj.get("config") if isinstance(proj, dict) else {})
+
     def _lead_system(self) -> str:
         return build_system_prompt(
             self.scope, self.workspace_dir, self.objective, self.brief,
+            output_lang=self._output_lang(),
         )
 
     def _role_system(self, role: str) -> str:
         spec = self._roles.get(role) or {}
         prompt = str(spec.get("prompt") or "")
         tools = ", ".join(tool_names(self.objective))
-        return (
+        from ..i18n.prompts import with_output_lang
+        return with_output_lang(
             f"{prompt}\n\n"
             f"工作目录：{self.workspace_dir}\n"
             f"可用工具：{tools}。禁止再开子进程或套娃。\n"
-            "越界与破坏性写入由平台硬拦，不要改业务状态。"
+            "越界与破坏性写入由平台硬拦，不要改业务状态。",
+            self._output_lang(),
         )
 
     def _fanout_roles(self) -> list[str]:
@@ -154,7 +164,7 @@ class ProjectAgent:
                     seen.add(n)
         if objective_is_src(self.objective) and "src-hunt" in out and "web-exploit" in out:
             out = [n for n in out if n != "web-exploit"]
-        return out
+        return cap_hunt_workers(out)
 
     async def connect(self, *, jitter: bool = False) -> None:
         _ = jitter
@@ -164,7 +174,8 @@ class ProjectAgent:
         await self._stop_background()
         await self._close_sessions(keep_review=False)
         self._connected = False
-        unregister_project_mcp(self.project_id)
+        if getattr(self, "_owns_mcp", True):
+            unregister_project_mcp(self.project_id)
         try:
             await self.ctx.aclose()
         except Exception:
@@ -276,9 +287,8 @@ class ProjectAgent:
         for role, sess in list(self._pi_pool.items()):
             if role == FINDING_REVIEW_ROLE:
                 continue
-            if not sess.alive():
-                dead.append(sess)
-                self._pi_pool.pop(role, None)
+            dead.append(sess)
+            self._pi_pool.pop(role, None)
         for sess in dead:
             try:
                 await sess.close()
@@ -288,6 +298,10 @@ class ProjectAgent:
                 self._sessions.remove(sess)
             except ValueError:
                 pass
+        try:
+            kill_live_for_project(self.project_id, keep_roles={FINDING_REVIEW_ROLE})
+        except Exception:
+            pass
         try:
             await self.ctx.aclose()
         except Exception:
@@ -370,16 +384,69 @@ class ProjectAgent:
             pass
 
     async def _run_finding_review(self) -> int:
-        """对当前未二次验证的入库漏洞立刻开专职复核 Pi；没有待办则跳过。"""
-        from ..graph.store import findings_pending_secondary
+        """按当前开关对缺二次/缺评级的入库漏洞开专职复核 Pi。"""
+        from ..graph.store import findings_pending_review
+        from ..review.flags import get_review_flags
+        from ..review.jobs import release, try_claim
 
+        flags = get_review_flags()
+        if not flags["secondary_verify"] and not flags["redteam_rating"]:
+            self._schedule_pages()
+            return 0
         try:
-            pending = await findings_pending_secondary(self.project_id)
+            pending = await findings_pending_review(self.project_id)
         except Exception:
             pending = []
+        kept: list[dict] = []
+        claimed: list[str] = []
+        for f in pending:
+            fid = str(f.get("id") or "")
+            mode = str(f.get("_review_mode") or "both")
+            job = try_claim(self.project_id, fid, mode, source="auto") if fid else None
+            if fid and job is None:
+                continue
+            if job:
+                f["_job_id"] = job["id"]
+                claimed.append(job["id"])
+            kept.append(f)
+        if not kept:
+            self._schedule_pages()
+            return 0
+        err = ""
+        try:
+            return await self._run_finding_review_items(kept)
+        except Exception as e:
+            err = str(e)[:240]
+            raise
+        finally:
+            for jid in claimed:
+                job = None
+                try:
+                    from ..review.jobs import snapshot as _snap
+                    job = _snap(jid)
+                except Exception:
+                    job = None
+                if job and job.get("status") in ("queued", "running"):
+                    release(jid, status="error" if err else "done", error=err)
+
+    async def review_one(self, finding: dict, mode: str) -> int:
+        """单条手动复核（调用方已占 job；此处不再 claim）。"""
+        item = dict(finding or {})
+        m = str(mode or "both").strip().lower()
+        if m not in ("secondary", "rating", "both"):
+            m = "both"
+        item["_review_mode"] = m
+        async with self._review_lock:
+            return await self._run_finding_review_items([item], mode=m)
+
+    async def _run_finding_review_items(self, pending: list[dict], mode: str | None = None) -> int:
         if not pending:
             self._schedule_pages()
             return 0
+        modes = {str(f.get("_review_mode") or mode or "both") for f in pending}
+        run_mode = str(mode or "").strip().lower()
+        if not run_mode:
+            run_mode = "both" if len(modes) != 1 else next(iter(modes))
         names = list(getattr(self.ctx, "task_subagents", None) or [])
         if FINDING_REVIEW_ROLE not in names:
             names.append(FINDING_REVIEW_ROLE)
@@ -387,11 +454,13 @@ class ProjectAgent:
                 self.ctx.task_subagents = names
             except Exception:
                 pass
+        ids = [str(f.get("id") or "") for f in pending if f.get("id")]
+        label = {"secondary": "二次验证", "rating": "红队评级"}.get(run_mode, "二次验证/红队评级")
         await emit(
             self.project_id, "log",
             {
                 "level": "info",
-                "message": f"专职二次验证 {len(pending)} 条（后台复核，不挡御主）",
+                "message": f"专职{label} {len(pending)} 条（后台复核，不挡御主）",
             },
             run_id=self.ctx.run_id,
         )
@@ -399,8 +468,10 @@ class ProjectAgent:
             self.project_id, "finding_review",
             {
                 "status": "running",
+                "mode": run_mode,
+                "finding_id": ids[0] if len(ids) == 1 else "",
                 "count": len(pending),
-                "ids": [str(f.get("id") or "") for f in pending if f.get("id")],
+                "ids": ids,
                 "titles": [str(f.get("title") or "")[:80] for f in pending],
                 "role": FINDING_REVIEW_ROLE,
             },
@@ -409,8 +480,11 @@ class ProjectAgent:
         try:
             await self._run_one(
                 FINDING_REVIEW_ROLE,
-                finding_review_system_prompt(self.workspace_dir, self.objective),
-                build_finding_review_instruction(pending),
+                finding_review_system_prompt(
+                    self.workspace_dir, self.objective, output_lang=self._output_lang(),
+                    mode=run_mode,
+                ),
+                build_finding_review_instruction(pending, mode=run_mode),
             )
             self._schedule_pages()
         finally:
@@ -419,8 +493,10 @@ class ProjectAgent:
                     self.project_id, "finding_review",
                     {
                         "status": "done",
+                        "mode": run_mode,
+                        "finding_id": ids[0] if len(ids) == 1 else "",
                         "count": len(pending),
-                        "ids": [str(f.get("id") or "") for f in pending if f.get("id")],
+                        "ids": ids,
                         "role": FINDING_REVIEW_ROLE,
                     },
                     run_id=self.ctx.run_id,
@@ -429,40 +505,48 @@ class ProjectAgent:
                 pass
         return len(pending)
 
+    def _pi_lock(self, role: str) -> asyncio.Lock:
+        lock = self._pi_locks.get(role)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._pi_locks[role] = lock
+        return lock
+
     async def _acquire_pi(self, role: str, system_prompt: str) -> PiSession:
-        sess = self._pi_pool.get(role)
-        if sess is not None and sess.alive():
-            sess.run_id = self.ctx.run_id
-            sess.on_activity = self.ctx.mark_activity
-            sess._emit = emit
+        async with self._pi_lock(role):
+            sess = self._pi_pool.get(role)
+            if sess is not None and sess.alive():
+                sess.run_id = self.ctx.run_id
+                sess.on_activity = self.ctx.mark_activity
+                sess._emit = emit
+                return sess
+            if sess is not None:
+                try:
+                    await sess.close()
+                except Exception:
+                    pass
+                self._pi_pool.pop(role, None)
+                try:
+                    self._sessions.remove(sess)
+                except ValueError:
+                    pass
+            sess = PiSession(
+                cwd=self.workspace_dir,
+                system_prompt=system_prompt,
+                project_id=self.project_id,
+                role=role,
+                tools=True,
+                emit=emit,
+                run_id=self.ctx.run_id,
+                on_activity=self.ctx.mark_activity,
+                model=self.model,
+                skill_paths=skill_abs_paths(self.workspace_dir, self._project_skill_names),
+            )
+            await sess.start()
+            self._pi_pool[role] = sess
+            if sess not in self._sessions:
+                self._sessions.append(sess)
             return sess
-        if sess is not None:
-            try:
-                await sess.close()
-            except Exception:
-                pass
-            self._pi_pool.pop(role, None)
-            try:
-                self._sessions.remove(sess)
-            except ValueError:
-                pass
-        sess = PiSession(
-            cwd=self.workspace_dir,
-            system_prompt=system_prompt,
-            project_id=self.project_id,
-            role=role,
-            tools=True,
-            emit=emit,
-            run_id=self.ctx.run_id,
-            on_activity=self.ctx.mark_activity,
-            model=self.model,
-            skill_paths=skill_abs_paths(self.workspace_dir, self._project_skill_names),
-        )
-        await sess.start()
-        self._pi_pool[role] = sess
-        if sess not in self._sessions:
-            self._sessions.append(sess)
-        return sess
 
     async def _run_one(self, role: str, system_prompt: str, instruction: str) -> dict:
         sess = await self._acquire_pi(role, system_prompt)
@@ -639,6 +723,10 @@ class ProjectAgent:
                             pending = set()
             results = [by_role.get("lead")] + [by_role.get(r) for r in roles]
         finally:
+            try:
+                await self._reap_idle_workers(used_roles={"lead", *roles})
+            except Exception:
+                pass
             self._kick_review()
             self.ctx.wake_finding_review = self._kick_review
         texts: list[str] = []
@@ -668,6 +756,42 @@ class ProjectAgent:
         }
 
 
+    async def _reap_idle_workers(self, used_roles: set[str] | None = None) -> None:
+        """工人连续未 prompt 或闲置超时则关进程；从者与复核保活。"""
+        used = {str(x) for x in (used_roles or ())}
+        try:
+            idle_sec = float(getattr(settings, "pi_worker_idle_sec", 180) or 180)
+        except (TypeError, ValueError):
+            idle_sec = 180.0
+        try:
+            idle_turns = int(getattr(settings, "pi_worker_idle_turns", 2) or 2)
+        except (TypeError, ValueError):
+            idle_turns = 2
+        now = time.monotonic()
+        drop: list[tuple[str, PiSession]] = []
+        for role, sess in list(self._pi_pool.items()):
+            if role in ("lead", FINDING_REVIEW_ROLE):
+                continue
+            if role in used:
+                sess.idle_turns = 0
+                continue
+            sess.idle_turns = int(getattr(sess, "idle_turns", 0) or 0) + 1
+            last = float(getattr(sess, "last_prompt_at", 0) or 0)
+            aged = last > 0 and (now - last) >= idle_sec
+            if sess.idle_turns >= max(1, idle_turns) or aged:
+                drop.append((role, sess))
+        for role, sess in drop:
+            self._pi_pool.pop(role, None)
+            try:
+                self._sessions.remove(sess)
+            except ValueError:
+                pass
+            try:
+                await sess.close()
+            except Exception:
+                pass
+
+
 def _preview(obj) -> str:
     try:
         import json
@@ -676,7 +800,3 @@ def _preview(obj) -> str:
         s = str(obj)
     return s[:400]
 
-
-def _get_spawn_sem() -> asyncio.Semaphore:
-    """兼容旧调用：项目内 Pi 不设闸。"""
-    return asyncio.Semaphore(10_000)

@@ -1,0 +1,47 @@
+# StrikeAgent_AtkBrain-Flash 控制台运行时。
+# 密钥不要写进本文件。Docker Compose 会读取仓库根目录的 .env：
+#   cp .env.example .env
+#   用编辑器打开 .env，填 DEEPSEEK_API_KEY=你的密钥（或 ANTHROPIC_AUTH_TOKEN）
+#   docker compose -f compose.yaml -f deploy/compose.build.yaml up -d --build --wait
+#
+# 不要和本机 systemd（atkbrain-flash-backend / frontend）同时抢 2333/2334。
+# TSecBench 托管镜像仍用根目录 Dockerfile，与本文件无关。
+
+name: strikeagent-atkbrain-flash
+
+services:
+  atkbrain:
+    image: strikeagent-atkbrain-flash:console
+    pull_policy: missing
+    container_name: strikeagent-atkbrain-flash
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    privileged: true
+    environment:
+      ATKBRAIN_HOSTED: "0"
+      ATKBRAIN_LLM_GATEWAY: "0"
+      ATKBRAIN_HOST: ${ATKBRAIN_HOST:-0.0.0.0}
+      ATKBRAIN_PORT: ${ATKBRAIN_PORT:-2333}
+      ATKBRAIN_ADMIN_USER: ${ATKBRAIN_ADMIN_USER:-admin}
+      ATKBRAIN_ADMIN_PASSWORD: ${ATKBRAIN_ADMIN_PASSWORD:-admin}
+      ATKBRAIN_ADMIN_PASSWORD_RESET: ${ATKBRAIN_ADMIN_PASSWORD_RESET:-false}
+      ATKBRAIN_CORS_ORIGINS: ${ATKBRAIN_CORS_ORIGINS:-http://127.0.0.1:2334,http://localhost:2334,http://127.0.0.1:2333,http://localhost:2333}
+      ATKBRAIN_API_TOKEN: ${ATKBRAIN_API_TOKEN:-}
+      ATKBRAIN_PI_BIN: ${ATKBRAIN_PI_BIN:-pi}
+      ATKBRAIN_PI_PROVIDER: ${ATKBRAIN_PI_PROVIDER:-deepseek}
+      ATKBRAIN_PI_MODEL: ${ATKBRAIN_PI_MODEL:-deepseek-flash}
+      ATKBRAIN_YAKIT_MCP_FULL_PORT: ${ATKBRAIN_YAKIT_MCP_FULL_PORT:-11433}
+      ATKBRAIN_YAKIT_MITM_PORT: ${ATKBRAIN_YAKIT_MITM_PORT:-8084}
+      # 下面两项从仓库根目录 .env 注入，不要把真实密钥贴进 compose.yaml
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./backend/data:/opt/atkbrain/backend/data
+    healthcheck:
+      test: ["CMD", "python3", "-m", "atkbrain.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 90s

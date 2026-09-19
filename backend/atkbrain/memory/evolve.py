@@ -29,6 +29,18 @@ EVOLVE_MILESTONES = frozenset({"getflag", "high_critical_finding"})
 _HIGH = frozenset({"high", "critical"})
 
 
+async def _output_lang_for_project(project_id: object) -> str:
+    from ..i18n.locale import config_output_lang
+    pid = str(project_id or "")
+    if not pid:
+        return "zh"
+    try:
+        row = await db.fetchone("SELECT config FROM projects WHERE id=?", (pid,))
+        return config_output_lang((row or {}).get("config") if row else {})
+    except Exception:
+        return "zh"
+
+
 def lesson_key(*, when: list[str], do: list[str], avoid: list[str], chain: str) -> str:
     raw = "|".join((
         ",".join(sorted({x.strip().lower() for x in when if x})),
@@ -281,6 +293,8 @@ async def evolve_from_episode_id(episode_id: str) -> dict | None:
         applied = await ai_refine_playbook(
             recent_episodes=[episode],
             playbook=await list_playbook(limit=12),
+            output_lang=await _output_lang_for_project(row.get("project_id")),
+            project_id=str(row.get("project_id") or ""),
         )
     except Exception:
         return grounded
@@ -601,7 +615,10 @@ async def _retire_lesson(spec: dict) -> None:
     await db.execute("UPDATE memory SET content=? WHERE id=?", (_dumps(content), row["id"]))
 
 
-async def ai_refine_playbook(*, recent_episodes: list[dict], playbook: list[dict]) -> list[dict]:
+async def ai_refine_playbook(
+    *, recent_episodes: list[dict], playbook: list[dict], output_lang: object = None,
+    project_id: str | None = None,
+) -> list[dict]:
     """用一次性 Pi 蒸馏合格 episode。失败返回空，不回退机械映射。"""
     if not bool(getattr(settings, "evolve_ai", True)):
         return []
@@ -658,14 +675,16 @@ async def ai_refine_playbook(*, recent_episodes: list[dict], playbook: list[dict
     )
     wait = float(getattr(settings, "evolve_timeout_sec", 90) or 90)
     applied: list[dict] = []
+    from ..i18n.prompts import with_output_lang
     blob = await query_text(
-        system_prompt=EVOLVE_SYSTEM,
+        system_prompt=with_output_lang(EVOLVE_SYSTEM, output_lang),
         user_prompt=prompt,
         cwd=str(settings.data_dir),
         timeout=max(15.0, wait),
         tools=False,
         model=model,
         role="evolve",
+        project_id=str(project_id or ""),
     )
     for spec in parse_evolve_lessons(blob):
         if spec.get("action") == "retire":

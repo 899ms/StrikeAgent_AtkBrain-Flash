@@ -9,17 +9,37 @@ import { PaginationBar, pageItems, readPageSize } from "../../components/Paginat
 import { colors } from "../../theme";
 import { huntFailedReason, listStatusOf, hardStopLine } from "../../projectStatus";
 import { ReportExportControls } from "../report/ExportReport";
+import { t, useT } from "../../i18n";
 
 const statusColor: Record<string, string> = {
   running: colors.success, queued: colors.warning, completed: colors.primary, idle: colors.mutedSoft, error: colors.error, stopped: colors.muted,
 };
-const statusLabel: Record<string, string> = {
-  running: "运行中", queued: "排队中", completed: "已完成", idle: "空闲", error: "失败", stopped: "已停止", goal_reached: "已完成",
-};
+function statusText(key: string): string {
+  const map: Record<string, string> = {
+    running: t("status.running"),
+    queued: t("status.queued"),
+    completed: t("status.completed"),
+    idle: t("status.idle"),
+    error: t("status.error"),
+    stopped: t("status.stopped"),
+    goal_reached: t("status.completed"),
+  };
+  return map[key] || key;
+}
 
-const STATUS_FILTER: Record<string, string> = {
-  all: "全部", running: "进行中", completed: "已完成", idle: "未完成", stopped: "已暂停", error: "失败",
-};
+const STATUS_FILTER_KEYS = ["all", "running", "completed", "idle", "stopped", "error"] as const;
+
+function statusFilterText(key: string): string {
+  const map: Record<string, string> = {
+    all: t("projects.statusAll"),
+    running: t("projects.statusRunning"),
+    completed: t("projects.statusCompleted"),
+    idle: t("projects.statusIdle"),
+    stopped: t("projects.statusStopped"),
+    error: t("projects.statusError"),
+  };
+  return map[key] || key;
+}
 
 /** 展示态：排队（等并发槽）优先于笼统的 running */
 function displayStatus(p: Project): string {
@@ -57,6 +77,7 @@ export function ClusterDashboard({
   project: Project;
   onProjectUpdate?: (p: Project) => void;
 }) {
+  const { t: tr } = useT();
   const [subs, setSubs] = useState<Project[]>([]);
   const [busy, setBusy] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -84,8 +105,8 @@ export function ClusterDashboard({
   const load = () => api.subprojects(project.id).then(setSubs).catch(() => {});
   useEffect(() => {
     load();
-    const t = setInterval(load, importing ? 1500 : 8000);
-    return () => clearInterval(t);
+    const tmr = setInterval(load, importing ? 1500 : 8000);
+    return () => clearInterval(tmr);
   }, [project.id, importing]);
   useEffect(() => {
     if (!editingName) setNameDraft(project.name);
@@ -110,7 +131,7 @@ export function ClusterDashboard({
           }));
           window.setTimeout(() => setImportProgress((cur) => (cur?.phase === "done" ? null : cur)), 2500);
         }
-        if (p.phase === "error") setErr(p.message || "导入失败");
+        if (p.phase === "error") setErr(p.message || tr("projects.importFailed"));
       } else if (isImportPaused(p)) {
         await load();
       }
@@ -130,7 +151,7 @@ export function ClusterDashboard({
   const saveName = async () => {
     const next = nameDraft.trim();
     if (!next) {
-      setErr("名称不能为空");
+      setErr(tr("projects.nameRequired"));
       return;
     }
     if (next === project.name) {
@@ -144,7 +165,7 @@ export function ClusterDashboard({
       setEditingName(false);
       await load();
     } catch (e: any) {
-      setErr(e.message || "改名失败");
+      setErr(e.message || tr("projects.renameFailed"));
     } finally {
       setBusy(false);
     }
@@ -158,7 +179,7 @@ export function ClusterDashboard({
       setSummary(r);
       await load();
     } catch (e: any) {
-      setErr(e.message || "重新探测失败");
+      setErr(e.message || tr("cluster.probeFailed"));
     } finally { setBusy(false); }
   };
 
@@ -168,26 +189,26 @@ export function ClusterDashboard({
       const r = await api.refoldMachines(project.id);
       setSummary({
         ...r,
-        message: `已按同机折叠 ${r.merged_groups || 0} 组，删除 ${r.deleted || 0} 个子项目`
-          + (r.skipped_running ? `，跳过 ${r.skipped_running} 组（有在跑）` : ""),
+        message: tr("cluster.foldOk", { g: r.merged_groups || 0, d: r.deleted || 0 })
+          + (r.skipped_running ? tr("cluster.foldSkip", { n: r.skipped_running }) : ""),
       });
       await load();
     } catch (e: any) {
-      setErr(e.message || "按同机折叠失败");
+      setErr(e.message || tr("cluster.foldFailed"));
     } finally { setBusy(false); }
   };
 
   const startAll = async () => {
     setBusy(true); setErr("");
     try { await api.startAll(project.id); await load(); }
-    catch (e: any) { setErr(e.message || "批量启动失败"); }
+    catch (e: any) { setErr(e.message || tr("cluster.batchStartFailed")); }
     finally { setBusy(false); }
   };
 
   const stopAll = async () => {
     setBusy(true); setErr("");
     try { await api.stopAll(project.id); await load(); }
-    catch (e: any) { setErr(e.message || "批量暂停失败"); }
+    catch (e: any) { setErr(e.message || tr("cluster.batchStopFailed")); }
     finally { setBusy(false); }
   };
 
@@ -204,7 +225,7 @@ export function ClusterDashboard({
         await load();
       }
     } catch (e: any) {
-      setErr(e.message || "暂停导入失败");
+      setErr(e.message || tr("projects.pauseImportFailed"));
     } finally {
       setBusy(false);
     }
@@ -220,7 +241,7 @@ export function ClusterDashboard({
       if (importPoll.current) clearTimeout(importPoll.current);
       importPoll.current = setTimeout(pollImport, 200);
     } catch (e: any) {
-      setErr(e.message || "继续导入失败");
+      setErr(e.message || tr("projects.resumeImportFailed"));
     } finally {
       setBusy(false);
     }
@@ -229,7 +250,7 @@ export function ClusterDashboard({
   const addAssets = async () => {
     const blob = newAssets.trim();
     if (!blob) {
-      setErr("请输入至少一个域名 / URL / IP");
+      setErr(tr("cluster.needAssets"));
       return;
     }
     const lineHint = blob.split(/\r?\n/).filter((s) => s.trim()).length;
@@ -237,7 +258,7 @@ export function ClusterDashboard({
     setImporting(true);
     setImportProgress({
       phase: "merge", done: 0, total: lineHint,
-      message: clusterTrack === "src" ? "正在按产品域合并…" : "正在按同机合并…",
+      message: clusterTrack === "src" ? tr("projects.mergingZone") : tr("projects.mergingHost"),
     });
     try {
       const r = await api.addClusterAssets(project.id, [blob], true);
@@ -256,7 +277,7 @@ export function ClusterDashboard({
       });
       setNewAssets("");
       if (r.rejected?.length) {
-        setErr(`部分资产被拒绝：${r.rejected.map((x: any) => x.asset).join(", ")}`);
+        setErr(tr("cluster.rejected", { list: r.rejected.map((x: any) => x.asset).join(", ") }));
       }
       if (!r.importing) {
         setImporting(false);
@@ -268,7 +289,7 @@ export function ClusterDashboard({
         importPoll.current = setTimeout(pollImport, 200);
       }
     } catch (e: any) {
-      setErr(e.message || "新增失败");
+      setErr(e.message || tr("cluster.addFailed"));
       setImporting(false);
       setImportProgress(null);
     } finally {
@@ -297,30 +318,30 @@ export function ClusterDashboard({
   };
   const toggleAll = () => setSelectedIds(allSelected ? selectedIds.filter((id) => !paged.some((s) => s.id === id)) : Array.from(new Set([...selectedIds, ...paged.map((s) => s.id)])));
   const runSelected = async () => {
-    if (!selectedCount || !window.confirm(`将运行选中的 ${selectedCount} 个子项目。它们会占用 Agent 并发，是否继续？`)) return;
+    if (!selectedCount || !window.confirm(tr("cluster.confirmRun", { n: selectedCount }))) return;
     setBusy(true); setErr("");
     try { await api.batchStartProjects(selectedIds); setSelectedIds([]); await load(); }
-    catch (e: any) { setErr(e.message || "批量运行失败"); }
+    catch (e: any) { setErr(e.message || tr("cluster.runFailed")); }
     finally { setBusy(false); }
   };
   const pauseSelected = async () => {
-    if (!selectedCount || !window.confirm(`将暂停选中的 ${selectedCount} 个子项目。正在执行的 Agent 会停止，仍可稍后重新运行，是否继续？`)) return;
+    if (!selectedCount || !window.confirm(tr("cluster.confirmPause", { n: selectedCount }))) return;
     setBusy(true); setErr("");
     try { await api.batchStopProjects(selectedIds); setSelectedIds([]); await load(); }
-    catch (e: any) { setErr(e.message || "批量暂停失败"); }
+    catch (e: any) { setErr(e.message || tr("cluster.batchStopFailed")); }
     finally { setBusy(false); }
   };
   const deleteSelected = async () => {
-    if (!selectedCount || !window.confirm(`将永久删除选中的 ${selectedCount} 个子项目及其攻击图、发现、报告和运行记录。此操作不可撤销，是否继续？`)) return;
+    if (!selectedCount || !window.confirm(tr("cluster.confirmDelete", { n: selectedCount }))) return;
     setBusy(true); setErr("");
     try { await api.batchDeleteProjects(selectedIds); setSelectedIds([]); await load(); }
-    catch (e: any) { setErr(e.message || "批量删除失败"); }
+    catch (e: any) { setErr(e.message || tr("cluster.deleteFailed")); }
     finally { setBusy(false); }
   };
 
   return (
     <div className="container" style={{ paddingTop: 24, paddingBottom: 40 }}>
-      <Link to="/" className="muted" style={{ fontSize: 13 }}>&larr; 返回项目列表</Link>
+      <Link to="/" className="muted" style={{ fontSize: 13 }}>&larr; {tr("project.backList")}</Link>
       <div className="spread" style={{ margin: "10px 0 18px", alignItems: "flex-start" }}>
         <div>
           <div className="row" style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -338,39 +359,39 @@ export function ClusterDashboard({
                   }}
                   style={{ fontSize: 22, fontWeight: 600, maxWidth: 360 }}
                 />
-                <button className="btn btn-primary btn-sm" disabled={busy} onClick={saveName}>保存</button>
+                <button className="btn btn-primary btn-sm" disabled={busy} onClick={saveName}>{tr("common.save")}</button>
                 <button
                   className="btn btn-secondary btn-sm"
                   disabled={busy}
                   onClick={() => { setEditingName(false); setNameDraft(project.name); }}
                 >
-                  取消
+                  {tr("common.cancel")}
                 </button>
               </>
             ) : (
               <>
                 <h1 style={{ fontSize: 34 }}>{project.name}</h1>
-                <Badge>集群</Badge>
+                <Badge>{tr("projects.cluster")}</Badge>
                 <button
                   className="btn btn-ghost btn-sm"
                   disabled={busy}
                   onClick={() => { setNameDraft(project.name); setEditingName(true); setErr(""); }}
-                  title="修改集群名称"
+                  title={tr("cluster.renameTitle")}
                 >
-                  改名
+                  {tr("common.rename")}
                 </button>
               </>
             )}
           </div>
           <div className="row" style={{ gap: 12, marginTop: 6 }}>
             <span className="muted" style={{ fontSize: 13 }}>
-              资产 {assets.length} · 子项目 {subs.length} · 运行中 {runningCount}
-              {queuedCount > 0 ? ` · 排队 ${queuedCount}` : ""}
+              {tr("cluster.assets", { a: assets.length, s: subs.length, r: runningCount })}
+              {queuedCount > 0 ? tr("cluster.queued", { n: queuedCount }) : ""}
             </span>
           </div>
           {stopHint ? (
             <div className="muted" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.55 }} title={stopHint.title}>
-              <div>每个子猎 {stopHint.text}</div>
+              <div>{tr("cluster.childStop", { text: stopHint.text })}</div>
               {stopHint.conditions.map((c) => (
                 <div key={c}>· {c}</div>
               ))}
@@ -380,31 +401,31 @@ export function ClusterDashboard({
         <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
           <ReportExportControls projectId={project.id} disabled={busy} />
           <button className="btn btn-primary" disabled={busy} onClick={() => { setShowAdd((v) => !v); setErr(""); }}>
-            {showAdd ? "取消" : "新增项目"}
+            {showAdd ? tr("common.cancel") : tr("cluster.add")}
           </button>
           <button className="btn btn-primary" disabled={busy || subs.length === 0} onClick={startAll}>
-            {busy ? "处理中…" : "全部启动"}
+            {busy ? tr("common.processing") : tr("cluster.startAll")}
           </button>
           <button className="btn btn-secondary" disabled={busy || runningCount === 0} onClick={stopAll}>
-            全部暂停
+            {tr("cluster.stopAll")}
           </button>
-          <button className="btn btn-secondary" disabled={busy} onClick={triage} title="可选：HTTP 存活探测并补建子项目">
-            重新探测（可选）
+          <button className="btn btn-secondary" disabled={busy} onClick={triage} title={tr("cluster.retriageTitle")}>
+            {tr("cluster.retriage")}
           </button>
           <button
             className="btn btn-secondary"
             disabled={busy || subs.length === 0}
             onClick={refold}
-            title="把 idle/error 子项目按同一 FQDN 或同一非 CDN 源站 IP 合成一台机；在跑的不动，不会自动启动"
+            title={tr("cluster.foldTitle")}
           >
-            按同机折叠
+            {tr("cluster.fold")}
           </button>
         </div>
       </div>
 
       <ImportProgressBar
         progress={importProgress}
-        title={isImportPaused(importProgress) ? "导入已暂停" : (isImportRunning(importProgress) ? "正在导入资产" : undefined)}
+        title={isImportPaused(importProgress) ? tr("cluster.importPaused") : (isImportRunning(importProgress) ? tr("cluster.importing") : undefined)}
         onPause={pauseImport}
         onResume={resumeImport}
         busy={busy}
@@ -412,15 +433,13 @@ export function ClusterDashboard({
 
       {showAdd && (
         <div className="card-cream" style={{ marginBottom: 20, padding: 18 }}>
-          <h3 style={{ marginBottom: 8, fontSize: 16 }}>向集群追加目标</h3>
+          <h3 style={{ marginBottom: 8, fontSize: 16 }}>{tr("cluster.addTitle")}</h3>
           <p className="muted" style={{ fontSize: 13, marginBottom: 10 }}>
-            {clusterTrack === "src"
-              ? "SRC：导入时按产品域自动收组（注册域再往左 1 级，如 *.bbs.ztgame.com 一组）。跨产品域即使 CDN 同 IP 也不并。"
-              : "红队：导入时同一主机名的不同端口并进一台；解析到同一源站 IP 的域名合成一个子项目。CDN 边缘 IP 不合并。"}
+            {clusterTrack === "src" ? tr("cluster.addSrc") : tr("cluster.addRed")}
           </p>
           <div className="row" style={{ gap: 10, marginBottom: 10, flexWrap: "wrap", alignItems: "center" }}>
             <label className="btn btn-secondary btn-sm" style={{ cursor: busy || importing ? "not-allowed" : "pointer" }}>
-              选择文件（如 合集_可访问.txt）
+              {tr("cluster.pickFile")}
               <input
                 type="file"
                 accept=".txt,.csv,.list,text/plain"
@@ -429,7 +448,7 @@ export function ClusterDashboard({
                 onChange={(e) => { onPickAssetFile(e.target.files?.[0]); e.target.value = ""; }}
               />
             </label>
-            <span className="muted" style={{ fontSize: 12 }}>文件内容会追加到下面文本框，点导入后自动合并并显示进度</span>
+            <span className="muted" style={{ fontSize: 12 }}>{tr("cluster.fileHint")}</span>
           </div>
           <textarea
             className="input"
@@ -442,10 +461,10 @@ export function ClusterDashboard({
           />
           <div className="row" style={{ gap: 10 }}>
             <button className="btn btn-primary" disabled={busy || importing} onClick={addAssets}>
-              {busy || importing ? "导入中…" : "确认添加并启动"}
+              {busy || importing ? tr("projects.importingBtn") : tr("cluster.confirmAdd")}
             </button>
             <button className="btn btn-secondary" disabled={busy} onClick={() => { setShowAdd(false); setNewAssets(""); }}>
-              取消
+              {tr("common.cancel")}
             </button>
           </div>
         </div>
@@ -456,30 +475,30 @@ export function ClusterDashboard({
       {summary && (
         <div className="card-cream" style={{ marginBottom: 20, padding: 18 }}>
           <div className="row" style={{ gap: 22, fontSize: 14, flexWrap: "wrap" }}>
-            {summary.added != null && <span>新写入资产 <b style={{ color: colors.success }}>{summary.added}</b></span>}
+            {summary.added != null && <span>{tr("cluster.added")} <b style={{ color: colors.success }}>{summary.added}</b></span>}
             {summary.skipped != null && (
               <span>
-                跳过已有子项目 <b>{summary.skipped}</b>
-                {summary.skippedUrls != null ? ` 个主机（${summary.skippedUrls} 条 URL）` : ""}
+                {tr("cluster.skipped")} <b>{summary.skipped}</b>
+                {summary.skippedUrls != null ? tr("cluster.skippedUrls", { n: summary.skippedUrls }) : ""}
               </span>
             )}
-            {summary.rejected != null && summary.rejected > 0 && <span>拒绝 <b style={{ color: colors.error }}>{summary.rejected}</b></span>}
-            <span>资产 <b>{summary.assets}</b></span>
-            <span>将补建子项目 <b style={{ color: colors.primary }}>{summary.hosts}</b></span>
-            {summary.live_hosts != null && <span>存活主机 <b style={{ color: colors.success }}>{summary.live_hosts}</b></span>}
-            {summary.live_endpoints != null && <span>存活端点 <b>{summary.live_endpoints}</b></span>}
-            {summary.subprojects_created > 0 && <span>新建子项目 <b style={{ color: colors.primary }}>{summary.subprojects_created}</b></span>}
-            {summary.started != null && <span>已启动 <b>{summary.started}</b></span>}
+            {summary.rejected != null && summary.rejected > 0 && <span>{tr("cluster.rejectedN")} <b style={{ color: colors.error }}>{summary.rejected}</b></span>}
+            <span>{tr("cluster.statAssets")} <b>{summary.assets}</b></span>
+            <span>{tr("cluster.willCreate")} <b style={{ color: colors.primary }}>{summary.hosts}</b></span>
+            {summary.live_hosts != null && <span>{tr("cluster.liveHosts")} <b style={{ color: colors.success }}>{summary.live_hosts}</b></span>}
+            {summary.live_endpoints != null && <span>{tr("cluster.liveEps")} <b>{summary.live_endpoints}</b></span>}
+            {summary.subprojects_created > 0 && <span>{tr("cluster.createdN")} <b style={{ color: colors.primary }}>{summary.subprojects_created}</b></span>}
+            {summary.started != null && <span>{tr("cluster.startedN")} <b>{summary.started}</b></span>}
           </div>
           {summary.message && <p className="muted" style={{ marginTop: 8, fontSize: 13 }}>{summary.message}</p>}
         </div>
       )}
 
-      <h3 style={{ marginBottom: 12 }}>子项目（每个授权主机一个单目标闭环）</h3>
+      <h3 style={{ marginBottom: 12 }}>{tr("cluster.children")}</h3>
       <div className="status-filters">
-        {Object.entries(STATUS_FILTER).map(([key, label]) => (
+        {STATUS_FILTER_KEYS.map((key) => (
           <button key={key} className={statusFilter === key ? "active" : ""} onClick={() => setStatusFilter(key)}>
-            {label} <b>{key === "all" ? subs.length : subs.filter((p) => filterStatusOf(p) === key).length}</b>
+            {statusFilterText(key)} <b>{key === "all" ? subs.length : subs.filter((p) => filterStatusOf(p) === key).length}</b>
           </button>
         ))}
       </div>
@@ -493,11 +512,11 @@ export function ClusterDashboard({
       />
       {subs.length === 0 ? (
         <div className="card-cream" style={{ textAlign: "center", padding: 48 }}>
-          <p className="muted">暂无子项目。可点「新增项目」直接追加，或「重新探测」补建：</p>
-          <div className="mono muted" style={{ fontSize: 12, marginTop: 12, whiteSpace: "pre-wrap" }}>{assets.join("  ") || "（无资产）"}</div>
+          <p className="muted">{tr("cluster.noChildren")}</p>
+          <div className="mono muted" style={{ fontSize: 12, marginTop: 12, whiteSpace: "pre-wrap" }}>{assets.join("  ") || tr("cluster.noAssets")}</div>
         </div>
       ) : visible.length === 0 ? (
-        <div className="empty-list">没有符合当前筛选条件的子项目。</div>
+        <div className="empty-list">{tr("cluster.emptyFilter")}</div>
       ) : (
         <SubprojectsTable
           projects={paged}
@@ -529,41 +548,42 @@ function SubprojectsTable({
   onToggle: (id: string) => void;
   onToggleAll: () => void;
 }) {
+  const { t: tr } = useT();
   const nav = useNavigate();
   return (
     <div className="project-table-wrap">
       <table className="project-table">
-        <thead><tr><th><input type="checkbox" checked={allSelected} onChange={onToggleAll} aria-label="全选子项目" /></th><th>状态</th><th>目标</th><th>同机</th><th>端口</th><th>节点</th><th>服务</th><th>高危</th><th>严重</th><th>攻击状态</th></tr></thead>
+        <thead><tr><th><input type="checkbox" checked={allSelected} onChange={onToggleAll} aria-label={tr("cluster.selectAll")} /></th><th>{tr("cluster.colStatus")}</th><th>{tr("cluster.colTarget")}</th><th>{tr("cluster.colHost")}</th><th>{tr("cluster.colPorts")}</th><th>{tr("projects.colNodes")}</th><th>{tr("projects.colServices")}</th><th>{tr("projects.colHigh")}</th><th>{tr("projects.colCritical")}</th><th>{tr("cluster.colAttack")}</th></tr></thead>
         <tbody>
           {projects.map((p) => {
             const s = p.stats;
             const aliases = vhostsOf(p);
             return (
               <tr key={p.id} className={selectedIds.includes(p.id) ? "selected" : ""} onClick={() => nav(`/project/${p.id}`)}>
-                <td onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={selectedIds.includes(p.id)} onChange={() => onToggle(p.id)} aria-label={`选择 ${p.target || p.name}`} /></td>
+                <td onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={selectedIds.includes(p.id)} onChange={() => onToggle(p.id)} aria-label={tr("cluster.selectOne", { name: p.target || p.name })} /></td>
                 <td>
                   <span className="row" style={{ gap: 7, alignItems: "center", flexWrap: "wrap" }}>
                     <span className="pulse-dot" style={{ background: statusColor[displayStatus(p)] || colors.muted }} />
-                    {statusLabel[displayStatus(p)] || p.status}
-                    {p.queued ? <span className="badge" style={{ background: "rgba(217,190,132,0.16)", color: "#d9be84", borderColor: "rgba(217,190,132,0.35)" }} title="已启动，等待本赛道（红队/SRC 或 CTF）并发槽空出后才会真正开跑">等并发槽</span> : null}
-                    {!p.running && p.config?.completion_reason === "entry_dead" ? <span className="badge" style={{ background: "rgba(217,190,132,0.16)", color: "#d9be84", borderColor: "rgba(217,190,132,0.35)" }} title="入口连续不可达；站点恢复后可再启动">入口不可达</span> : null}
-                    {!p.running && (p.config?.completion_reason === "env_closed" || p.config?.completion_reason === "env_unreachable" || p.config?.env_closed) ? <span className="badge" style={{ background: "rgba(198,69,69,.12)", color: "#c64545", borderColor: "rgba(198,69,69,.35)" }} title="评测任务已到期或平台不可达">环境已到期</span> : null}
+                    {statusText(displayStatus(p)) || p.status}
+                    {p.queued ? <span className="badge" style={{ background: "rgba(217,190,132,0.16)", color: "#d9be84", borderColor: "rgba(217,190,132,0.35)" }} title={tr("status.waitingSlotTitle")}>{tr("status.waitingSlot")}</span> : null}
+                    {!p.running && p.config?.completion_reason === "entry_dead" ? <span className="badge" style={{ background: "rgba(217,190,132,0.16)", color: "#d9be84", borderColor: "rgba(217,190,132,0.35)" }} title={tr("status.entryDeadTitle")}>{tr("status.entryDead")}</span> : null}
+                    {!p.running && (p.config?.completion_reason === "env_closed" || p.config?.completion_reason === "env_unreachable" || p.config?.env_closed) ? <span className="badge" style={{ background: "rgba(198,69,69,.12)", color: "#c64545", borderColor: "rgba(198,69,69,.35)" }} title={tr("cluster.envClosedShort")}>{tr("status.envClosed")}</span> : null}
                   </span>
                 </td>
                 <td>
                   <b>{p.target || p.name}</b>
                   {aliases.length > 0 ? (
                     <div className="muted" style={{ fontSize: 12, marginTop: 2 }} title={aliases.join(", ")}>
-                      同机 {aliases.length + 1} 个域名
+                      {tr("cluster.aliases", { n: aliases.length + 1 })}
                     </div>
                   ) : null}
                 </td>
                 <td className="mono" title={aliases.join(", ") || undefined}>{aliases.length ? aliases.length : "—"}</td>
-                <td className="mono">{(p.ports || []).join(", ") || "全端口"}</td>
+                <td className="mono">{(p.ports || []).join(", ") || tr("cluster.allPorts")}</td>
                 <td>{s?.nodes ?? 0}</td><td>{s?.services ?? 0}</td>
                 <td className={(s?.high ?? 0) > 0 ? "danger-number" : ""}>{s?.high ?? 0}</td>
                 <td className={(s?.critical ?? 0) > 0 ? "danger-number" : ""}>{s?.critical ?? 0}</td>
-                <td>{s?.has_shell ? <Badge coral>GETSHELL</Badge> : s?.lateral_active ? <span className="badge">横向</span> : "—"}</td>
+                <td>{s?.has_shell ? <Badge coral>GETSHELL</Badge> : s?.lateral_active ? <span className="badge">{tr("cluster.lateral")}</span> : "—"}</td>
               </tr>
             );
           })}

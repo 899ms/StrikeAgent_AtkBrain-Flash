@@ -11,6 +11,9 @@ from pathlib import Path
 
 from ..config import settings
 from ..db import new_id
+from ..i18n.locale import get_locale, normalize_locale
+from ..i18n.prompts import export_system_prompt
+from ..i18n.strings import msg
 from . import generator as report_gen
 from .pdf_print import html_to_pdf
 from .slots import (
@@ -82,7 +85,7 @@ def _persist_job(job: dict) -> None:
         safe = {
             k: job.get(k)
             for k in (
-                "id", "project_id", "format", "status", "percent", "message",
+                "id", "project_id", "format", "lang", "status", "percent", "message",
                 "error", "filename", "cached", "claude", "claude_error",
                 "pi_role", "force", "html_path", "pdf_path",
             )
@@ -108,6 +111,7 @@ def _job_public(job: dict) -> dict:
         "id": job["id"],
         "project_id": job["project_id"],
         "format": job["format"],
+        "lang": job.get("lang") or "zh",
         "status": job["status"],
         "percent": int(job.get("percent") or 0),
         "message": job.get("message") or "",
@@ -223,14 +227,21 @@ def _facts_payload(data: dict) -> dict:
     }
 
 
-async def _export_enrich(facts: dict, *, project_id: str = "") -> dict:
+async def _export_enrich(facts: dict, *, project_id: str = "", lang: object = "zh") -> dict:
     """专职导出 Pi：无工具一次性会话，role=report-export。"""
     from ..agents.pi_runtime import query_text
 
-    prompt = (
-        "# 渗透测试事实包（专职导出 Pi 只填槽，禁止整页 HTML）\n"
-        + json.dumps(facts, ensure_ascii=False, indent=2)[:100000]
-    )
+    loc = normalize_locale(lang)
+    if loc == "en":
+        prompt = (
+            "# Facts pack (export Pi fills slots only; all JSON prose in English; missing fields: Not collected)\n"
+            + json.dumps(facts, ensure_ascii=False, indent=2)[:100000]
+        )
+    else:
+        prompt = (
+            "# 渗透测试事实包（专职导出 Pi 只填槽，禁止整页 HTML）\n"
+            + json.dumps(facts, ensure_ascii=False, indent=2)[:100000]
+        )
     model = (getattr(settings, "report_model", None) or "").strip() or (
         (getattr(settings, "supervisor_model", None) or "").strip() or settings.claude_model
     )
@@ -245,15 +256,16 @@ async def _export_enrich(facts: dict, *, project_id: str = "") -> dict:
                 {
                     "status": "running",
                     "role": EXPORT_ROLE,
-                    "message": "专职导出 Pi 正在撰写交付报告槽位",
+                    "message": msg("job_slots", lang=loc),
                 },
             )
         except Exception:
             pass
+    system = export_system_prompt(loc, EXPORT_SYSTEM)
     for attempt in (1, 2):
         try:
             blob = await query_text(
-                system_prompt=EXPORT_SYSTEM,
+                system_prompt=system,
                 user_prompt=prompt,
                 cwd=str(settings.data_dir),
                 timeout=wait,
@@ -268,8 +280,8 @@ async def _export_enrich(facts: dict, *, project_id: str = "") -> dict:
         parsed = parse_claude_enrich(blob)
         if _enrich_usable(parsed):
             return parsed
-        last_err = "专职导出 Pi 未返回可用槽位 JSON"
-    raise RuntimeError(last_err or "专职导出 Pi 撰写失败")
+        last_err = msg("job_bad_json", lang=loc)
+    raise RuntimeError(last_err or msg("job_pi_fail", lang=loc, err=""))
 
 
 async def _claude_enrich(facts: dict) -> dict:
@@ -299,13 +311,15 @@ async def _notify_export(pid: str, status: str, message: str) -> None:
 async def run_export_job(job: dict) -> None:
     pid = job["project_id"]
     fmt = job["format"]
+    loc = normalize_locale(job.get("lang") or "zh")
+    job["lang"] = loc
     try:
-        _set_job(job, 8, "收集项目事实与漏洞页…")
+        _set_job(job, 8, msg("job_facts", lang=loc))
         data = await report_gen.build_report_data(pid, enrich_ai=False)
         digest = facts_digest(data)
         out_dir = Path(settings.reports_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        stem = cache_stem(pid, digest)
+        stem = cache_stem(pid, digest, loc)
         html_path = out_dir / f"{stem}.html"
         p = data.get("project") or {}
         fname_base = _safe_name(pid, p)
@@ -313,41 +327,41 @@ async def run_export_job(job: dict) -> None:
         force = bool(job.get("force", True))
         cached = (not force) and html_path.exists() and html_path.stat().st_size > 200
         if cached:
-            _set_job(job, 72, "命中缓存，跳过专职导出 Pi…")
+            _set_job(job, 72, msg("job_cache", lang=loc))
             html_doc = html_path.read_text(encoding="utf-8")
             job["cached"] = True
             job["claude"] = False
         else:
-            _set_job(job, 22, "专职导出 Pi 正在撰写封面与漏洞卡片…")
+            _set_job(job, 22, msg("job_writing", lang=loc))
             enrich: dict = {}
             claude_err = ""
             try:
-                _set_job(job, 40, "专职导出 Pi 正在撰写槽位…")
-                enrich = await _export_enrich(_facts_payload(data), project_id=pid) or {}
+                _set_job(job, 40, msg("job_slots", lang=loc))
+                enrich = await _export_enrich(_facts_payload(data), project_id=pid, lang=loc) or {}
             except Exception as e:
                 claude_err = str(e)[:400]
                 enrich = {}
             if not _enrich_usable(enrich):
                 if not claude_err:
-                    claude_err = "专职导出 Pi 未返回可用槽位 JSON"
+                    claude_err = msg("job_bad_json", lang=loc)
                 job["claude"] = False
                 job["claude_error"] = claude_err
                 job["error"] = claude_err
-                _set_job(job, 58, f"专职导出 Pi 撰写失败：{claude_err[:160]}", status="error")
+                _set_job(job, 58, msg("job_pi_fail", lang=loc, err=claude_err[:160]), status="error")
                 await _notify_export(pid, "error", claude_err[:200])
                 return
             job["claude"] = True
             job["claude_error"] = None
             job["pi_role"] = EXPORT_ROLE
-            _set_job(job, 62, "套入母版槽位…")
-            html_doc = assemble_deliverable(data, enrich=enrich)
-            _set_job(job, 82, "写入报告…")
+            _set_job(job, 62, msg("job_shell", lang=loc))
+            html_doc = assemble_deliverable(data, enrich=enrich, lang=loc)
+            _set_job(job, 82, msg("job_write", lang=loc))
             html_path.write_text(html_doc, encoding="utf-8")
             job["cached"] = False
 
         job["html_path"] = str(html_path)
         if fmt == "pdf":
-            _set_job(job, 90, "渲染 PDF…")
+            _set_job(job, 90, msg("job_pdf", lang=loc))
             pdf_path = out_dir / f"{stem}.pdf"
             pdf_path.write_bytes(html_to_pdf(html_path.read_text(encoding="utf-8")))
             job["pdf_path"] = str(pdf_path)
@@ -355,33 +369,35 @@ async def run_export_job(job: dict) -> None:
         else:
             job["filename"] = f"{fname_base}.html"
         if job.get("claude"):
-            done_msg = "报告已生成（专职导出 Pi 已撰写）"
+            done_msg = msg("job_done_pi", lang=loc)
         elif job.get("cached"):
-            done_msg = "报告已生成（命中缓存）"
+            done_msg = msg("job_done_cache", lang=loc)
         else:
-            done_msg = "报告已生成"
+            done_msg = msg("job_done", lang=loc)
         _set_job(job, 100, done_msg, status="done")
         await _notify_export(pid, "done", done_msg)
     except Exception as e:
         job["error"] = str(e)
-        _set_job(job, int(job.get("percent") or 0), f"失败：{e}", status="error")
+        _set_job(job, int(job.get("percent") or 0), msg("job_fail", lang=loc, err=e), status="error")
         await _notify_export(pid, "error", str(e)[:200])
 
 
-async def start_export_job(project_id: str, fmt: str, *, force: bool = True) -> dict:
+async def start_export_job(project_id: str, fmt: str, *, force: bool = True, lang: object = None) -> dict:
     fmt = (fmt or "html").lower().strip()
+    loc = normalize_locale(lang if lang is not None else get_locale())
     if fmt == "md":
-        raise ProjectReportMdGone("项目总报告请改用 HTML 或 PDF 导出")
+        raise ProjectReportMdGone(msg("md_gone", lang=loc))
     if fmt not in ("html", "pdf"):
-        raise ValueError("format 仅支持 html|pdf")
+        raise ValueError(msg("format_html_pdf", lang=loc))
     job_id = new_id("rpt_")
     job = {
         "id": job_id,
         "project_id": project_id,
         "format": fmt,
+        "lang": loc,
         "status": "running",
         "percent": 1,
-        "message": "专职导出 Pi 排队中…",
+        "message": msg("job_queued", lang=loc),
         "error": None,
         "filename": None,
         "cached": False,
@@ -407,7 +423,7 @@ def parse_claude_docs(text: str) -> tuple[str, str]:
 
 
 def wrap_html(data, **_kw) -> str:
-    return assemble_deliverable(data, enrich=None)
+    return assemble_deliverable(data, enrich=None, lang=_kw.get("lang"))
 
 
 def wrap_markdown(data, **_kw) -> str:

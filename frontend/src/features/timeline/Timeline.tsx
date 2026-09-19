@@ -2,11 +2,12 @@ import { useEffect, useMemo, useRef } from "react";
 import type { RTEvent } from "../../types";
 import { displayFindingSeverity } from "../../theme";
 import { coalesceStreamEvents } from "./coalesce";
+import { t, useT } from "../../i18n";
 
-const LABEL: Record<string, string> = {
-  text: "分析", thought: "思考", tool: "工具", tool_result: "结果", finding: "发现",
-  shell: "GETSHELL", steer: "指令", status: "状态", log: "日志", intent: "新意图", turn: "轮次结束", node: "节点", edge: "连接", rce_path: "路径", lateral: "内网横向", drift_alert: "漂移告警", finding_review: "二次验证", report_export: "交付报告",
-};
+const TIMELINE_TYPES = new Set([
+  "text", "thought", "tool", "tool_result", "finding", "shell", "steer", "status", "log",
+  "intent", "turn", "node", "edge", "rce_path", "lateral", "drift_alert", "finding_review", "report_export",
+]);
 
 function line(ev: RTEvent): string {
   const p = ev.payload || {};
@@ -14,37 +15,38 @@ function line(ev: RTEvent): string {
     case "text": return p.text?.slice(0, 300) || "";
     case "thought": return "💭 " + (p.message?.slice(0, 800) || "");
     case "tool": return `▶ ${p.tool}` + (p.command ? `: ${p.command}` : p.url ? `: ${p.method || ""} ${p.url}` : p.input ? `: ${p.input}` : "");
-    case "tool_result": return p.tool === "run_cmd" ? `exit=${p.exit_code}${p.blocked ? " [已拦截]" : ""} ${(p.stdout_preview || p.reason || "").slice(0, 200)}` : `${p.status ?? ""} ${(p.preview || p.error || "").slice(0, 200)}`;
+    case "tool_result": return p.tool === "run_cmd" ? `exit=${p.exit_code}${p.blocked ? t("timeline.blocked") : ""} ${(p.stdout_preview || p.reason || "").slice(0, 200)}` : `${p.status ?? ""} ${(p.preview || p.error || "").slice(0, 200)}`;
     case "finding": {
       const sev = displayFindingSeverity(p);
       return `${sev === "critical" ? "★ " : ""}[${sev}] ${p.title} (${p.category})`;
     }
     case "shell": return `🎯 GETSHELL! ${p.access || ""} ${(p.evidence || "").slice(0, 120)}`;
-    case "lateral": return `🌐 内网横向已开始${p.hosts_footed ? ` · ${p.hosts_footed} 台主机` : ""}${p.pivot_edges ? ` · ${p.pivot_edges} 条跳板` : ""}`;
+    case "lateral": return `🌐 ${t("timeline.lateralStart")}${p.hosts_footed ? t("timeline.hosts", { n: p.hosts_footed }) : ""}${p.pivot_edges ? t("timeline.pivots", { n: p.pivot_edges }) : ""}`;
     case "finding_review": {
       const n = Number(p.count || (p.titles || []).length || 0);
-      if (p.status === "running") return `🔎 专职 Pi 正在二次验证与红队评级 · ${n} 条`;
-      return `🔎 本轮二次验证结束${n ? ` · ${n} 条` : ""}`;
+      if (p.status === "running") return `🔎 ${t("timeline.reviewRun", { n })}`;
+      return n ? `🔎 ${t("timeline.reviewDoneN", { n })}` : `🔎 ${t("timeline.reviewDone")}`;
     }
     case "report_export": {
-      if (p.status === "running") return "📄 专职导出 Pi 正在撰写交付报告";
-      if (p.status === "error") return `📄 专职导出 Pi 失败：${String(p.message || "").slice(0, 160)}`;
-      return "📄 专职导出 Pi 已写完交付报告";
+      if (p.status === "running") return `📄 ${t("timeline.exportRun")}`;
+      if (p.status === "error") return `📄 ${t("timeline.exportErr", { msg: String(p.message || "").slice(0, 160) })}`;
+      return `📄 ${t("timeline.exportDone")}`;
     }
-    case "drift_alert": return `⚠️ 疑似打偏[${p.category || ""}] ${(p.message || "").slice(0, 220)}`;
+    case "drift_alert": return `⚠️ ${t("timeline.drift", { cat: p.category || "", msg: (p.message || "").slice(0, 220) })}`;
     case "steer": return `⚡ ${p.content}`;
-    case "status": return `状态: ${p.status}${p.turn ? ` · 第 ${p.turn} 轮` : ""}`;
+    case "status": return `${t("timeline.statusLine", { status: p.status })}${p.turn ? t("timeline.turnN", { n: p.turn }) : ""}`;
     case "log": return `${p.level === "error" ? "✖" : p.level === "warn" ? "⚠" : "ℹ"} ${p.message}`;
-    case "intent": return `+ 意图: ${p.description}`;
-    case "turn": return `— 轮次结束 (${p.num_turns ?? "?"} steps${p.total_cost_usd ? `, $${Number(p.total_cost_usd).toFixed(3)}` : ""})`;
+    case "intent": return t("timeline.intentLine", { desc: p.description });
+    case "turn": return `${t("timeline.turnEnd", { steps: p.num_turns ?? "?" })}${p.total_cost_usd ? `, $${Number(p.total_cost_usd).toFixed(3)}` : ""})`;
     default: return JSON.stringify(p).slice(0, 160);
   }
 }
 
 function labelOf(ev: RTEvent): string {
-  if (ev.type === "steer" && ev.payload?.source === "supervisor") return "御主";
-  if (ev.type === "steer") return "人工指令";
-  return LABEL[ev.type] || ev.type;
+  if (ev.type === "steer" && ev.payload?.source === "supervisor") return t("timeline.supervisor");
+  if (ev.type === "steer") return t("timeline.human");
+  const key = `timeline.${ev.type}`;
+  return TIMELINE_TYPES.has(ev.type) ? t(key) : ev.type;
 }
 
 const CLS: Record<string, string> = { finding: "t-finding", shell: "t-shell", lateral: "t-shell", tool: "t-tool", steer: "t-steer", log: "t-error", drift_alert: "t-error", finding_review: "t-steer", report_export: "t-steer" };
@@ -53,9 +55,10 @@ const SKIP = new Set(["node", "edge", "rce_path", "supervisor"]);
 const MAX_SHOWN = 150;
 
 export function Timeline({ events }: { events: RTEvent[] }) {
+  const { t: tr } = useT();
   const ref = useRef<HTMLDivElement>(null);
   const shown = useMemo(() => {
-    const filtered = coalesceStreamEvents(events).filter((e) => !SKIP.has(e.type) && LABEL[e.type]);
+    const filtered = coalesceStreamEvents(events).filter((e) => !SKIP.has(e.type) && TIMELINE_TYPES.has(e.type));
     return filtered.length > MAX_SHOWN ? filtered.slice(-MAX_SHOWN) : filtered;
   }, [events]);
 
@@ -67,7 +70,7 @@ export function Timeline({ events }: { events: RTEvent[] }) {
 
   return (
     <div className="scroll-y" ref={ref} style={{ maxHeight: 520 }}>
-      {shown.length === 0 && <p className="muted" style={{ fontSize: 14 }}>暂无活动。启动项目后，智能体的每一步都会实时显示在这里。</p>}
+      {shown.length === 0 && <p className="muted" style={{ fontSize: 14 }}>{tr("timeline.empty")}</p>}
       {shown.map((ev) => (
         <div key={ev.id ?? `${ev.ts}-${ev.type}`} className={`timeline-item ${ev.type === "log" && ev.payload?.level !== "error" ? "" : CLS[ev.type] || ""}`}>
           <div style={{ fontSize: 11, color: "var(--muted)" }}>{labelOf(ev)}</div>

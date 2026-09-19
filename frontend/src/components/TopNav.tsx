@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { api } from "../api";
 import { isCtfProject } from "../projectStatus";
+import { useT } from "../i18n";
 
 interface TrackSlots {
   active: number;
@@ -70,6 +71,7 @@ function projectIdFromPath(pathname: string): string | null {
 }
 
 export function TopNav() {
+  const { t } = useT();
   const location = useLocation();
   const [h, setH] = useState<Health | null>(null);
   const [px, setPx] = useState<ProxyInfo | null>(null);
@@ -159,29 +161,29 @@ export function TopNav() {
   const srcProxyOn = !ctfLocked && ctfView !== null && !!px?.enabled;
   const yakitOn = !ctfLocked && ctfView !== null && !!yk?.enabled;
   const yakitLabel = ctfLocked
-    ? "CTF 不抓包"
+    ? t("topnav.ctfNoMitm")
     : (onProject && ctfView === null)
-      ? "Yakit…"
+      ? t("topnav.yakitWait")
       : "Yakit";
   const proxyLabel = ctfLocked
-    ? "CTF 直连"
+    ? t("topnav.ctfDirect")
     : (onProject && ctfView === null)
-      ? "出网…"
-      : `红队代理 存活 ${px?.live ?? 0}`;
+      ? t("topnav.proxyWait")
+      : t("topnav.proxyLive", { n: px?.live ?? 0 });
 
   return (
     <div className="topnav">
-      <div className="workspace-title">控制台 <span>实时项目与攻击图谱</span></div>
+      <div className="workspace-title">{t("shell.console")} <span>{t("shell.consoleSub")}</span></div>
       <div className="nav-meta">
         <div className="row" style={{ gap: 12 }}>
         {h && (
             <div
               className="row status-control"
               style={{ gap: 8 }}
-              title="红队与 SRC 共用项目槽，CTF 另有独立槽，互不占用。多点的启动会在本赛道槽满时排队。已开项目内工人数不因顶栏变化被杀掉。"
+              title={t("topnav.slotsTitle")}
             >
               <span className="pulse-dot" style={{ background: (rtActive + ctfActive) > 0 ? "var(--success)" : "var(--muted-soft)" }} />
-              <span>红队/SRC {rtActive}/{rt?.limit ?? "-"}</span>
+              <span>{t("topnav.redSrc", { a: rtActive, b: rt?.limit ?? "-" })}</span>
               {rt && (
                 <SlotSelect
                   value={rt.limit}
@@ -189,7 +191,7 @@ export function TopNav() {
                   onChange={(n) => changeTrack("redteam", n)}
                 />
               )}
-              <span>CTF {ctfActive}/{ctf?.limit ?? "-"}</span>
+              <span>{t("topnav.ctf", { a: ctfActive, b: ctf?.limit ?? "-" })}</span>
               {ctf && (
                 <SlotSelect
                   value={ctf.limit}
@@ -204,10 +206,10 @@ export function TopNav() {
               style={{ gap: 8 }}
               title={
                 ctfLocked
-                  ? "本项目是 CTF，始终直连靶场，不走出口代理。顶栏开关只作用于红队/SRC。"
+                  ? t("topnav.proxyCtf")
                   : (px?.error
                     ? String(px.error)
-                    : "红队/SRC 打目标必须走出口代理；关开关才会直连并暴露真实 IP。CTF 始终直连。")
+                    : t("topnav.proxyHint"))
               }
             >
               <button
@@ -224,7 +226,7 @@ export function TopNav() {
               {!ctfLocked && (
                 <span
                   className={`proxy-spin${px?.fetching ? " is-on" : ""}`}
-                  aria-label={px?.fetching ? "正在持续获取代理" : "代理已关闭"}
+                  aria-label={px?.fetching ? t("topnav.fetching") : t("topnav.proxyOff")}
                 />
               )}
             </div>
@@ -233,10 +235,10 @@ export function TopNav() {
               style={{ gap: 8 }}
               title={
                 ctfLocked
-                  ? "CTF 默认不进 Yakit MITM。项目 config.yakit_mitm=true 才 opt-in。"
+                  ? t("topnav.yakitCtf")
                   : (yk?.error
                     ? String(yk.error)
-                    : "红队/SRC 打开后从者 HTTP 走本机 MITM，下游仍是出口池。关=不抓包、不向从者暴露 Yakit 工具。")
+                    : t("topnav.yakitHint"))
               }
             >
               <button
@@ -255,30 +257,34 @@ export function TopNav() {
                 title={yk?.engine?.error || yk?.engine?.label || "Yakit"}
                 style={{ background: yk?.engine?.ready ? "var(--success)" : "var(--error)" }}
               />
-              <span>{yk?.engine?.ready ? "Yakit 就绪" : "Yakit 未就绪"}</span>
+              <span>{yk?.engine?.ready ? t("settings.yakitReady") : t("settings.yakitDown")}</span>
               <span
                 className="pulse-dot"
-                title={yk?.cert?.error || yk?.cert?.label || "证书"}
+                title={yk?.cert?.error || yk?.cert?.label || t("topnav.cert")}
                 style={{ background: yk?.cert?.ready ? "var(--success)" : "var(--error)" }}
               />
-              <span>{yk?.cert?.ready ? "证书就绪" : "证书异常"}</span>
+              <span>{yk?.cert?.ready ? t("settings.certReady") : t("settings.certBad")}</span>
               {yakitOn && (
                 <>
                   <span
                     className="pulse-dot"
-                    title={yk?.mitm?.verified ? `MITM 出口 ${yk?.mitm?.exit_ip || ""}` : (yk?.error || "MITM 出口未验收")}
+                    title={yk?.mitm?.verified ? t("topnav.mitmExit", { ip: yk?.mitm?.exit_ip || "" }) : (yk?.error || t("topnav.mitmUnverified"))}
                     style={{ background: yk?.mitm?.verified ? "var(--success)" : "var(--error)" }}
                   />
-                  <span>{yk?.mitm?.verified ? `出口 ${yk?.mitm?.exit_ip || "已验收"}` : "出口未验收"}</span>
+                  <span>{yk?.mitm?.verified ? (yk?.mitm?.exit_ip ? t("topnav.exitOk", { ip: yk.mitm.exit_ip }) : t("topnav.exitVerified")) : t("topnav.exitNo")}</span>
                 </>
               )}
             </div>
             {h?.claude_sdk && (
-              <div className="row status-control" style={{ gap: 6 }} title="Pi 就绪状态。本机进程数仅展示，项目内工人不设上限。">
+              <div className="row status-control" style={{ gap: 6 }} title={t("topnav.piTitle")}>
                 <span className="pulse-dot" style={{ background: h.claude_sdk?.state === "unavailable" ? "var(--error)" : "var(--success)" }} />
-                <span>{h.claude_sdk?.label || "Pi 就绪"}</span>
+                <span>{h.claude_sdk?.label || t("topnav.piReady")}</span>
                 {(cl?.active ?? 0) > 0 && (
-                  <span className="muted" style={{ fontSize: 11 }}>· {cl?.active} 进程</span>
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    {t("topnav.piProcs", {
+                      n: cl?.limit ? `${cl.active}/${cl.limit}` : (cl?.active ?? 0),
+                    })}
+                  </span>
                 )}
               </div>
             )}

@@ -1,20 +1,27 @@
 import type { RTEvent } from "../../types";
+import { t, useT } from "../../i18n";
 
-const STALL_LABEL: Record<string, string> = {
-  none: "有清晰下一步",
-  infra: "入口不可达",
-  method: "方法空转",
-  chain: "应打利用下一跳",
-  postex: "应提权/横向",
-};
+function stallLabel(stall: string): string {
+  const key: Record<string, string> = {
+    none: "sup.none",
+    infra: "sup.infra",
+    method: "sup.method",
+    chain: "sup.chain",
+    postex: "sup.postex",
+  };
+  return key[stall] ? t(key[stall]) : stall;
+}
 
-const KIND_LABEL: Record<string, string> = {
-  plan: "方案",
-  error: "调用失败",
-  empty: "空方案",
-  hold: "继续",
-  runtime_review: "御主审查",
-};
+function kindLabel(kind: string): string {
+  const key: Record<string, string> = {
+    plan: "sup.kindPlan",
+    error: "sup.kindError",
+    empty: "sup.kindEmpty",
+    hold: "sup.kindHold",
+    runtime_review: "sup.kindReview",
+  };
+  return key[kind] ? t(key[kind]) : t("sup.kindGeneric");
+}
 
 /** 御主栏只展示失败记录与模型生成的内容，不展示 skip/probe 等机械条目。 */
 const VISIBLE_KINDS = new Set(["error", "empty", "plan", "hold", "runtime_review"]);
@@ -34,10 +41,10 @@ type SupervisorRow = {
   tags?: { label: string; items: string[] }[];
 };
 
-function chips(label: string, items: unknown): { label: string; items: string[] } | null {
+function chips(labelKey: string, items: unknown): { label: string; items: string[] } | null {
   if (!Array.isArray(items) || !items.length) return null;
   const out = items.map((x) => String(x || "").trim()).filter(Boolean);
-  return out.length ? { label, items: out } : null;
+  return out.length ? { label: labelKey, items: out } : null;
 }
 
 function fromSupervisorEvent(ev: RTEvent): SupervisorRow | null {
@@ -48,31 +55,31 @@ function fromSupervisorEvent(ev: RTEvent): SupervisorRow | null {
   const turn = Number(p.turn) || 0;
   const title =
     kind === "error"
-      ? "监督调用失败，本轮未注入方案"
+      ? t("sup.callFailed")
       : kind === "empty"
-      ? "监督返回空方案，本轮未注入"
+      ? t("sup.emptyPlan")
       : kind === "hold"
       ? (
           String(p.reason || "") === "binding_ignored"
-            ? (turn ? `第 ${turn} 轮收紧后重注` : "收紧后重注")
-            : (turn ? `第 ${turn} 轮继续当前方案` : "继续当前方案")
+            ? (turn ? t("sup.rebindTurn", { n: turn }) : t("sup.rebind"))
+            : (turn ? t("sup.holdTurn", { n: turn }) : t("sup.hold"))
         )
       : kind === "runtime_review"
       ? (
-          (turn ? `第 ${turn} 轮御主审查` : "御主审查")
-          + (p.continue === false ? " · 暂停" : " · 续跑")
+          (turn ? t("sup.reviewTurn", { n: turn }) : t("sup.review"))
+          + (p.continue === false ? t("sup.pause") : t("sup.continue"))
         )
       : turn
-      ? `第 ${turn} 轮方案`
+      ? t("sup.planTurn", { n: turn })
       : pivot
-      ? `方案 #${pivot}`
-      : "监督方案";
+      ? t("sup.planN", { n: pivot })
+      : t("sup.plan");
   const tags = [
-    chips("建议 Intent", p.must_intents),
-    chips("建议委派", p.subagents),
-    chips("建议战术", p.prefer_tactics),
-    chips("禁止策略", p.defer_families),
-    chips("禁止重复", p.ban_repeats),
+    chips("sup.chipIntent", p.must_intents),
+    chips("sup.chipDelegate", p.subagents),
+    chips("sup.chipTactics", p.prefer_tactics),
+    chips("sup.chipDefer", p.defer_families),
+    chips("sup.chipBan", p.ban_repeats),
   ].filter(Boolean) as { label: string; items: string[] }[];
   const body = p.next_plan || (kind === "error" ? String(p.error || "") : "") || "";
   const diagnosis = p.diagnosis || (kind === "error" ? p.error : "") || "";
@@ -107,7 +114,7 @@ function fromLegacy(ev: RTEvent): SupervisorRow | null {
       key: String(ev.id ?? `steer-${ev.ts}`),
       ts: ev.ts,
       kind: "plan",
-      title: pivot ? `方案 #${pivot}` : "御主方案",
+      title: pivot ? t("sup.planN", { n: pivot }) : t("sup.planTitle"),
       diagnosis: diag,
       body: content,
       pivot,
@@ -121,7 +128,7 @@ function fromLegacy(ev: RTEvent): SupervisorRow | null {
       key: String(ev.id ?? `log-${ev.ts}`),
       ts: ev.ts,
       kind: "error",
-      title: "御主调用失败，本轮未注入方案",
+      title: t("sup.legacyFail"),
       body: msg.replace(/^AI监督调用失败（本轮不注入方案）：/, ""),
     };
   }
@@ -130,12 +137,12 @@ function fromLegacy(ev: RTEvent): SupervisorRow | null {
       key: String(ev.id ?? `log-${ev.ts}`),
       ts: ev.ts,
       kind: "error",
-      title: "御主超时未下令，从者自走",
+      title: t("sup.legacyTimeout"),
       body: msg,
     };
   }
   if (/空方案/.test(msg) && (/AI监督/.test(msg) || /指挥官/.test(msg) || /御主/.test(msg))) {
-    return { key: String(ev.id ?? `log-${ev.ts}`), ts: ev.ts, kind: "empty", title: "御主返回空方案，本轮未注入", body: msg };
+    return { key: String(ev.id ?? `log-${ev.ts}`), ts: ev.ts, kind: "empty", title: t("sup.legacyEmpty"), body: msg };
   }
   return null;
 }
@@ -177,11 +184,12 @@ export function countSupervisorRecords(events: RTEvent[]): number {
 }
 
 export function SupervisorPanel({ events }: { events: RTEvent[] }) {
+  const { t: tr } = useT();
   const rows = collectRows(events).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
   if (!rows.length) {
     return (
       <p className="muted" style={{ padding: 16 }}>
-        暂无御主记录。御主开口后，这里只显示模型给出的方案，以及调用失败。
+        {tr("sup.emptyHint")}
       </p>
     );
   }
@@ -190,21 +198,21 @@ export function SupervisorPanel({ events }: { events: RTEvent[] }) {
       {rows.map((row) => (
         <article key={row.key} className={`advisor-record supervisor-${row.kind}`}>
           <div>
-            <span className="badge badge-pill">{KIND_LABEL[row.kind] || "监督"}</span>
+            <span className="badge badge-pill">{kindLabel(row.kind)}</span>
             <time>{row.ts ? new Date(row.ts * 1000).toLocaleString() : ""}</time>
           </div>
           <b>{row.title}</b>
           <div className="supervisor-meta">
-            {row.turn ? <span>第 {row.turn} 轮</span> : null}
-            {row.stall && row.stall !== "none" ? <span>卡点 {STALL_LABEL[row.stall] || row.stall}</span> : null}
-            {row.quality && row.quality !== "none" ? <span>进展 {row.quality}</span> : null}
-            {row.rebind ? <span>建议重绑入口</span> : null}
+            {row.turn ? <span>{tr("sup.turnN", { n: row.turn })}</span> : null}
+            {row.stall && row.stall !== "none" ? <span>{tr("sup.stall", { text: stallLabel(row.stall) })}</span> : null}
+            {row.quality && row.quality !== "none" ? <span>{tr("sup.progress", { text: row.quality })}</span> : null}
+            {row.rebind ? <span>{tr("sup.rebindEntry")}</span> : null}
           </div>
           {row.diagnosis && row.diagnosis !== row.body ? <p className="supervisor-diag">{row.diagnosis}</p> : null}
           {row.body && <p>{row.body}</p>}
           {row.tags?.map((tag) => (
             <div key={tag.label} className="supervisor-tags">
-              <span className="muted">{tag.label}</span>
+              <span className="muted">{tr(tag.label)}</span>
               {tag.items.map((item) => (
                 <span key={`${tag.label}-${item}`} className="badge badge-pill">{item}</span>
               ))}

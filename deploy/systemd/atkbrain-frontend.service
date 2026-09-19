@@ -1,20 +1,19 @@
 [Unit]
-Description=StrikeAgent_AtkBrain-Flash Vite frontend (LAN :2334)
-After=network-online.target
+Description=StrikeAgent_AtkBrain-Flash console :2334 (reverse proxy to API :2333)
+After=network-online.target atkbrain-flash-backend.service
 Wants=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=20
 
 [Service]
 Type=simple
-WorkingDirectory=__REPO__/frontend
-Environment=NODE_ENV=development
+WorkingDirectory=__REPO__
 Environment=HOME=/root
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=ATKBRAIN_API_ORIGIN=http://127.0.0.1:2333
+Environment=ATKBRAIN_PORT=2333
 Environment=ATKBRAIN_FRONTEND_PORT=2334
 ExecStartPre=/bin/mkdir -p __REPO__/backend/data/logs
-ExecStart=/usr/bin/npm run dev -- --host 0.0.0.0 --port 2334 --strictPort
+ExecStart=/bin/bash __REPO__/scripts/console-2334-proxy.sh
 Restart=always
 RestartSec=2
 TimeoutStopSec=20

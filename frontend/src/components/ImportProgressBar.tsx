@@ -1,3 +1,5 @@
+import { useT } from "../i18n";
+
 export type ImportProgress = {
   phase?: string;
   done?: number;
@@ -12,17 +14,6 @@ export type ImportProgress = {
   hosts?: number;
   policy?: string;
   groups?: { primary: string; zone?: string; vhosts?: string[]; ports?: number[] }[];
-};
-
-const PHASE_LABEL: Record<string, string> = {
-  parse: "解析资产",
-  merge: "合并资产",
-  spawn: "创建子项目",
-  start: "排队启动",
-  done: "导入完成",
-  error: "导入失败",
-  idle: "空闲",
-  paused: "已暂停导入",
 };
 
 export function isImportRunning(p?: ImportProgress | null): boolean {
@@ -48,13 +39,24 @@ export function ImportProgressBar({
   onResume?: () => void;
   busy?: boolean;
 }) {
+  const { t } = useT();
   if (!progress) return null;
   const phase = (progress.phase || "").toLowerCase();
   if (!phase || phase === "idle" || progress.stale) return null;
+  const phaseKey: Record<string, string> = {
+    parse: "import.parse",
+    merge: "import.merge",
+    spawn: "import.spawn",
+    start: "import.start",
+    done: "import.done",
+    error: "import.error",
+    idle: "import.idle",
+    paused: "import.paused",
+  };
   const total = Math.max(0, Number(progress.total) || 0);
   const done = Math.max(0, Number(progress.done) || 0);
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : (phase === "done" ? 100 : 8);
-  const label = PHASE_LABEL[phase] || phase;
+  const label = phaseKey[phase] ? t(phaseKey[phase]) : phase;
   const err = phase === "error";
   const paused = phase === "paused";
   const running = isImportRunning(progress);
@@ -73,11 +75,11 @@ export function ImportProgressBar({
         />
       </div>
       <div className="import-progress-meta muted">
-        {progress.message || (progress.current ? `当前 ${progress.current}` : "请稍候，正在写入子项目…")}
-        {typeof progress.created === "number" && progress.created > 0 ? ` · 已建 ${progress.created}` : ""}
-        {typeof progress.started === "number" && progress.started > 0 ? ` · 已启动 ${progress.started}` : ""}
+        {progress.message || (progress.current ? t("import.current", { name: progress.current }) : t("import.wait"))}
+        {typeof progress.created === "number" && progress.created > 0 ? t("import.created", { n: progress.created }) : ""}
+        {typeof progress.started === "number" && progress.started > 0 ? t("import.started", { n: progress.started }) : ""}
         {typeof progress.group_count === "number" && progress.group_count > 0
-          ? ` · ${progress.policy === "product_zone" ? "产品域" : "同机"} ${progress.group_count} 组`
+          ? (progress.policy === "product_zone" ? t("import.groupsZone", { n: progress.group_count }) : t("import.groupsHost", { n: progress.group_count }))
           : ""}
       </div>
       {Array.isArray(progress.groups) && progress.groups.length > 0 && (
@@ -89,14 +91,14 @@ export function ImportProgressBar({
               <li key={g.primary} style={{ marginBottom: 2, fontWeight: active ? 600 : 400 }}>
                 {g.primary}
                 {g.zone ? ` · ${g.zone}` : ""}
-                {n > 1 ? ` · ${n} 域` : ""}
+                {n > 1 ? t("import.domains", { n }) : ""}
                 {g.ports?.length ? ` · ${g.ports.join(",")}` : ""}
                 {active ? " ←" : ""}
               </li>
             );
           })}
           {progress.groups.length > 12 && (
-            <li className="muted">另有 {progress.groups.length - 12} 组…</li>
+            <li className="muted">{t("import.more", { n: progress.groups.length - 12 })}</li>
           )}
         </ul>
       )}
@@ -104,12 +106,12 @@ export function ImportProgressBar({
         <div className="import-progress-actions">
           {running && onPause && (
             <button type="button" className="btn btn-secondary btn-sm" disabled={busy} onClick={onPause}>
-              {busy ? "处理中…" : "暂停导入"}
+              {busy ? t("common.processing") : t("import.pause")}
             </button>
           )}
           {paused && onResume && (
             <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={onResume}>
-              {busy ? "处理中…" : "继续导入"}
+              {busy ? t("common.processing") : t("import.resume")}
             </button>
           )}
         </div>

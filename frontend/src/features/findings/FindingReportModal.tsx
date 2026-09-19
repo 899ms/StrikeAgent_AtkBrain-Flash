@@ -4,15 +4,17 @@ import type { Finding, FindingDetail } from "../../types";
 import { Modal } from "../../components/Modal";
 import { SeverityBadge, VerifyBadge, SecondaryVerifyBadge } from "../../components/Badge";
 import { displayFindingSeverity, scrubCandidateRceLabel } from "../../theme";
+import { useT } from "../../i18n";
 
 function SectionBody({ text, pending }: { text?: string; pending?: boolean }) {
+  const { t } = useT();
   const body = (text || "").trim();
   if (!body) {
     return (
       <p className="muted" style={{ fontSize: 13, margin: 0 }}>
         {pending
-          ? "专职复核 Pi 完成二次验证与红队评级后撰写本段，不使用模板套话。"
-          : "未采集"}
+          ? t("findings.pendingCopy")
+          : t("findings.notCollected")}
       </p>
     );
   }
@@ -26,6 +28,7 @@ function SectionBody({ text, pending }: { text?: string; pending?: boolean }) {
 export function FindingReportModal({
   projectId, finding, onClose,
 }: { projectId: string; finding: Finding; onClose: () => void }) {
+  const { t, locale } = useT();
   const [detail, setDetail] = useState<FindingDetail | null>(null);
   const [err, setErr] = useState("");
 
@@ -40,7 +43,7 @@ export function FindingReportModal({
   }, [projectId, finding.id]);
 
   const downloadMd = () => {
-    window.open(api.findingReportUrl(projectId, finding.id), "_blank");
+    window.open(api.findingReportUrl(projectId, finding.id, locale), "_blank");
   };
 
   const d = detail;
@@ -64,15 +67,15 @@ export function FindingReportModal({
           <SecondaryVerifyBadge done={!!(finding.secondary_verified || detail?.secondary_verified)} />
           <span className="muted" style={{ fontSize: 12 }}>{finding.category}</span>
           <div style={{ flex: 1 }} />
-          <button className="btn btn-primary btn-sm" onClick={downloadMd}>下载 Markdown</button>
+          <button className="btn btn-primary btn-sm" onClick={downloadMd}>{t("findings.downloadMd")}</button>
         </div>
 
         {err && <p style={{ color: "var(--error)", fontSize: 13 }}>{err}</p>}
         {!d && !err && (
           <p className="muted" style={{ fontSize: 13 }}>
             {finding.secondary_verified
-              ? "专职 Pi 正在撰写漏洞页…"
-              : "加载完整报告…二次验证未完成时由专职复核 Pi 验证、评级后再撰写。"}
+              ? t("findings.writing")
+              : t("findings.loading")}
           </p>
         )}
 
@@ -80,29 +83,29 @@ export function FindingReportModal({
           <>
             {pending && (
               <p className="muted" style={{ fontSize: 12, margin: "0 0 12px" }}>
-                本页由专职复核 Pi 在二次验证与红队评级之后撰写。尚未完成本条时不套用模板。
+                {t("findings.pageNote")}
               </p>
             )}
 
-            <h3>漏洞简介</h3>
+            <h3>{t("findings.summary")}</h3>
             <SectionBody text={summary} pending={pending && !summary} />
 
-            <h3>危害</h3>
+            <h3>{t("findings.impact")}</h3>
             <SectionBody text={impact} pending={pending} />
 
-            <h3>红队评级</h3>
+            <h3>{t("findings.rating")}</h3>
             <SectionBody text={rating} pending={pending} />
 
-            <h3>手动复现</h3>
+            <h3>{t("findings.repro")}</h3>
             <SectionBody text={repro} pending={pending} />
             {curl ? <pre style={{ maxHeight: 280 }}>{curl}</pre> : null}
 
-            <h3>修复方式</h3>
+            <h3>{t("findings.fix")}</h3>
             <SectionBody text={fix} pending={pending} />
 
             <div className="row" style={{ gap: 8, marginTop: 20, borderTop: "1px solid var(--hair)", paddingTop: 14 }}>
-              <button className="btn btn-primary" onClick={downloadMd}>下载本漏洞 Markdown 报告</button>
-              <button className="btn btn-secondary" onClick={onClose}>关闭</button>
+              <button className="btn btn-primary" onClick={downloadMd}>{t("findings.downloadThis")}</button>
+              <button className="btn btn-secondary" onClick={onClose}>{t("common.close")}</button>
             </div>
           </>
         )}
