@@ -30,11 +30,19 @@ def normalize_ver(raw: str | None) -> str:
 
 
 def _parse(raw: str | None):
-    from packaging.version import InvalidVersion, Version
-
     s = normalize_ver(raw)
     if not s:
         return None
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        core = s.split("+", 1)[0].split("-", 1)[0]
+        parts: list[int] = []
+        for bit in core.split("."):
+            if not bit.isdigit():
+                return None
+            parts.append(int(bit))
+        return tuple(parts) if parts else None
     try:
         return Version(s)
     except InvalidVersion:
@@ -124,14 +132,10 @@ def _status_for(local: str, remote: str | None) -> tuple[str, str, bool]:
     return "latest", "已是最新", True
 
 
-def check_latest(*, force: bool = False) -> dict[str, Any]:
-    now = time.monotonic()
-    if not force and _cache["payload"] and (now - float(_cache["at"] or 0)) < _CACHE_TTL:
-        return dict(_cache["payload"])
-
+def local_payload(*, message: str = "已是最新") -> dict[str, Any]:
     local = local_version()
     slug = _repo_slug()
-    payload: dict[str, Any] = {
+    return {
         "local": local,
         "latest": None,
         "latest_tag": None,
@@ -139,9 +143,18 @@ def check_latest(*, force: bool = False) -> dict[str, Any]:
         "status": "latest",
         "html_url": f"https://github.com/{slug}/releases",
         "notes": "",
-        "message": "已是最新",
+        "message": message,
         "repo": slug,
     }
+
+
+def check_latest(*, force: bool = False) -> dict[str, Any]:
+    now = time.monotonic()
+    if not force and _cache["payload"] and (now - float(_cache["at"] or 0)) < _CACHE_TTL:
+        return dict(_cache["payload"])
+
+    payload = local_payload()
+    slug = str(payload.get("repo") or _repo_slug())
 
     code, data = _gh_get(f"/repos/{slug}/releases?per_page=30")
     remote: dict[str, Any] | None = None
@@ -157,7 +170,7 @@ def check_latest(*, force: bool = False) -> dict[str, Any]:
             "html_url": remote.get("html_url") or payload["html_url"],
             "notes": remote.get("notes") or "",
         })
-        st, message, is_latest = _status_for(local, remote.get("latest"))
+        st, message, is_latest = _status_for(str(payload.get("local") or ""), remote.get("latest"))
         payload["status"] = st
         payload["is_latest"] = is_latest
         payload["message"] = message

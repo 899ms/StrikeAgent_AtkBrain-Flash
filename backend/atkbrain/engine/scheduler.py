@@ -7,6 +7,20 @@ from dataclasses import dataclass, field
 from ..config import benchmark_slot_limit, settings
 
 
+def _task_is_cancelling() -> bool:
+    """当前协程是否正在被取消（HTTP 断开 / shutdown），区别于子猎任务的 CancelledError。"""
+    task = asyncio.current_task()
+    if task is None:
+        return False
+    fn = getattr(task, "cancelling", None)
+    if not callable(fn):
+        return False
+    try:
+        return int(fn()) > 0
+    except Exception:
+        return False
+
+
 class DynamicSemaphore:
     """并发上限可在运行时调整的信号量。"""
 
@@ -257,24 +271,33 @@ class RunManager:
         if h.agent is not None:
             try:
                 await h.agent.interrupt()  # type: ignore[attr-defined]
+            except asyncio.CancelledError:
+                if _task_is_cancelling():
+                    raise
             except Exception:
                 pass
         try:
             from ..agents.pi_runtime import kill_live_for_project
-            kill_live_for_project(project_id)
+            await asyncio.to_thread(kill_live_for_project, project_id)
+        except asyncio.CancelledError:
+            if _task_is_cancelling():
+                raise
         except Exception:
             pass
         if h.task and not h.task.done():
             h.task.cancel()
             try:
                 await asyncio.wait_for(h.task, timeout=12)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
+                if _task_is_cancelling() and (h.task is None or not h.task.done()):
+                    raise
+            except (asyncio.TimeoutError, Exception):
                 # 取消后仍卡住（例如 SDK 忽略 cancel）→ 降级为 zombie，解除 is_running 占位
                 if not h.task.done():
                     h.status = "zombie"
                     try:
                         from ..agents.pi_runtime import kill_live_for_project
-                        kill_live_for_project(project_id)
+                        await asyncio.to_thread(kill_live_for_project, project_id)
                     except Exception:
                         pass
                     await self.release_handle_slots(h)
@@ -300,15 +323,22 @@ class RunManager:
             pass
         try:
             from ..agents.pi_runtime import kill_live_for_project
-            kill_live_for_project(project_id)
+            await asyncio.to_thread(kill_live_for_project, project_id)
         except Exception:
             pass
         had = bool(self.handles.get(project_id))
         if had:
-            await self.stop(project_id)
+            try:
+                await self.stop(project_id)
+            except asyncio.CancelledError:
+                # 猎循环 cancel 会冒到这里；再抛出会让 Starlette BaseHTTPMiddleware 变成 HTTP 500
+                if _task_is_cancelling():
+                    raise
+            except Exception:
+                pass
             try:
                 from ..agents.pi_runtime import kill_live_for_project
-                kill_live_for_project(project_id)
+                await asyncio.to_thread(kill_live_for_project, project_id)
             except Exception:
                 pass
         try:

@@ -1066,6 +1066,15 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
             await emit(project_id, "status", {"status": "error", "reason": "unsafe_target"})
             return
 
+    from ..agents.pi_runtime import llm_api_key_configured, llm_key_missing_message
+    if not llm_api_key_configured():
+        handle.status = "done"
+        manager._drop_handle(project_id, handle)
+        await update_status(project_id, "error")
+        await emit(project_id, "log", {"level": "error", "message": llm_key_missing_message()})
+        await emit(project_id, "status", {"status": "error", "reason": "llm_key_missing"})
+        return
+
     await emit(project_id, "status", {"status": "queued", "reason": "concurrency"})
 
     agent: ProjectAgent | None = None

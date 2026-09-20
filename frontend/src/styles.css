@@ -690,6 +690,8 @@ label.field > span { display: block; font-size: 13px; color: var(--muted); margi
 .advisor-record.supervisor-empty { border-color: rgba(217,190,132,.45); }
 .advisor-record.supervisor-skip { border-color: rgba(148,163,184,.4); background: rgba(148,163,184,.06); }
 .advisor-record.supervisor-hold { border-color: rgba(204,120,92,.35); background: rgba(204,120,92,.06); }
+.advisor-record.supervisor-probe { border-color: rgba(93,184,166,.45); background: rgba(93,184,166,.08); }
+.advisor-record.supervisor-waiting { border-color: rgba(217,190,132,.45); background: rgba(217,190,132,.08); }
 .supervisor-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; font-size: 11px; color: var(--muted); }
 .supervisor-diag { font-weight: 600; color: var(--ink) !important; }
 .supervisor-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }

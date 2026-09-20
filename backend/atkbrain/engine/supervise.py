@@ -1147,11 +1147,10 @@ class LoopSupervisor:
         )
 
     async def restart_after_consult_fail(self, turn: int, *, error: str) -> None:
-        """360s 未拿到令：清冷却、释放后探活，便于下一轮再拉起。不拆旧绑定。"""
+        """360s 未拿到令：清冷却，便于下一轮再拉起。不拆旧绑定，也不再发探活盖掉超时。"""
         _ = turn
         _ = error
         self.last_fail_ts = 0.0
-        await self.emit_ready_probe()
 
     async def record_graph_progress(
         self, *, graph: dict | None, flags: int,
@@ -1811,10 +1810,16 @@ class LoopSupervisor:
             project_id=self.project_id, run_id=self.run_id, objective=self.objective,
             graph=graph, facts=facts, project=project, brief=brief,
             last_turn_text=last_turn_text, last_tool_uses=last_tool_uses,
-            turn=turn, scope_hosts=scope_hosts,
+            turn=turn, scope_hosts=scope_hosts, compact=True,
         )
         brief_text = await assemble_supervisor_brief(**brief_kw)
         wait = float(getattr(settings, "supervisor_timeout_sec", 360) or 360)
+        await self._emit_supervisor(
+            "waiting",
+            quality=quality,
+            turn=turn,
+            extra={"diagnosis": "御主思考中，从者本轮已交回。"},
+        )
 
         async def _on_wait(attempt: int, err: str, delay: float) -> None:
             # 超时是 Pi CLI 墙钟，不是上下文不够。控制台不要当成报错。

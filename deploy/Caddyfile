@@ -6,7 +6,7 @@
 	encode gzip
 	reverse_proxy 127.0.0.1:2333 {
 		header_up X-Forwarded-Proto {scheme}
-		header_up Host {host}
+		header_up Host {http.request.hostport}
 		flush_interval -1
 	}
 }
@@ -16,7 +16,7 @@
 	encode gzip
 	reverse_proxy 127.0.0.1:2333 {
 		header_up X-Forwarded-Proto https
-		header_up Host {host}
+		header_up Host {http.request.hostport}
 		flush_interval -1
 	}
 }

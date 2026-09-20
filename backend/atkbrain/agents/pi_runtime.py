@@ -23,14 +23,26 @@ _LIVE: dict[int, tuple[str, str]] = {}
 _RESERVED: list[tuple[str, str]] = []
 _SPAWN_COND: asyncio.Condition | None = None
 
-# 猎面留下内置 read 给 Pi 加载 SKILL.md；其余官方内置工具一律排除。
-EXCLUDE_BUILTIN_TOOLS = "bash,powershell,edit,write,grep,find,ls"
+# 猎面技能靠 --skill 注入；Pi 0.74+ 已去掉 --exclude-tools / -a，改用 --no-builtin-tools 禁官方 bash/edit。
 ONESHOT_ROLES = frozenset({
     "supervisor", "evolve", "finding-page", "report-export", "oneshot",
 })
 REVIEW_ROLE = "finding-review"
 
 EmitFn = Callable[..., Awaitable[None]]
+
+
+def llm_api_key() -> str:
+    return (os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
+
+
+def llm_api_key_configured() -> bool:
+    return bool(llm_api_key())
+
+
+def llm_key_missing_message() -> str:
+    from ..i18n.strings import msg
+    return msg("llm_key_missing")
 
 
 def pi_max_live_limit() -> int:
@@ -191,6 +203,19 @@ def _is_backend_cmd(cmd: bytes) -> bool:
     return b"atkbrain.main" in cmd or b"atkbrain-backend" in cmd
 
 
+def _is_protected_cmd(cmd: bytes) -> bool:
+    """停猎扫 /proc 时不能误杀控制台、反代、Yakit。"""
+    if not cmd or _is_backend_cmd(cmd):
+        return True
+    blob = cmd.replace(b"\0", b" ").lower()
+    first = cmd.split(b"\0", 1)[0].rsplit(b"/", 1)[-1].lower()
+    if first in (b"caddy", b"caddy.exe", b"yak", b"yak.exe", b"uvicorn"):
+        return True
+    if b"yak mcp" in blob or b"uvicorn" in blob:
+        return True
+    return False
+
+
 def _is_pi_cmdline(cmd: bytes) -> bool:
     if not cmd or _is_backend_cmd(cmd):
         return False
@@ -255,7 +280,7 @@ def _scan_pi_pids(*, project_id: str = "", role: str = "") -> set[int]:
             continue
         pid = int(name)
         cmd = _proc_cmdline(pid)
-        if _is_backend_cmd(cmd):
+        if _is_protected_cmd(cmd):
             continue
         env_p = _proc_project_ids(pid)
         env_r = _proc_role(pid)
@@ -409,8 +434,16 @@ def extension_path() -> Path:
 
 
 def tools_base_url() -> str:
+    """Pi 扩展拉工具列表。必须带 8 位入口，否则安全入口中间件会 404。"""
     port = int(getattr(settings, "port", 2333) or 2333)
-    return f"http://127.0.0.1:{port}"
+    try:
+        from ..auth.entry import entry_prefix
+        prefix = entry_prefix() or ""
+    except Exception:
+        prefix = ""
+    if prefix and not str(prefix).startswith("/"):
+        prefix = "/" + str(prefix)
+    return f"http://127.0.0.1:{port}{prefix}"
 
 
 def pi_bin() -> str:
@@ -539,6 +572,25 @@ def _child_env(*, project_id: str | None, tools: bool, role: str = "") -> dict[s
     return env
 
 
+def _assistant_text_from_message(msg: dict | None) -> str:
+    """Pi RPC 无流式时，完整助手消息在 message.content[].text。"""
+    if not isinstance(msg, dict):
+        return ""
+    if str(msg.get("role") or "") != "assistant":
+        return ""
+    content = msg.get("content")
+    parts: list[str] = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and str(item.get("type") or "") in ("", "text"):
+                parts.append(str(item.get("text") or ""))
+    return "".join(parts).strip()
+
+
 class PiSession:
     """一条 Pi RPC 进程。不续接旧对话；猎面角色可保活进程、每轮只换 instruction。"""
 
@@ -581,6 +633,9 @@ class PiSession:
         self._buf = b""
         self._last_text = ""
         self._last_thought = ""
+        self._text_acc: list[str] = []
+        self._thought_acc: list[str] = []
+        self._turn_closed = False
         self.last_prompt_at = 0.0
         self.idle_turns = 0
 
@@ -594,7 +649,6 @@ class PiSession:
             "--mode", "rpc",
             "--no-session",
             "--offline",
-            "-a",
             "--provider", pi_provider(),
             "--model", self.model or pi_model(),
             "--system-prompt", "StrikeAgent_AtkBrain-Flash",
@@ -606,7 +660,7 @@ class PiSession:
                 "--no-context-files",
                 "--no-extensions", "-e", str(ext),
                 "--no-skills",
-                "--exclude-tools", EXCLUDE_BUILTIN_TOOLS,
+                "--no-builtin-tools",
             ])
             for raw in self.skill_paths:
                 p = Path(raw)
@@ -663,6 +717,17 @@ class PiSession:
                 if f:
                     f.write(chunk)
                     f.flush()
+                text = chunk.decode("utf-8", "replace").strip()
+                if (
+                    "Unknown option" in text
+                    or "unknown option" in text.lower()
+                    or "Failed to load extension" in text
+                ):
+                    await self._emit_safe(
+                        "log",
+                        {"level": "error",
+                         "message": f"Pi 启动失败：{text[:300]}"},
+                    )
         finally:
             if f:
                 f.close()
@@ -708,13 +773,30 @@ class PiSession:
                 self.on_activity()
             except Exception:
                 pass
-        if typ in ("agent_settled", "message_end"):
+        if typ == "agent_settled":
             await self._flush_streams()
-            if typ == "agent_settled":
-                self._settled.set()
+            self._settled.set()
+            return
+        if typ in ("message_end", "turn_end"):
+            await self._flush_streams()
+            msg = event.get("message") if isinstance(event.get("message"), dict) else {}
+            # 用户回显的 message_end 不能当收工，否则会 abort 掉还没生成的助手回复。
+            if not self.tools and str(msg.get("role") or "") == "assistant":
+                text = _assistant_text_from_message(msg)
+                if text and (not self.texts or self.texts[-1] != text):
+                    self.texts.append(text)
+                stop = str(msg.get("stopReason") or "")
+                if stop != "aborted":
+                    self._settled.set()
             return
         if typ == "agent_end" and not event.get("willRetry"):
-            # 仍可能 compaction；以 settled 为准，这里只收文本兜底
+            if not self.tools:
+                await self._flush_streams()
+                for item in event.get("messages") or []:
+                    text = _assistant_text_from_message(item if isinstance(item, dict) else None)
+                    if text and (not self.texts or self.texts[-1] != text):
+                        self.texts.append(text)
+                self._settled.set()
             return
         if typ == "message_update":
             ev = event.get("assistantMessageEvent") or {}
@@ -760,6 +842,7 @@ class PiSession:
             await self._emit_safe("text", {"text": text[:8000], "role": self.role})
             if (
                 not getattr(self, "_turn_closed", False)
+                and self.role not in ONESHOT_ROLES
                 and role_wrote_turn_done(text, role=self.role)
             ):
                 self._turn_closed = True
@@ -823,18 +906,24 @@ class PiSession:
         self._prompt_ok = loop.create_future()
         self._req += 1
         await self._send({"id": f"p{self._req}", "type": "prompt", "message": message})
+        ack_ok = False
         try:
-            await asyncio.wait_for(self._prompt_ok, timeout=30)
+            ack_ok = bool(await asyncio.wait_for(self._prompt_ok, timeout=30))
         except Exception:
-            pass
+            ack_ok = False
         wait = float(timeout or 0)
+        if not self.tools and not ack_ok:
+            wait = min(wait, 15.0) if wait > 0 else 15.0
         try:
             if wait > 0:
                 await asyncio.wait_for(self._settled.wait(), timeout=wait)
             else:
                 await self._settled.wait()
         except TimeoutError:
+            text = "".join(self.texts).strip()
             await self.abort()
+            if text:
+                return text
             raise
         return "".join(self.texts).strip()
 

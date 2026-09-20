@@ -29,6 +29,10 @@ _MSG = {
     "job_fail": {"zh": "失败：{err}", "en": "Failed: {err}"},
     "missing": {"zh": "未采集", "en": "Not collected"},
     "auth_fail": {"zh": "验证失败", "en": "Verification failed"},
+    "llm_key_missing": {
+        "zh": "未配置 DEEPSEEK_API_KEY（或 ANTHROPIC_AUTH_TOKEN）。在项目目录 .env 填写后执行 docker compose up -d，再启动猎面。",
+        "en": "DEEPSEEK_API_KEY (or ANTHROPIC_AUTH_TOKEN) is not set. Put it in the project .env, run docker compose up -d, then start the hunt.",
+    },
     "password_wrong": {"zh": "口令错误", "en": "Wrong password"},
     "review_busy": {"zh": "该漏洞这项复核正在进行", "en": "This finding already has that review running"},
     "review_mode": {"zh": "mode 须为 secondary 或 rating", "en": "mode must be secondary or rating"},

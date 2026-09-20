@@ -212,6 +212,8 @@ async def api_auth_middleware(request: Request, call_next):
     loopback = is_loopback_peer(peer_host(request))
     if path == "/api/health" and loopback:
         return await call_next(request)
+    if loopback and "/agent-tools" in path:
+        return await call_next(request)
     if auth_public_path(path) or not path.startswith("/api"):
         return await call_next(request)
     if env_no_auth():

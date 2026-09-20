@@ -266,19 +266,26 @@ class ProxyPool:
                 return random.choice(bucket).url
         return None
 
+    def https_ok_url(self, url: str) -> bool | None:
+        """池内已知则返回探活结果；未入池返回 None。"""
+        u = (url or "").strip()
+        if not u:
+            return False
+        for item in self.live:
+            if item.url == u:
+                return bool(item.https_ok)
+        return None
+
     def mitm_candidates(self, n: int = 16, exclude: set[str] | None = None) -> list[str]:
-        """给 Yakit 下游试的节点：自建 https → 池内 https → 其余存活（备用）。"""
+        """给 Yakit 下游试的节点：只收已探活 HTTPS CONNECT 的，HTTP-only 会让 MITM 对 :80 做 TLS。"""
         if not self.enabled and not self._custom_urls():
             return []
-        items = self._usable(exclude)
+        items = [i for i in self._usable(exclude) if i.https_ok]
         custom = set(self._custom_urls())
         buckets = [
-            [i for i in items if i.url in custom and i.https_ok],
-            [i for i in items if i.url not in custom and i.https_ok and (i.proto or "").startswith("http")],
-            [i for i in items if i.url not in custom and i.https_ok],
             [i for i in items if i.url in custom],
-            [i for i in items if (i.proto or "").startswith("http")],
-            list(items),
+            [i for i in items if i.url not in custom and (i.proto or "").startswith("http")],
+            [i for i in items if i.url not in custom],
         ]
         out: list[str] = []
         seen: set[str] = set()
@@ -293,6 +300,17 @@ class ProxyPool:
                 if len(out) >= want:
                     return out
         return out
+
+    async def wait_pick_https(self, timeout: float = 8.0) -> str | None:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            px = self.pick_https()
+            if px:
+                return px
+            if time.monotonic() >= deadline:
+                return None
+            self.ensure_loop()
+            await asyncio.sleep(0.4)
 
     def pick(self, exclude: set[str] | None = None, *, prefer_http: bool = False) -> str | None:
         """出网出口与顶栏同一条：当前池节点。被排除时才从其余存活里再选。"""

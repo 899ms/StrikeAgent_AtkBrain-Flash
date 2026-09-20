@@ -74,6 +74,24 @@ def capture_mitm_root_pem(host: str, port: int, *, timeout: float = 12.0) -> str
     return root_pem_from_chain_text(text)
 
 
+def mitm_url_likely_no_connect(url: str) -> bool:
+    """http://host:80 几乎没有 CONNECT，Yakit 会对其做 TLS 并 502。"""
+    raw = (url or "").strip()
+    if not raw:
+        return True
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    scheme = (parsed.scheme or "http").lower()
+    if scheme.startswith("socks"):
+        return False
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    try:
+        return int(port) == 80
+    except (TypeError, ValueError):
+        return True
+
+
 def parse_echo_ip(status_code: int | None, body: str | None) -> str | None:
     """icanhazip 只接受 200 + 首行纯 IPv4。Yakit 错误页里的 IP 不算出口。"""
     try:
@@ -719,7 +737,7 @@ class YakitBridge:
             out.append(u)
 
         try:
-            add(pool.current_url())
+            add(pool.pick_https(exclude=skip))
         except Exception:
             pass
         try:
@@ -728,9 +746,17 @@ class YakitBridge:
         except Exception:
             pass
         for u in self._backup_urls():
-            add(u)
-        add(self.last_good_proxy)
-        return out
+            if not mitm_url_likely_no_connect(u):
+                add(u)
+        good = (self.last_good_proxy or "").strip()
+        if good and not mitm_url_likely_no_connect(good):
+            try:
+                known = pool.https_ok_url(good)
+            except Exception:
+                known = None
+            if known is not False:
+                add(good)
+        return [u for u in out if not mitm_url_likely_no_connect(u)]
 
     def _choose_listen_port(self, host: str) -> int:
         """start_mitm_v2 不会改已经在听的口的下游。只用空闲端口。"""
@@ -766,9 +792,13 @@ class YakitBridge:
         host = host or h
         port = int(port or p)
         proxy = f"http://{host}:{port}"
+        verify: bool | str = False
+        ca = cert_path()
+        if ca.is_file() and ca.stat().st_size > 32:
+            verify = str(ca)
         try:
             async with httpx.AsyncClient(
-                timeout=8.0, follow_redirects=True, verify=False, trust_env=False, proxy=proxy,
+                timeout=8.0, follow_redirects=True, verify=verify, trust_env=False, proxy=proxy,
             ) as cli:
                 r = await cli.get("https://ipv4.icanhazip.com")
             return parse_echo_ip(r.status_code, r.text)
@@ -833,7 +863,7 @@ class YakitBridge:
         downs = self._downstream_candidates()
         if not downs:
             try:
-                await pool.wait_pick(8.0, prefer_http=True)
+                await pool.wait_pick_https(8.0)
             except Exception:
                 pass
             downs = self._downstream_candidates()
@@ -867,11 +897,19 @@ class YakitBridge:
                 continue
             tried.add(url)
             try:
+                if mitm_url_likely_no_connect(url):
+                    raise RuntimeError("下游是 :80 HTTP 代理，不能给 MITM 做 HTTPS CONNECT")
                 port = self._choose_listen_port(host)
                 await self._start_mitm(host, port, url)
+                try:
+                    await self._bind_live_cert()
+                except Exception:
+                    pass
                 via = await self._echo_via_mitm(host, port)
                 if not via:
-                    raise RuntimeError("经 MITM 打 icanhazip 失败")
+                    raise RuntimeError("经 MITM 打 HTTPS icanhazip 失败（下游多半不能 CONNECT）")
+                if not await self._https_decrypt_ok():
+                    raise RuntimeError("MITM 证书无法校验 HTTPS 叶子证")
                 if direct and via == direct:
                     try:
                         pool.drop(url)
@@ -891,14 +929,11 @@ class YakitBridge:
                     for item in pool.live:
                         if item.url == url:
                             item.exit_ip = via
+                            item.https_ok = True
                             break
                 except Exception:
                     pass
                 self.save()
-                try:
-                    await self._bind_live_cert()
-                except Exception:
-                    pass
                 try:
                     await mcp_client.call_tool("set_mitm_filter", self._exclude_filter())
                 except Exception:
@@ -906,6 +941,9 @@ class YakitBridge:
                 return
             except Exception as e:
                 last_err = e
+                self.listen_owned = False
+                self.verified_exit_ip = None
+                self.applied_downstream = None
                 self._down_fail[url] = time.monotonic() + 90.0
                 try:
                     pool.drop(url)
@@ -914,6 +952,7 @@ class YakitBridge:
                 continue
         self.verified_exit_ip = None
         self.applied_downstream = None
+        self.listen_owned = False
         self.last_error = str(last_err) if last_err else NO_DIRECT_MSG
 
     async def _start_fresh_mitm(self, down: str) -> None:

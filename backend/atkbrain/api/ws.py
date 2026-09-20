@@ -69,6 +69,10 @@ async def project_ws(ws: WebSocket, pid: str):
                     if refuse:
                         await emit(pid, "log", {"level": "warn", "message": refuse})
                         continue
+                    from ..agents.pi_runtime import llm_api_key_configured, llm_key_missing_message
+                    if not llm_api_key_configured():
+                        await emit(pid, "log", {"level": "error", "message": llm_key_missing_message()})
+                        continue
                     manager.start(pid, hard_restart=bool(msg.get("confirm_restart")))
             elif mtype == "stop":
                 await manager.halt(pid)

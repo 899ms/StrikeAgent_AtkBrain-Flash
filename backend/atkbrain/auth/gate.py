@@ -98,6 +98,19 @@ async def auth_ok(request: Request | WebSocket) -> bool:
     return False
 
 
+def _host_name(value: str) -> str:
+    """Origin netloc 与 Host 比主机名；反代常把 Host 写成无端口。"""
+    h = (value or "").strip().lower()
+    if h.startswith("["):
+        end = h.find("]")
+        if end > 0:
+            return h[: end + 1]
+        return h
+    if h.count(":") == 1:
+        return h.split(":", 1)[0]
+    return h
+
+
 def origin_ok(request: Request) -> bool:
     """Cookie 登录/改密：有 Origin/Referer 时必须对上 Host 或 CORS 列表。"""
     origin = (request.headers.get("origin") or "").strip()
@@ -112,10 +125,12 @@ def origin_ok(request: Request) -> bool:
     got = netloc(origin) if origin else netloc(referer)
     if not got:
         return True
-    if host and got == host:
+    if host and (got == host or _host_name(got) == _host_name(host)):
         return True
     for item in str(getattr(settings, "cors_origins", "") or "").split(","):
         item = item.strip()
+        if not item:
+            continue
         if item and netloc(item) == got:
             return True
     return False

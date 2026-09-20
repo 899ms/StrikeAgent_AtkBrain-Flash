@@ -18,12 +18,11 @@ function kindLabel(kind: string): string {
     error: "sup.kindError",
     empty: "sup.kindEmpty",
     hold: "sup.kindHold",
-    runtime_review: "sup.kindReview",
   };
   return key[kind] ? t(key[kind]) : t("sup.kindGeneric");
 }
 
-/** 御主栏只展示失败记录与模型生成的内容，不展示 skip/probe 等机械条目。 */
+/** 只展示方案与失败；探活/思考中不占面板。 */
 const VISIBLE_KINDS = new Set(["error", "empty", "plan", "hold", "runtime_review"]);
 
 type SupervisorRow = {
@@ -83,7 +82,8 @@ function fromSupervisorEvent(ev: RTEvent): SupervisorRow | null {
   ].filter(Boolean) as { label: string; items: string[] }[];
   const body = p.next_plan || (kind === "error" ? String(p.error || "") : "") || "";
   const diagnosis = p.diagnosis || (kind === "error" ? p.error : "") || "";
-  if (kind !== "error" && kind !== "empty" && !String(body || diagnosis).trim()) return null;
+  if (kind === "probe" && p.ready === false) return null;
+  if (kind !== "error" && kind !== "empty" && kind !== "probe" && !String(body || diagnosis).trim()) return null;
   return {
     key: String(ev.id ?? `sup-${ev.ts}`),
     ts: ev.ts,

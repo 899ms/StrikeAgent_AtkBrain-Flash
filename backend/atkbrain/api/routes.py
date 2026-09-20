@@ -11,10 +11,10 @@ from ..i18n.locale import get_locale, normalize_locale
 from ..i18n.strings import msg
 from ..config import settings
 from ..db import db, _loads
-from ..engine.scheduler import manager
+from ..engine.scheduler import _task_is_cancelling, manager
 from ..graph import store as gstore
 from ..project_status import displayed_status, hunt_hard_stop_info
-from ..app_version import check_latest, local_version, normalize_ver
+from ..app_version import check_latest, local_payload, local_version, normalize_ver
 from ..upgrade import live_hunt_ids, start_upgrade
 from ..projects import (
     assert_safe_project_target,
@@ -91,6 +91,21 @@ async def _load_reportable_finding(pid: str, fid: str) -> tuple[dict, dict | Non
 
 router = APIRouter(prefix="/api")
 router.include_router(mcp_router)
+
+
+def _require_llm_key() -> None:
+    from ..agents.pi_runtime import llm_api_key_configured
+    if not llm_api_key_configured():
+        raise HTTPException(400, msg("llm_key_missing"))
+
+
+async def _require_llm_key_for(pid: str) -> None:
+    from ..agents.pi_runtime import llm_api_key_configured
+    if llm_api_key_configured():
+        return
+    from ..events import emit
+    await emit(pid, "log", {"level": "error", "message": msg("llm_key_missing")})
+    raise HTTPException(400, msg("llm_key_missing"))
 
 
 class CreateProjectReq(BaseModel):
@@ -193,8 +208,17 @@ def _proxy_snap() -> dict:
 async def _stop_project_tree(pid: str) -> list[str]:
     """先停子项目再停自身，返回实际被 stop 的 id 列表。同级子树并行停，避免 400 个子项目串行卡死。"""
     child_ids = await list_child_ids(pid)
-    nested = await asyncio.gather(*(_stop_project_tree(cid) for cid in child_ids)) if child_ids else []
-    stopped = [x for group in nested for x in group]
+    nested: list = []
+    if child_ids:
+        nested = await asyncio.gather(
+            *(_stop_project_tree(cid) for cid in child_ids),
+            return_exceptions=True,
+        )
+    stopped: list[str] = []
+    for group in nested:
+        if isinstance(group, BaseException):
+            continue
+        stopped.extend(group)
     await manager.halt(pid)
     stopped.append(pid)
     return stopped
@@ -225,8 +249,12 @@ async def health(request: Request):
             return {"ok": True}
         raise HTTPException(401, "login-required")
 
+    from ..agents.pi_runtime import llm_api_key_configured
+
     bin_path = shutil.which(pi_bin()) or shutil.which("pi")
     try:
+        if not llm_api_key_configured():
+            raise RuntimeError("llm_key_missing")
         if not bin_path:
             raise FileNotFoundError("pi not found in PATH")
         ver = subprocess.check_output(
@@ -234,7 +262,10 @@ async def health(request: Request):
         ).strip()
         claude_sdk = {"state": "ready", "label": "Pi 就绪", "version": ver[:80], "bin": bin_path}
     except Exception as exc:
-        claude_sdk = {"state": "unavailable", "label": "Pi 不可用", "error": str(exc)[:160]}
+        if str(exc) == "llm_key_missing":
+            claude_sdk = {"state": "unavailable", "label": "未配置大模型密钥", "error": "DEEPSEEK_API_KEY missing"}
+        else:
+            claude_sdk = {"state": "unavailable", "label": "Pi 不可用", "error": str(exc)[:160]}
     from ..agents.brief_creds import CREDS_MODE
     yakit_snap: dict = {}
     try:
@@ -255,7 +286,10 @@ async def health(request: Request):
 
 @router.get("/version")
 async def get_version(refresh: bool = False):
-    return check_latest(force=bool(refresh))
+    try:
+        return check_latest(force=bool(refresh))
+    except Exception:
+        return local_payload()
 
 
 @router.post("/version/apply")
@@ -668,20 +702,32 @@ async def api_batch_delete_projects(req: BatchDeleteReq):
 
 @router.post("/projects/batch_stop")
 async def api_batch_stop_projects(req: BatchRunReq):
-    """跨项目批量暂停；集群项目递归暂停所有子项目。"""
+    """跨项目批量暂停；集群项目递归暂停所有子项目。单条失败不让整批 500。"""
     stopped: list[str] = []
     missing: list[str] = []
-    for pid in dict.fromkeys(str(x).strip() for x in req.ids if str(x).strip()):
-        if not await get_project(pid):
-            missing.append(pid)
-            continue
-        stopped.extend(await _stop_project_tree(pid))
-    return {"ok": True, "stopped": stopped, "missing": missing}
+    failed: list[dict] = []
+    ids = [str(x).strip() for x in (req.ids or []) if str(x).strip()]
+    if not ids:
+        raise HTTPException(400, "ids 不能为空")
+    for pid in dict.fromkeys(ids):
+        try:
+            if not await get_project(pid):
+                missing.append(pid)
+                continue
+            stopped.extend(await _stop_project_tree(pid))
+        except asyncio.CancelledError:
+            failed.append({"id": pid, "error": "cancelled"})
+            if _task_is_cancelling():
+                raise
+        except Exception as e:
+            failed.append({"id": pid, "error": str(e)[:200] or type(e).__name__})
+    return {"ok": True, "stopped": stopped, "missing": missing, "failed": failed}
 
 
 @router.post("/projects/batch_start")
 async def api_batch_start_projects(req: BatchRunReq):
     """跨项目批量启动；父项目展开为直属子项目进入调度器。"""
+    _require_llm_key()
     started: list[str] = []
     skipped: list[dict] = []
     missing: list[str] = []
@@ -734,6 +780,7 @@ async def api_start(pid: str, confirm_restart: bool = Query(False)):
         raise HTTPException(404, msg("project_missing"))
     if p["kind"] in ("cluster", "benchmark"):
         raise HTTPException(400, "父项目不直接运行；请对其子项目单独或批量启动。")
+    await _require_llm_key_for(pid)
     refuse = await bmk.gate_start_against_closed_env(p)
     if refuse:
         raise HTTPException(400, refuse)
@@ -1031,6 +1078,7 @@ async def api_start_all(
         raise HTTPException(404, msg("project_missing"))
     if parent["kind"] not in ("cluster", "benchmark"):
         raise HTTPException(400, "仅集群/评测项目支持全部启动")
+    _require_llm_key()
     refuse = await bmk.gate_start_against_closed_env(parent)
     if refuse:
         raise HTTPException(400, refuse)
@@ -1097,7 +1145,7 @@ async def api_stop_all(pid: str):
         ids = [s["id"] for s in await cluster_mod.list_subprojects(pid) if manager.is_running(s["id"])]
         if not ids:
             break
-        await asyncio.gather(*(manager.halt(sid) for sid in ids))
+        await asyncio.gather(*(manager.halt(sid) for sid in ids), return_exceptions=True)
         stopped.extend(ids)
     uniq = list(dict.fromkeys(stopped))
     return {"stopped": uniq, "count": len(uniq), "autopilot": False if p["kind"] == "benchmark" else None}

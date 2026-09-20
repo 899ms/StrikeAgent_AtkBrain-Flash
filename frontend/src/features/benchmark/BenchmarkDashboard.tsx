@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api } from "../../api";
+import { api, formatApiError } from "../../api";
 import type { Project } from "../../types";
 import { Badge } from "../../components/Badge";
 import { BatchSelectionBar } from "../../components/BatchSelectionBar";
@@ -153,7 +153,7 @@ export function BenchmarkDashboard({ project }: { project: Project }) {
     if (!window.confirm(tr("bench.confirmStopAll", { n: liveCount, noun: labSrc ? tr("bench.nounAsset") : tr("bench.nounChallenge") }))) return;
     setBusy("stop"); setErr("");
     try { await api.stopAll(project.id); await load(); }
-    catch (e: any) { setErr(e.message || tr("cluster.batchStopFailed")); }
+    catch (e: any) { setErr(formatApiError(e, tr("cluster.batchStopFailed"))); }
     finally { setBusy(""); }
   };
 
@@ -168,7 +168,7 @@ export function BenchmarkDashboard({ project }: { project: Project }) {
     if (!selectedCount || !window.confirm(tr("bench.confirmPauseSel", { n: selectedCount }))) return;
     setBusy("sel-stop"); setErr("");
     try { await api.batchStopProjects(selectedIds); setSelectedIds([]); await load(); }
-    catch (e: any) { setErr(e.message || tr("cluster.batchStopFailed")); }
+    catch (e: any) { setErr(formatApiError(e, tr("cluster.batchStopFailed"))); }
     finally { setBusy(""); }
   };
   const deleteSelected = async () => {

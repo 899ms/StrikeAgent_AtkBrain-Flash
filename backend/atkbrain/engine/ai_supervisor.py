@@ -488,8 +488,10 @@ async def consult_supervisor(
     brief: str, *, timeout: float | None = None, system_prompt: str | None = None,
     project_id: str = "",
 ) -> SupervisorPlan:
-    """一次性、无工具的 Pi 查询。空回复可按从者同一套握手重试。"""
+    """一次性、无工具的 Pi 查询。空回复交给外层墙钟再问，不在这里连烧 360s。"""
     wait = float(timeout if timeout is not None else getattr(settings, "supervisor_timeout_sec", 360) or 360)
+    attempt_cap = float(getattr(settings, "supervisor_attempt_timeout_sec", 90) or 90)
+    inner = max(5.0, min(wait, attempt_cap if attempt_cap > 0 else wait))
     model = (getattr(settings, "supervisor_model", None) or "").strip() or settings.claude_model
     retries = max(1, int(getattr(settings, "claude_connect_retries", 4) or 4))
     last_exc: BaseException | None = None
@@ -499,7 +501,7 @@ async def consult_supervisor(
                 system_prompt=system_prompt or SUPERVISOR_SYSTEM,
                 user_prompt=brief,
                 cwd=_advisor_cwd(),
-                timeout=max(0.05, wait),
+                timeout=inner,
                 tools=False,
                 model=model,
                 role="supervisor",
@@ -507,13 +509,13 @@ async def consult_supervisor(
             )
             if blob:
                 return parse_supervisor_plan(blob)
-            last_exc = TimeoutError("supervisor_empty_reply")
+            raise TimeoutError("supervisor_empty_reply")
         except asyncio.CancelledError:
             raise
         except TimeoutError:
             raise
         except asyncio.TimeoutError as e:
-            raise TimeoutError(f"超过 {wait:.0f}s 未返回") from e
+            raise TimeoutError(f"超过 {inner:.0f}s 未返回") from e
         except Exception as e:
             if is_oneshot_prompt_config_error(e):
                 raise RuntimeError(_ONESHOT_CONFIG_ERR) from e
@@ -522,9 +524,6 @@ async def consult_supervisor(
                 raise
             await asyncio.sleep(min(12.0, 1.5 * attempt))
             continue
-        if attempt >= retries:
-            break
-        await asyncio.sleep(min(12.0, 1.5 * attempt))
     raise last_exc or TimeoutError("supervisor_empty_reply")
 
 

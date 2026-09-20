@@ -209,6 +209,20 @@ class OriginTests(unittest.TestCase):
         none = http_request(headers=[("host", "10.0.0.5:2334")])
         self.assertTrue(origin_ok(none))
 
+    def test_proxy_strips_host_port(self):
+        from atkbrain.auth.gate import origin_ok
+        from atkbrain.auth.test_auth import http_request
+        req = http_request(headers=[
+            ("host", "43.133.167.198"),
+            ("origin", "https://43.133.167.198:2334"),
+        ])
+        self.assertTrue(origin_ok(req))
+        other = http_request(headers=[
+            ("host", "43.133.167.198"),
+            ("origin", "https://evil.example:2334"),
+        ])
+        self.assertFalse(origin_ok(other))
+
 
 class TokenQueryRemovedTests(unittest.TestCase):
     def test_no_query_token(self):

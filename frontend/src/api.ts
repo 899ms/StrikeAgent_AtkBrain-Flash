@@ -65,6 +65,31 @@ function isNetworkErr(raw: string) {
   return /failed to fetch|networkerror|load failed|network request failed/i.test(raw);
 }
 
+/** HTTP/2 的 statusText 经常是空的，不能只靠 e.message，否则批量操作只剩「失败」。 */
+export function formatApiError(e: unknown, fallback: string): string {
+  if (e == null) return fallback;
+  if (typeof e === "string" && e.trim()) return e;
+  const err = e as { message?: unknown; detail?: unknown; status?: number; code?: string };
+  let msg: unknown = err.message ?? err.detail;
+  if (Array.isArray(msg)) {
+    msg = msg.map((x) => (x && typeof x === "object" && "msg" in x ? String((x as { msg?: unknown }).msg || "") : JSON.stringify(x))).filter(Boolean).join("; ");
+  } else if (msg && typeof msg !== "string") {
+    try {
+      msg = JSON.stringify(msg);
+    } catch {
+      msg = "";
+    }
+  }
+  const text = String(msg || "").trim();
+  const status = Number(err.status || 0);
+  if (text && text !== "OK") {
+    if (status && !/^HTTP\s+\d+/i.test(text)) return `HTTP ${status} ${text}`;
+    return text;
+  }
+  if (status) return `${fallback} (HTTP ${status})`;
+  return fallback;
+}
+
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -80,7 +105,7 @@ async function j<T>(r: Response): Promise<T> {
       retryAfter = Number(b.retry_after || 0);
       code = String(b.code || "");
     } catch {}
-    const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg)) as Error & { status?: number; retryAfter?: number; code?: string };
+    const err = new Error(typeof msg === "string" && msg.trim() ? msg : `HTTP ${r.status}`) as Error & { status?: number; retryAfter?: number; code?: string };
     err.status = r.status;
     if (retryAfter) err.retryAfter = retryAfter;
     if (code) err.code = code;

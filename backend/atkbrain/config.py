@@ -91,6 +91,8 @@ class Settings(BaseSettings):
     supervisor_model: str = "deepseek-flash"
     # 御主一次性 Pi 总等待（冷启动 CLI + 生成 + 重试）。到点从者自走。
     supervisor_timeout_sec: int = 360
+    # 单次拉起 CLI+生成的上限；空等不再一次吃掉整段 360s。
+    supervisor_attempt_timeout_sec: int = 90
     # 御主问模型：0=在总墙钟内一直重试；>0 时次数与墙钟谁先到谁停。
     supervisor_consult_max_attempts: int = 0
     supervisor_consult_retry_base_sec: float = 4.0

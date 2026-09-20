@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api } from "../../api";
+import { api, formatApiError } from "../../api";
 import type { Project } from "../../types";
 import { Badge } from "../../components/Badge";
 import { BatchSelectionBar } from "../../components/BatchSelectionBar";
@@ -201,14 +201,14 @@ export function ClusterDashboard({
   const startAll = async () => {
     setBusy(true); setErr("");
     try { await api.startAll(project.id); await load(); }
-    catch (e: any) { setErr(e.message || tr("cluster.batchStartFailed")); }
+    catch (e: any) { setErr(formatApiError(e, tr("cluster.batchStartFailed"))); }
     finally { setBusy(false); }
   };
 
   const stopAll = async () => {
     setBusy(true); setErr("");
     try { await api.stopAll(project.id); await load(); }
-    catch (e: any) { setErr(e.message || tr("cluster.batchStopFailed")); }
+    catch (e: any) { setErr(formatApiError(e, tr("cluster.batchStopFailed"))); }
     finally { setBusy(false); }
   };
 
@@ -321,14 +321,14 @@ export function ClusterDashboard({
     if (!selectedCount || !window.confirm(tr("cluster.confirmRun", { n: selectedCount }))) return;
     setBusy(true); setErr("");
     try { await api.batchStartProjects(selectedIds); setSelectedIds([]); await load(); }
-    catch (e: any) { setErr(e.message || tr("cluster.runFailed")); }
+    catch (e: any) { setErr(formatApiError(e, tr("cluster.runFailed"))); }
     finally { setBusy(false); }
   };
   const pauseSelected = async () => {
     if (!selectedCount || !window.confirm(tr("cluster.confirmPause", { n: selectedCount }))) return;
     setBusy(true); setErr("");
     try { await api.batchStopProjects(selectedIds); setSelectedIds([]); await load(); }
-    catch (e: any) { setErr(e.message || tr("cluster.batchStopFailed")); }
+    catch (e: any) { setErr(formatApiError(e, tr("cluster.batchStopFailed"))); }
     finally { setBusy(false); }
   };
   const deleteSelected = async () => {

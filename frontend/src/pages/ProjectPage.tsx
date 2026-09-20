@@ -170,6 +170,15 @@ export function ProjectPage() {
     }).catch((e: any) => {
       setLoadErr(String(e?.message || e || t("project.loadFailed")));
     });
+    api.health().then((h: any) => {
+      if (h?.claude_sdk?.state === "unavailable") {
+        const err = String(h.claude_sdk?.error || "");
+        const label = String(h.claude_sdk?.label || "");
+        if (err.includes("DEEPSEEK_API_KEY") || label.includes("密钥") || /api key/i.test(err + label)) {
+          setLoadErr(t("project.llmKeyMissing"));
+        }
+      }
+    }).catch(() => {});
   }, [id]);
 
   useEffect(() => {
@@ -281,11 +290,14 @@ export function ProjectPage() {
   const startResume = async (): Promise<boolean> => {
     if (!id) return false;
     try {
+      setLoadErr("");
       await api.start(id, false);
       setRunning(true);
       setQueued(true);
       return true;
     } catch (e: any) {
+      setRunning(false);
+      setQueued(false);
       setLoadErr(String(e?.message || e || t("project.startFailed")));
       return false;
     }
@@ -444,6 +456,9 @@ export function ProjectPage() {
                   <div key={c}>· {c}</div>
                 ))}
               </div>
+            ) : null}
+            {loadErr ? (
+              <p className="error-text" style={{ marginTop: 10, maxWidth: 640 }}>{loadErr}</p>
             ) : null}
           </div>
           <div className="project-head-metrics">

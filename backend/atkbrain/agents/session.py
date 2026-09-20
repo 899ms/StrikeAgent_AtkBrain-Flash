@@ -211,6 +211,9 @@ class ProjectAgent:
             task.cancel()
             try:
                 await task
+            except asyncio.CancelledError:
+                if not task.cancelled() and not task.done():
+                    raise
             except Exception:
                 pass
         self._review_task = None

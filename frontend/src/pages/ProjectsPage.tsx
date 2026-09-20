@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { api } from "../api";
+import { api, formatApiError } from "../api";
 import type { Project } from "../types";
 import { Modal } from "../components/Modal";
 import { ImportProgressBar, isImportPaused, isImportRunning, type ImportProgress } from "../components/ImportProgressBar";
@@ -34,6 +34,7 @@ export function ProjectsPage() {
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState(""); const [kind, setKind] = useState("all"); const [track, setTrack] = useState("all"); const [status, setStatus] = useState("all");
   const [pendingAction, setPendingAction] = useState<BatchAction | null>(null);
+  const [batchErr, setBatchErr] = useState("");
   const [rename, setRename] = useState<Project | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(readPageSize);
@@ -63,8 +64,24 @@ export function ProjectsPage() {
   const runBatch = async () => {
     const ids = [...selected]; if (!pendingAction || !ids.length) return;
     setBusy(true);
-    try { if (pendingAction === "delete") await api.batchDeleteProjects(ids); if (pendingAction === "start") await api.batchStartProjects(ids); if (pendingAction === "stop") await api.batchStopProjects(ids); setSelected(new Set()); await load(); }
-    catch (e: any) { alert(e?.message || t("projects.batchFailed")); } finally { setBusy(false); setPendingAction(null); }
+    setBatchErr("");
+    try {
+      let result: { failed?: { id?: string; error?: string }[] } | undefined;
+      if (pendingAction === "delete") result = await api.batchDeleteProjects(ids);
+      if (pendingAction === "start") result = await api.batchStartProjects(ids);
+      if (pendingAction === "stop") result = await api.batchStopProjects(ids);
+      const failed = result?.failed || [];
+      if (failed.length) {
+        setBatchErr(failed.map((f) => `${f.id || ""} ${f.error || ""}`.trim()).join("；"));
+      }
+      setSelected(new Set());
+      await load();
+    } catch (e: any) {
+      setBatchErr(formatApiError(e, t("projects.batchFailed")));
+    } finally {
+      setBusy(false);
+      setPendingAction(null);
+    }
   };
   const statusFilterLabel = (key: string) => ({
     all: t("projects.statusAll"),
@@ -79,6 +96,7 @@ export function ProjectsPage() {
     <section className="project-list-toolbar"><input className="input project-search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t("projects.search")} /><Filter value={kind} onChange={setKind} options={[["all", t("projects.kindAll")], ["single", t("projects.kindSingle")], ["cluster", t("projects.kindCluster")]]} /><Filter value={track} onChange={setTrack} options={[["all", t("projects.trackAll")], ["ctf", "CTF"], ["redteam", t("projects.trackRed")], ["src", t("projects.trackSrc")]]} /></section>
     <div className="status-filters">{STATUS_KEYS.map((key) => <button key={key} className={status === key ? "active" : ""} onClick={() => setStatus(key)}>{statusFilterLabel(key)} <b>{key === "all" ? projects.length : projects.filter((p) => statusOf(p) === key).length}</b></button>)}</div>
     <div className="batch-toolbar"><span className="muted">{t("projects.selected", { n: selected.size, total: visible.length })}</span><button className="btn btn-secondary btn-sm" onClick={selectAll} disabled={!visible.length || busy}>{t("projects.selectFiltered")}</button><button className="btn btn-secondary btn-sm" onClick={() => setSelected(new Set())} disabled={!selected.size || busy}>{t("projects.clearSelect")}</button><div style={{ flex: 1 }} /><button className="btn btn-primary btn-sm" onClick={() => setPendingAction("start")} disabled={!selected.size || busy}>{t("projects.batchStart")}</button><button className="btn btn-secondary btn-sm" onClick={() => setPendingAction("stop")} disabled={!selected.size || busy}>{t("projects.batchStop")}</button><button className="btn btn-danger btn-sm" onClick={() => setPendingAction("delete")} disabled={!selected.size || busy}>{t("projects.batchDelete")}</button></div>
+    {batchErr ? <p className="error-text" style={{ margin: "8px 0 0" }}>{batchErr}</p> : null}
     <div className="project-table-wrap"><table className="project-table"><thead><tr><th><input type="checkbox" checked={pageAllSelected} onChange={togglePage} /></th><th>{t("projects.colName")}</th><th>{t("projects.colKind")}</th><th>{t("projects.colStatus")}</th><th>{t("projects.colNodes")}</th><th>{t("projects.colServices")}</th><th>{t("projects.colHigh")}</th><th>{t("projects.colCritical")}</th><th>{t("projects.colUpdated")}</th></tr></thead><tbody>{paged.map((p) => <ProjectRow key={p.id} p={p} selected={selected.has(p.id)} onToggle={() => toggle(p.id)} onRename={() => setRename(p)} />)}</tbody></table>{!visible.length && <div className="empty-list">{t("projects.empty")}</div>}</div>
     {visible.length > 0 && <PaginationBar total={visible.length} page={curPage} pageSize={pageSize} onPage={setPage} onPageSize={setPageSize} />}
     {showCreate && <CreateModal onClose={() => setShowCreate(false)} onCreated={load} />}

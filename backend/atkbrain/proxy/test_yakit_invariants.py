@@ -7,6 +7,7 @@ from unittest.mock import patch
 from .yakit import (
     MITM_FAIL_MSG,
     engine_cert_stale,
+    mitm_url_likely_no_connect,
     parse_echo_ip,
     resolve_egress,
     root_pem_from_chain_text,
@@ -188,11 +189,42 @@ class PoolFollowsCurrentTests(unittest.TestCase):
         from .pool import pool
         yakit.last_good_proxy = "socks5://103.75.118.84:1080"
         yakit.backup_text = ""
-        with patch.object(pool, "current_url", return_value="http://198.51.100.9:3128"), \
-             patch.object(pool, "mitm_candidates", return_value=["http://198.51.100.9:3128"]):
+        with patch.object(pool, "pick_https", return_value="http://198.51.100.9:3128"), \
+             patch.object(pool, "mitm_candidates", return_value=["http://198.51.100.9:3128"]), \
+             patch.object(pool, "https_ok_url", return_value=True):
             downs = yakit._downstream_candidates()
         self.assertEqual(downs[0], "http://198.51.100.9:3128")
         self.assertGreater(downs.index("socks5://103.75.118.84:1080"), 0)
+
+    def test_mitm_candidates_skip_http_only(self) -> None:
+        from .pool import LiveProxy, pool
+        pool.enabled = True
+        pool.live = [
+            LiveProxy(url="http://203.0.113.1:80", exit_ip="203.0.113.1", proto="http", https_ok=False),
+            LiveProxy(url="http://198.51.100.9:3128", exit_ip="198.51.100.9", proto="http", https_ok=True),
+        ]
+        self.assertEqual(pool.mitm_candidates(8), ["http://198.51.100.9:3128"])
+        self.assertEqual(pool.https_ok_url("http://203.0.113.1:80"), False)
+        self.assertIsNone(pool.https_ok_url("http://198.51.100.8:3128"))
+
+    def test_port_80_last_good_dropped(self) -> None:
+        from .pool import pool
+        yakit.last_good_proxy = "http://14.161.10.46:80"
+        yakit.backup_text = "http://14.161.10.46:80\nhttp://198.51.100.9:3128"
+        with patch.object(pool, "pick_https", return_value=None), \
+             patch.object(pool, "mitm_candidates", return_value=[]), \
+             patch.object(pool, "https_ok_url", return_value=None):
+            downs = yakit._downstream_candidates()
+        self.assertEqual(downs, ["http://198.51.100.9:3128"])
+
+
+class MitmUrlFilterTests(unittest.TestCase):
+    def test_port_80_http_blocked(self) -> None:
+        self.assertTrue(mitm_url_likely_no_connect("http://14.161.10.46:80"))
+        self.assertTrue(mitm_url_likely_no_connect("http://14.161.10.46"))
+        self.assertFalse(mitm_url_likely_no_connect("http://198.51.100.9:3128"))
+        self.assertFalse(mitm_url_likely_no_connect("socks5://198.51.100.9:1080"))
+        self.assertFalse(mitm_url_likely_no_connect("http://36.155.23.163:10808"))
 
 
 class RebindToPoolTests(unittest.IsolatedAsyncioTestCase):
